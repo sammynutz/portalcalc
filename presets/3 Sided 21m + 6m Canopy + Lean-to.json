@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "geometry": {
+    "span_mm": "21000",
+    "roof_pitch_deg": "7.5",
+    "eave_height_mm": "6000",
+    "truss_depth_mm": "800",
+    "left_support": "Pinned",
+    "right_support": "Pinned"
+  },
+  "canopies": {
+    "left_length_mm": "10000",
+    "left_type": "Lean-to",
+    "left_pitch_deg": "3.5",
+    "left_shallow_depth_mm": "600",
+    "left_g_kpa": "-.15",
+    "left_q_kpa": "-.25",
+    "left_solar_kpa": "0.0",
+    "right_length_mm": "6000",
+    "right_type": "Canopy",
+    "right_pitch_deg": "3.5",
+    "right_shallow_depth_mm": "400",
+    "right_g_kpa": "-.15",
+    "right_q_kpa": "-.25",
+    "right_solar_kpa": "0.0"
+  },
+  "sections": {
+    "left_column": "310 UB 40.4",
+    "right_column": "310 UB 46.2",
+    "top_chord": "65*3 SHS",
+    "bottom_chord": "65*3 SHS",
+    "webs_posts": "50*3 SHS",
+    "left_canopy_top_chord": "65*2.5 SHS",
+    "left_canopy_bottom_chord": "65*2.5 SHS",
+    "left_canopy_webs_posts": "50*2 SHS",
+    "left_lean_to_column": "250 UB 25.7",
+    "right_canopy_top_chord": "65*2.5 SHS",
+    "right_canopy_bottom_chord": "65*2.5 SHS",
+    "right_canopy_webs_posts": "40*2 SHS",
+    "right_lean_to_column": "150 UC 23.4"
+  },
+  "loads": {
+    "bay_size_m": "8.0",
+    "g_kpa": "-0.10",
+    "q_kpa": "-0.25",
+    "solar_kpa": "-0.15",
+    "fire_service_kpa": "0.0",
+    "hvac_kpa": "0.0",
+    "other_kpa": "0.0",
+    "roof_load_placements": {
+      "g": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      },
+      "q": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      },
+      "solar": {
+        "side": "Both",
+        "from_percent": "40",
+        "to_percent": "60"
+      },
+      "other": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      }
+    },
+    "left_wall_kn_m": "0",
+    "right_wall_kn_m": "0",
+    "load_combination": "1.2G + Wu (Left +, Cpi +)"
+  },
+  "wind": {
+    "region": "A5",
+    "importance_level": "1",
+    "terrain_category": "2",
+    "orientation": "N",
+    "frame_type": "3 Sided",
+    "single_wind_case": "Left +",
+    "building_length_m": "40.0",
+    "additional_pressure_factor": "1.0"
+  },
+  "display": {
+    "diagram_view": "Load Diagram",
+    "load_view_mode": "Single load",
+    "single_load": "Cpi + with Right +",
+    "deflection_scale": "100",
+    "diagram_scale": "10"
+  }
+}

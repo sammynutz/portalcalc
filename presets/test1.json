@@ -1,0 +1,149 @@
+{
+  "version": 1,
+  "geometry": {
+    "span_mm": "21000",
+    "roof_pitch_deg": "7.5",
+    "eave_height_mm": "6000",
+    "truss_depth_mm": "950",
+    "frame_system": "Truss",
+    "rafter_haunch_length_mm": "3000",
+    "internal_column_count": "None",
+    "internal_column_offset_mm": "3000",
+    "left_support": "Pinned",
+    "right_support": "Pinned",
+    "eave_x_restraint": "None",
+    "eave_x_spring_kn_mm": "0.0",
+    "end_wall_brace_dia_mm": "12.0"
+  },
+  "canopies": {
+    "left_length_mm": "10000",
+    "left_type": "Lean-to",
+    "left_wind_model": "Main roof Cpe + Cpi",
+    "left_underside": "Empty under",
+    "left_cpn_uplift": "0.0",
+    "left_cpn_downward": "0.0",
+    "left_lean_outer_wall_clad": "No",
+    "left_lean_enclosure": {
+      "back": true,
+      "left": false,
+      "right": false,
+      "front": true
+    },
+    "left_eave_height_mm": "",
+    "left_pitch_deg": "3.5",
+    "left_shallow_depth_mm": "700",
+    "left_g_kpa": "0.15",
+    "left_q_kpa": "0.25",
+    "left_solar_kpa": "0.0",
+    "right_length_mm": "10000",
+    "right_type": "Lean-to",
+    "right_wind_model": "Main roof Cpe + Cpi",
+    "right_underside": "Empty under",
+    "right_cpn_uplift": "0.0",
+    "right_cpn_downward": "0.0",
+    "right_lean_outer_wall_clad": "No",
+    "right_lean_enclosure": {
+      "back": false,
+      "left": true,
+      "right": true,
+      "front": false
+    },
+    "right_eave_height_mm": "",
+    "right_pitch_deg": "3.5",
+    "right_shallow_depth_mm": "600",
+    "right_g_kpa": "0.15",
+    "right_q_kpa": "0.25",
+    "right_solar_kpa": "0.0"
+  },
+  "sections": {
+    "left_column": "310 UB 40.4",
+    "right_column": "310 UB 46.2",
+    "internal_column": "200 UC 46.2",
+    "top_chord": "65*3 SHS",
+    "bottom_chord": "65*3 SHS",
+    "purlin_span_type": "Double span",
+    "wall_girt_span_type": "Double span",
+    "webs_posts": "50*3 SHS",
+    "left_canopy_top_chord": "65*3 SHS",
+    "left_canopy_bottom_chord": "65*3 SHS",
+    "left_canopy_webs_posts": "50*2 SHS",
+    "left_lean_to_column": "250 UB 25.7",
+    "right_canopy_top_chord": "65*3 SHS",
+    "right_canopy_bottom_chord": "65*3 SHS",
+    "right_canopy_webs_posts": "40*2 SHS",
+    "right_lean_to_column": "200 UB 25.4"
+  },
+  "costing": {
+    "shs_rate_per_kg": "2.07",
+    "ub_rate_per_kg": "2.07",
+    "wb_rate_per_kg": "2.80",
+    "purlin_rate_per_kg": "1.90"
+  },
+  "foundations": {
+    "allowable_bearing_kpa": "150",
+    "skin_friction_kpa": "15",
+    "use_skin_friction_for_bearing": false
+  },
+  "loads": {
+    "bay_size_mm": "8000",
+    "bay_size_m": 8.0,
+    "g_kpa": "0.1",
+    "q_kpa": "0.25",
+    "solar_kpa": "0.15",
+    "fire_service_kpa": "0.0",
+    "hvac_kpa": "0.0",
+    "other_kpa": "0.0",
+    "crane_rating_t": "0",
+    "snow_region": "None",
+    "snow_ahd_height_m": "0",
+    "roof_load_placements": {
+      "g": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      },
+      "q": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      },
+      "solar": {
+        "side": "Both",
+        "from_percent": "40",
+        "to_percent": "60"
+      },
+      "other": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      }
+    },
+    "left_wall_kn_m": "0",
+    "right_wall_kn_m": "0",
+    "load_combination": "1.2G + Wu (Left +, Cpi +)"
+  },
+  "wind": {
+    "region": "A5",
+    "importance_level": "1",
+    "terrain_category": "2",
+    "orientation": "N",
+    "frame_type": "3 Sided",
+    "wall_enclosure": {
+      "back": true,
+      "left": true,
+      "right": true,
+      "front": true
+    },
+    "single_wind_case": "Left +",
+    "building_length_m": "40.0",
+    "additional_pressure_factor": "1.0"
+  },
+  "display": {
+    "diagram_view": "Load Diagram",
+    "load_view_mode": "Single load",
+    "single_load": "Wu Cpe Left +",
+    "second_order_analysis": false,
+    "deflection_scale": "100",
+    "diagram_scale": "10"
+  }
+}

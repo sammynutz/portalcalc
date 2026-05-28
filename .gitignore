@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+.env
+.venv/
+venv/
+
+*.db
+*.sqlite
+*.sqlite3
+license_token.json
+
+.pytest_cache/
+.mypy_cache/
+
+*.log
+*.tmp
+
+Archive/
+Archive 2/

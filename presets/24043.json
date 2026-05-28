@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "geometry": {
+    "span_mm": "30000",
+    "roof_pitch_deg": "5",
+    "eave_height_mm": "9000",
+    "truss_depth_mm": "1050",
+    "internal_column_count": "None",
+    "internal_column_offset_mm": "3000",
+    "left_support": "Pinned",
+    "right_support": "Pinned"
+  },
+  "canopies": {
+    "left_length_mm": "0",
+    "left_type": "Canopy",
+    "left_lean_outer_wall_clad": "No",
+    "left_pitch_deg": "3.5",
+    "left_shallow_depth_mm": "300",
+    "left_g_kpa": "-.15",
+    "left_q_kpa": "-.25",
+    "left_solar_kpa": "0.0",
+    "right_length_mm": "6000",
+    "right_type": "Canopy",
+    "right_lean_outer_wall_clad": "No",
+    "right_pitch_deg": "3.5",
+    "right_shallow_depth_mm": "550",
+    "right_g_kpa": "-.15",
+    "right_q_kpa": "-.25",
+    "right_solar_kpa": "0.0"
+  },
+  "sections": {
+    "left_column": "460 UB 67.1",
+    "right_column": "410 UB 53.7",
+    "internal_column": "200 UC 46.2",
+    "top_chord": "100*3 SHS",
+    "bottom_chord": "100*3 SHS",
+    "webs_posts": "50*3 SHS",
+    "left_canopy_top_chord": "20*1.6 SHS",
+    "left_canopy_bottom_chord": "20*1.6 SHS",
+    "left_canopy_webs_posts": "20*1.6 SHS",
+    "left_lean_to_column": "150 UC 23.4",
+    "right_canopy_top_chord": "65*3 SHS",
+    "right_canopy_bottom_chord": "65*3 SHS",
+    "right_canopy_webs_posts": "50*2.5 SHS",
+    "right_lean_to_column": "150 UC 23.4"
+  },
+  "loads": {
+    "bay_size_mm": "6000",
+    "bay_size_m": 6.0,
+    "g_kpa": "-0.15",
+    "q_kpa": "-0.25",
+    "solar_kpa": "-0.15",
+    "fire_service_kpa": "-.05",
+    "hvac_kpa": "0.0",
+    "other_kpa": "0.0",
+    "crane_rating_t": "5",
+    "roof_load_placements": {
+      "g": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      },
+      "q": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      },
+      "solar": {
+        "side": "Left",
+        "from_percent": "0",
+        "to_percent": "100"
+      },
+      "other": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      }
+    },
+    "left_wall_kn_m": "0",
+    "right_wall_kn_m": "0",
+    "load_combination": "1.2G + 1.5Q"
+  },
+  "wind": {
+    "region": "A0",
+    "importance_level": "2",
+    "terrain_category": "2",
+    "orientation": "W",
+    "frame_type": "Enclosed",
+    "single_wind_case": "Left +",
+    "building_length_m": "70",
+    "additional_pressure_factor": "1.0"
+  },
+  "display": {
+    "diagram_view": "Geometry",
+    "load_view_mode": "Combination loads",
+    "single_load": "G",
+    "deflection_scale": "100",
+    "diagram_scale": "10"
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "geometry": {
+    "span_mm": "40000",
+    "roof_pitch_deg": "18.4",
+    "eave_height_mm": "6000",
+    "truss_depth_mm": "1400",
+    "left_support": "Pinned",
+    "right_support": "Pinned"
+  },
+  "sections": {
+    "left_column": "530 UB 82.0",
+    "right_column": "530 UB 82.0",
+    "top_chord": "100*3 SHS",
+    "bottom_chord": "100*3 SHS",
+    "webs_posts": "50*2.5 SHS"
+  },
+  "loads": {
+    "bay_size_m": "10",
+    "g_kpa": "-0.15",
+    "q_kpa": "-.25",
+    "solar_kpa": "-0.15",
+    "fire_service_kpa": "0.0",
+    "hvac_kpa": "0.0",
+    "other_kpa": "0.0",
+    "roof_load_placements": {
+      "g": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      },
+      "q": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      },
+      "solar": {
+        "side": "Right",
+        "from_percent": "30",
+        "to_percent": "70"
+      },
+      "other": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      }
+    },
+    "left_wall_kn_m": "0",
+    "right_wall_kn_m": "0",
+    "load_combination": "1.35G"
+  },
+  "wind": {
+    "region": "A5",
+    "importance_level": "2",
+    "terrain_category": "2",
+    "orientation": "E",
+    "frame_type": "Roof Only",
+    "single_wind_case": "Left +",
+    "building_length_m": "200",
+    "additional_pressure_factor": "1.0"
+  },
+  "display": {
+    "diagram_view": "Load Diagram",
+    "deflection_scale": "100",
+    "diagram_scale": "10"
+  }
+}

@@ -1,0 +1,149 @@
+{
+  "version": 1,
+  "geometry": {
+    "span_mm": "20000",
+    "roof_pitch_deg": "18.4",
+    "eave_height_mm": "12000",
+    "truss_depth_mm": "1000",
+    "frame_system": "Truss",
+    "rafter_haunch_length_mm": "3000",
+    "internal_column_count": "None",
+    "internal_column_offset_mm": "3000",
+    "left_support": "Pinned",
+    "right_support": "Pinned",
+    "eave_x_restraint": "None",
+    "eave_x_spring_kn_mm": "0.0",
+    "end_wall_brace_dia_mm": "12.0"
+  },
+  "canopies": {
+    "left_length_mm": "18000",
+    "left_type": "Lean-to",
+    "left_wind_model": "Main roof Cpe + Cpi",
+    "left_underside": "Empty under",
+    "left_cpn_uplift": "0.0",
+    "left_cpn_downward": "0.0",
+    "left_lean_outer_wall_clad": "No",
+    "left_lean_enclosure": {
+      "back": false,
+      "left": false,
+      "right": false,
+      "front": false
+    },
+    "left_eave_height_mm": "",
+    "left_pitch_deg": "18.4",
+    "left_shallow_depth_mm": "1000",
+    "left_g_kpa": "0.0",
+    "left_q_kpa": "0.0",
+    "left_solar_kpa": "0.0",
+    "right_length_mm": "18000",
+    "right_type": "Lean-to",
+    "right_wind_model": "Main roof Cpe + Cpi",
+    "right_underside": "Empty under",
+    "right_cpn_uplift": "0.0",
+    "right_cpn_downward": "0.0",
+    "right_lean_outer_wall_clad": "No",
+    "right_lean_enclosure": {
+      "back": false,
+      "left": false,
+      "right": false,
+      "front": false
+    },
+    "right_eave_height_mm": "",
+    "right_pitch_deg": "18.4",
+    "right_shallow_depth_mm": "1000",
+    "right_g_kpa": "0.0",
+    "right_q_kpa": "0.0",
+    "right_solar_kpa": "0.0"
+  },
+  "sections": {
+    "left_column": "530 UB 92.4",
+    "right_column": "530 UB 92.4",
+    "internal_column": "200 UC 46.2",
+    "top_chord": "75*3 SHS",
+    "bottom_chord": "75*3 SHS",
+    "purlin_span_type": "Continuous lapped",
+    "wall_girt_span_type": "Continuous lapped",
+    "webs_posts": "50*2.5 SHS",
+    "left_canopy_top_chord": "100*3 SHS",
+    "left_canopy_bottom_chord": "100*3 SHS",
+    "left_canopy_webs_posts": "50*2.5 SHS",
+    "left_lean_to_column": "310 UB 40.4",
+    "right_canopy_top_chord": "100*3 SHS",
+    "right_canopy_bottom_chord": "100*3 SHS",
+    "right_canopy_webs_posts": "50*2.5 SHS",
+    "right_lean_to_column": "310 UB 40.4"
+  },
+  "costing": {
+    "shs_rate_per_kg": "2.07",
+    "ub_rate_per_kg": "2.07",
+    "wb_rate_per_kg": "2.80",
+    "purlin_rate_per_kg": "1.90"
+  },
+  "foundations": {
+    "allowable_bearing_kpa": "150",
+    "skin_friction_kpa": "15",
+    "use_skin_friction_for_bearing": false
+  },
+  "loads": {
+    "bay_size_mm": "10000",
+    "bay_size_m": 10.0,
+    "g_kpa": "0.15",
+    "q_kpa": "0.25",
+    "solar_kpa": "0.15",
+    "fire_service_kpa": "0.0",
+    "hvac_kpa": "0.0",
+    "other_kpa": "0.0",
+    "crane_rating_t": "0.0",
+    "snow_region": "None",
+    "snow_ahd_height_m": "0",
+    "roof_load_placements": {
+      "g": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      },
+      "q": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      },
+      "solar": {
+        "side": "Right",
+        "from_percent": "0",
+        "to_percent": "100"
+      },
+      "other": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      }
+    },
+    "left_wall_kn_m": "0.0",
+    "right_wall_kn_m": "0.0",
+    "load_combination": "1.2G + 1.5Q"
+  },
+  "wind": {
+    "region": "A5",
+    "importance_level": "2",
+    "terrain_category": "2",
+    "orientation": "E",
+    "frame_type": "3 Sided",
+    "wall_enclosure": {
+      "back": false,
+      "left": false,
+      "right": false,
+      "front": false
+    },
+    "single_wind_case": "Left +",
+    "building_length_m": "40.0",
+    "additional_pressure_factor": "1.0"
+  },
+  "display": {
+    "diagram_view": "Load Diagram",
+    "load_view_mode": "Single load",
+    "single_load": "Wu Cpe Right +",
+    "second_order_analysis": false,
+    "deflection_scale": "100",
+    "diagram_scale": "1.0"
+  }
+}
