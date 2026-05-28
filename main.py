@@ -1390,6 +1390,17 @@ class MainWindow(QMainWindow):
         self.eave_x_restraint_combo.addItems(["None", "Left eave", "Right eave", "Both eaves", "End wall bracing approx"])
         self.eave_x_spring_input = QLineEdit("0.0")
         self.end_wall_brace_dia_input = QLineEdit("12.0")
+        self.license_status_label = QLabel()
+        self.license_status_label.setWordWrap(True)
+        self.refresh_license_status_button = QPushButton("Refresh")
+        self.refresh_license_status_button.clicked.connect(self.update_license_status_label)
+        license_status_row = QWidget()
+        license_status_layout = QHBoxLayout()
+        license_status_layout.setContentsMargins(0, 0, 0, 0)
+        license_status_row.setLayout(license_status_layout)
+        license_status_layout.addWidget(self.license_status_label, 1)
+        license_status_layout.addWidget(self.refresh_license_status_button)
+        advanced_layout.addRow("License", license_status_row)
         advanced_layout.addRow("Left Base Support", self.left_support_combo)
         advanced_layout.addRow("Right Base Support", self.right_support_combo)
         advanced_layout.addRow("Eave X restraint", self.eave_x_restraint_combo)
@@ -1831,6 +1842,7 @@ class MainWindow(QMainWindow):
         self.update_snow_visibility()
         self.update_frame_system_visibility()
         self.update_eave_restraint_visibility()
+        self.update_license_status_label()
         self.update_snow_visibility()
         self.internal_column_count_combo.currentTextChanged.connect(lambda _: self.update_internal_column_visibility())
         self.frame_system_combo.currentTextChanged.connect(lambda _: self.update_frame_system_visibility())
@@ -3527,6 +3539,37 @@ resize();
 
     def column_half_width_for_span_offset(self, profile):
         return (profile.depth or profile.flange_width or 0.0) / 2.0
+
+    def update_license_status_label(self):
+        label = getattr(self, "license_status_label", None)
+        if label is None:
+            return
+        if os.environ.get("PORTALCALC_LICENSE_ENFORCED") != "1":
+            label.setText("Not enforced for this run")
+            label.setStyleSheet("color: #777;")
+            return
+        try:
+            from licensing import LicenseManager
+
+            status = LicenseManager().local_status()
+        except Exception as exc:
+            label.setText(f"Check failed: {exc}")
+            label.setStyleSheet("color: #b00020;")
+            return
+        if status.valid:
+            details = []
+            if status.customer:
+                details.append(status.customer)
+            if status.plan:
+                details.append(status.plan)
+            if status.days_remaining is not None:
+                details.append(f"{status.days_remaining} days remaining")
+            suffix = f" ({', '.join(details)})" if details else ""
+            label.setText(f"Valid{suffix}")
+            label.setStyleSheet("color: #1b7f3a; font-weight: bold;")
+        else:
+            label.setText(status.reason)
+            label.setStyleSheet("color: #b00020; font-weight: bold;")
 
     def update_web_section_visibility(self):
         rows = []
@@ -6684,6 +6727,8 @@ if __name__ == "__main__":
                 )
                 window.close()
                 app.quit()
+            else:
+                window.update_license_status_label()
 
         QTimer.singleShot(100, enforce_license_after_startup)
         sys.exit(app.exec())

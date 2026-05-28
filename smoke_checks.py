@@ -81,6 +81,7 @@ def run_ui_smoke_checks() -> None:
 
     window.generate_and_solve()
     assert window.derived_frame_type_label.text() == "Enclosed"
+    assert "Not enforced" in window.license_status_label.text()
     assert window.bottom_profile_combo is window.top_profile_combo
     assert window.left_canopy_bottom_profile_combo is window.left_canopy_top_profile_combo
     assert window.right_canopy_bottom_profile_combo is window.right_canopy_top_profile_combo
