@@ -118,9 +118,12 @@ class LicenseManager:
         except ImportError as exc:
             raise LicenseError("cryptography package is required for license verification.") from exc
 
-        public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
-        public_key.verify(signature, payload_bytes)
-        return json.loads(payload_bytes.decode("utf-8"))
+        try:
+            public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
+            public_key.verify(signature, payload_bytes)
+            return json.loads(payload_bytes.decode("utf-8"))
+        except Exception as exc:
+            raise LicenseError("License token signature is invalid.") from exc
 
     def status_from_payload(self, payload: dict) -> LicenseStatus:
         now = int(time.time())

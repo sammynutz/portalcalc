@@ -6666,8 +6666,17 @@ if __name__ == "__main__":
         def enforce_license_after_startup():
             if os.environ.get("PORTALCALC_LICENSE_ENFORCED") != "1":
                 return
-            from licensing import require_valid_license
-            if not require_valid_license(window):
+            try:
+                from licensing import require_valid_license
+                licensed = require_valid_license(window)
+            except Exception as exc:
+                QMessageBox.critical(
+                    window,
+                    "License check failed",
+                    str(exc),
+                )
+                licensed = False
+            if not licensed:
                 QMessageBox.warning(
                     window,
                     "License required",
