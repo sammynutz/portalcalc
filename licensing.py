@@ -76,9 +76,26 @@ def _ssl_context() -> ssl.SSLContext:
         context = ssl.create_default_context(cafile=certifi.where())
     except ImportError:
         context = ssl.create_default_context()
+    _load_windows_root_certificates(context)
     if hasattr(ssl, "VERIFY_X509_STRICT"):
         context.verify_flags &= ~ssl.VERIFY_X509_STRICT
     return context
+
+
+def _load_windows_root_certificates(context: ssl.SSLContext) -> None:
+    enum_certificates = getattr(ssl, "enum_certificates", None)
+    der_to_pem = getattr(ssl, "DER_cert_to_PEM_cert", None)
+    if enum_certificates is None or der_to_pem is None:
+        return
+    try:
+        for cert_bytes, encoding, trust in enum_certificates("ROOT"):
+            if encoding != "x509_asn":
+                continue
+            if trust is not True and "1.3.6.1.5.5.7.3.1" not in trust:
+                continue
+            context.load_verify_locations(cadata=der_to_pem(cert_bytes))
+    except Exception:
+        return
 
 
 class LicenseManager:
