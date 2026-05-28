@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import platform
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -62,10 +63,22 @@ def _json_post(url: str, payload: dict, timeout: float = 15.0) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
             return json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, json.JSONDecodeError) as exc:
         raise LicenseError(str(exc)) from exc
+
+
+def _ssl_context() -> ssl.SSLContext:
+    try:
+        import certifi
+
+        context = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        context = ssl.create_default_context()
+    if hasattr(ssl, "VERIFY_X509_STRICT"):
+        context.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    return context
 
 
 class LicenseManager:
