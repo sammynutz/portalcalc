@@ -57,6 +57,13 @@ AREA_REDUCTION_TABLE = {
     "leeward_wall": [(10.0, 1.0), (25.0, 1.0), (100.0, 0.95)],
 }
 
+SIDE_WALL_CPE_BANDS = [
+    (0.0, 1.0, -0.65),
+    (1.0, 2.0, -0.50),
+    (2.0, 3.0, -0.30),
+    (3.0, float("inf"), -0.20),
+]
+
 
 # Ultimate regional wind speed table from the spreadsheet.
 # Rows are importance levels 1-4; columns are wind regions.
@@ -373,7 +380,7 @@ class WindCalculationResult:
             )
         lines.append(f"Kce / Kci         : {kce:.3f} / {kci:.3f}")
         lines.append(f"Manual pressure f : {self.inputs.reduction_factor:.3f}")
-        lines.append(f"Wall Cpe WW/LW    : +0.700 / {self.leeward_wall_cpe:+.3f}")
+        lines.append(f"Wall Cpe WW/LW/S  : +0.700 / {self.leeward_wall_cpe:+.3f} / {side_wall_cpe_first_frame(self):+.3f}")
         lines.append(f"Wall Cpe q WW/LW  : {wall_cpe_line_load_kn_m(self, 0.7):.3f} / {wall_cpe_line_load_kn_m(self, self.leeward_wall_cpe):.3f} kN/m")
         lines.append(f"Cpi line q +/-    : {wall_cpi_line_load_kn_m(self, self.cpi_max):.3f} / {wall_cpi_line_load_kn_m(self, self.cpi_min):.3f} kN/m")
         if self.inputs.roof_pitch_deg >= 10.0:
@@ -476,7 +483,26 @@ def wall_cpe_for_surface(result, surface: str) -> float:
         return 0.7
     if surface == "leeward_wall":
         return result.leeward_wall_cpe
+    if surface == "side_wall":
+        return side_wall_cpe_first_frame(result)
     return -0.65
+
+
+def side_wall_cpe_first_frame(result) -> float:
+    """Table 5.2(C) side-wall Cpe averaged over the first analysed bay."""
+    h_m = max(getattr(result, "h_m", 0.0), 1e-9)
+    inputs = getattr(result, "inputs", result)
+    length_m = max(getattr(inputs, "building_length_m", 0.0), 1e-9)
+    bay_m = min(max(getattr(inputs, "bay_size_m", 0.0), 1e-9), length_m)
+    total = 0.0
+    for from_h, to_h, cpe in SIDE_WALL_CPE_BANDS:
+        a = min(max(from_h * h_m, 0.0), length_m)
+        b = length_m if math.isinf(to_h) else min(max(to_h * h_m, 0.0), length_m)
+        if b <= a:
+            continue
+        overlap = max(0.0, min(bay_m, b) - max(0.0, a))
+        total += cpe * overlap
+    return total / max(bay_m, 1e-9)
 
 
 def local_pressure_dimension_a(result_or_inputs) -> float:

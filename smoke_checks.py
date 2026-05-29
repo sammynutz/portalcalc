@@ -13,8 +13,22 @@ def compile_sources(root: Path) -> None:
 def run_license_smoke_checks() -> None:
     import licensing
     import license_server
+    import wind
 
     assert len(licensing.machine_id()) == 64
+    side_wall_result = wind.calculate_wind(
+        wind.WindInputs(
+            eave_height_m=6.0,
+            building_width_m=24.0,
+            building_length_m=40.0,
+            bay_size_m=12.0,
+        )
+    )
+    expected_side_wall_cpe = (
+        -0.65 * side_wall_result.h_m
+        + -0.50 * (12.0 - side_wall_result.h_m)
+    ) / 12.0
+    assert math.isclose(wind.wall_cpe_for_surface(side_wall_result, "side_wall"), expected_side_wall_cpe, abs_tol=1e-9)
     with tempfile.TemporaryDirectory() as temp_dir:
         manager = licensing.LicenseManager(storage_path=Path(temp_dir) / "license.json")
         status = manager.local_status()

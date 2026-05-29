@@ -4684,13 +4684,27 @@ resize();
 
         def apply_wall_cpe_with_lean_to(target_structure, wind_result, cpe_case, wind_pressure):
             frame_type = wind_result.inputs.frame_type
-            if str(cpe_case).startswith("End"):
-                return []
             if frame_type == "No Wind":
                 return []
             if frame_type == "Roof Only" and not (left_lean_outer_wall_clad or right_lean_outer_wall_clad):
                 return []
             arrows = []
+            if str(cpe_case).startswith("End"):
+                side_cpe = wall_cpe_for_surface(wind_result, "side_wall")
+                wall_area_m2 = wind_result.inputs.bay_size_m * wind_result.inputs.eave_height_m
+                side_line = wall_cpe_line_load_kn_m(wind_result, side_cpe, wind_pressure, "side_wall", wall_area_m2)
+                if frame_type not in {"Roof Only", "No Wind"}:
+                    if wind_result.inputs.left_wall_clad and not left_has_lean_to:
+                        arrows.extend(add_horizontal_line_load(target_structure, left_base, top_nodes[0], side_line, -1.0))
+                    if wind_result.inputs.right_wall_clad and not right_has_lean_to:
+                        arrows.extend(add_horizontal_line_load(target_structure, right_base, top_nodes[-1], side_line, +1.0))
+                if left_lean_outer_wall_clad:
+                    base, top = lean_outer_wall_nodes("left")
+                    arrows.extend(add_horizontal_line_load(target_structure, base, top, side_line, -1.0))
+                if right_lean_outer_wall_clad:
+                    base, top = lean_outer_wall_nodes("right")
+                    arrows.extend(add_horizontal_line_load(target_structure, base, top, side_line, +1.0))
+                return arrows
             left_wind = str(cpe_case).startswith("Left")
             wall_area_m2 = wind_result.inputs.bay_size_m * wind_result.inputs.eave_height_m
             ww_line = wall_cpe_line_load_kn_m(wind_result, 0.7, wind_pressure, "windward_wall", wall_area_m2)
@@ -4718,8 +4732,6 @@ resize();
 
         def apply_wall_cpi_with_lean_to(target_structure, wind_result, cpi_case, wind_pressure, cpe_case):
             frame_type = wind_result.inputs.frame_type
-            if str(cpe_case).startswith("End"):
-                return []
             if frame_type == "No Wind":
                 return []
             if frame_type == "Roof Only" and not (left_lean_outer_wall_clad or right_lean_outer_wall_clad):
