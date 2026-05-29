@@ -5,6 +5,8 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
+from licensing import _ssl_context
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
@@ -35,7 +37,7 @@ def json_post(url: str, payload: dict, headers: dict | None = None, timeout: flo
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
