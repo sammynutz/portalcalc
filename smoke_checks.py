@@ -402,6 +402,7 @@ def run_ui_smoke_checks() -> None:
         cpi_text = window.results_box.toPlainText()
         assert "Left  Table 5.1(B)" in cpi_text
         assert "Left  Table 5.1(B) leeward_wall opening" in cpi_text
+        assert "internal wall Cpi" in cpi_text
         assert "2 Sided lean-to Cpi" not in cpi_text
 
     window.confirm_on_close = False

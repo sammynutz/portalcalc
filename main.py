@@ -4632,6 +4632,56 @@ resize();
                 arrows.append((x, y, total_n / count, 0.0))
             return arrows
 
+        def add_signed_horizontal_line_load(target_structure, base, top, signed_line_kn_m, arrow_count=5):
+            if abs(signed_line_kn_m) <= 1e-12:
+                return []
+            direction = +1.0 if signed_line_kn_m > 0.0 else -1.0
+            return add_horizontal_line_load(target_structure, base, top, abs(signed_line_kn_m), direction, arrow_count)
+
+        def signed_internal_cpi_line_kn_m(wind_result, cpi, wind_pressure):
+            return (
+                cpi
+                * wind_result.wu_kn_m2
+                * wind_pressure_scale(wind_result, wind_pressure)
+                * internal_pressure_factor(wind_result, cpi)
+                * wind_result.inputs.bay_size_m
+            )
+
+        def internal_wall_net_cpi_line(wind_result, side_key, cpi_case, wind_pressure, cpe_case):
+            if side_key == "left":
+                if not (left_has_lean_to and wind_result.inputs.left_wall_clad):
+                    return 0.0, None
+                lean_cpi_for = lambda case: lean_to_cpi_for_case(wind_result, case, cpe_case, "left")[0]
+                main_sign = -1.0
+                lean_sign = +1.0
+            else:
+                if not (right_has_lean_to and wind_result.inputs.right_wall_clad):
+                    return 0.0, None
+                lean_cpi_for = lambda case: lean_to_cpi_for_case(wind_result, case, cpe_case, "right")[0]
+                main_sign = +1.0
+                lean_sign = -1.0
+
+            candidates = []
+            for main_case in CPI_CASE_OPTIONS:
+                main_cpi, _ = main_chamber_cpi(wind_result, main_case, cpe_case)
+                main_line = signed_internal_cpi_line_kn_m(wind_result, main_cpi, wind_pressure)
+                for lean_case in CPI_CASE_OPTIONS:
+                    lean_cpi = lean_cpi_for(lean_case)
+                    lean_line = signed_internal_cpi_line_kn_m(wind_result, lean_cpi, wind_pressure)
+                    signed_line = main_sign * main_line + lean_sign * lean_line
+                    candidates.append((signed_line, main_case, main_cpi, lean_case, lean_cpi))
+            if not candidates:
+                return 0.0, None
+            pick = max if str(cpi_case).strip() == "Cpi +" else min
+            signed_line, main_case, main_cpi, lean_case, lean_cpi = pick(candidates, key=lambda item: item[0])
+            return signed_line, {
+                "side": side_key,
+                "main_case": main_case,
+                "main_cpi": main_cpi,
+                "lean_case": lean_case,
+                "lean_cpi": lean_cpi,
+            }
+
         def apply_wall_cpe_with_lean_to(target_structure, wind_result, cpe_case, wind_pressure):
             frame_type = wind_result.inputs.frame_type
             if str(cpe_case).startswith("End"):
@@ -4681,10 +4731,15 @@ resize();
             main_right_direction = +1.0 if main_cpi > 0 else -1.0
 
             if frame_type not in {"Roof Only", "No Wind"} and abs(main_line) > 1e-12:
-                if wind_result.inputs.left_wall_clad and not left_lean_outer_wall_clad:
+                if wind_result.inputs.left_wall_clad and not left_has_lean_to:
                     arrows.extend(add_horizontal_line_load(target_structure, left_base, top_nodes[0], main_line, main_left_direction))
-                if wind_result.inputs.right_wall_clad and not right_lean_outer_wall_clad:
+                if wind_result.inputs.right_wall_clad and not right_has_lean_to:
                     arrows.extend(add_horizontal_line_load(target_structure, right_base, top_nodes[-1], main_line, main_right_direction))
+
+            left_net_line, _ = internal_wall_net_cpi_line(wind_result, "left", cpi_case, wind_pressure, cpe_case)
+            arrows.extend(add_signed_horizontal_line_load(target_structure, left_base, top_nodes[0], left_net_line))
+            right_net_line, _ = internal_wall_net_cpi_line(wind_result, "right", cpi_case, wind_pressure, cpe_case)
+            arrows.extend(add_signed_horizontal_line_load(target_structure, right_base, top_nodes[-1], right_net_line))
 
             if left_lean_outer_wall_clad:
                 base, top = lean_outer_wall_nodes("left")
@@ -4699,6 +4754,26 @@ resize();
                 direction = +1.0 if right_lean_cpi > 0 else -1.0
                 arrows.extend(add_horizontal_line_load(target_structure, base, top, right_lean_line, direction))
             return arrows
+
+        def internal_wall_cpi_summary_lines(wind_result, combination):
+            lines = []
+            for label, side_key in [("Left", "left"), ("Right", "right")]:
+                signed_line, detail = internal_wall_net_cpi_line(
+                    wind_result,
+                    side_key,
+                    combination.cpi_case,
+                    combination.wind_pressure,
+                    combination.cpe_case,
+                )
+                if detail is None or abs(signed_line) <= 1e-12:
+                    continue
+                direction = "+X" if signed_line > 0.0 else "-X"
+                lines.append(
+                    f"{label} internal wall Cpi: {signed_line:+.3f} kN/m ({direction}), "
+                    f"main {detail['main_case']} {detail['main_cpi']:+.3f}, "
+                    f"lean {detail['lean_case']} {detail['lean_cpi']:+.3f}"
+                )
+            return lines
 
         def canopy_wind_summary_lines(wind_result, combination, active_cpi):
             left_slope_m = slope_path_length_m(left_canopy_top_nodes)
@@ -5096,6 +5171,7 @@ resize();
                         summary_lines.append(f"Open-side Cpi rule  : {combination.cpi_case} overridden to {effective_cpi_case}")
                     summary_lines.append(f"Main chamber Cpi    : {active_cpi:+.3f} ({active_cpi_source})")
                     summary_lines.append(f"Applied Kce / Kci   : {applied_kce:.3f} / {applied_kci:.3f}")
+                    summary_lines.extend(internal_wall_cpi_summary_lines(wind_result, combination))
                     summary_lines.extend(canopy_wind_summary_lines(continuous_roof_wind_result, combination, active_cpi))
                     summary_lines.extend(wind_result.summary_lines())
             elif include_summary:
