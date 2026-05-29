@@ -3544,7 +3544,9 @@ resize();
         label = getattr(self, "license_status_label", None)
         if label is None:
             return
-        if os.environ.get("PORTALCALC_LICENSE_ENFORCED") != "1":
+        from licensing import license_enforced
+
+        if not license_enforced():
             label.setText("Not enforced for this run")
             label.setStyleSheet("color: #777;")
             return
@@ -6707,7 +6709,9 @@ if __name__ == "__main__":
         window.show()
 
         def enforce_license_after_startup():
-            if os.environ.get("PORTALCALC_LICENSE_ENFORCED") != "1":
+            from licensing import license_enforced
+
+            if not license_enforced():
                 return
             try:
                 from licensing import require_valid_license

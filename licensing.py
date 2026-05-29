@@ -14,6 +14,9 @@ from pathlib import Path
 
 APP_NAME = "PortalCalc"
 LICENSE_FILE = "license_token.json"
+DEFAULT_LICENSE_ENFORCED = True
+DEFAULT_LICENSE_API_BASE_URL = "https://portalcalc.onrender.com"
+DEFAULT_LICENSE_PUBLIC_KEY_HEX = "07b75c5894be9353274df66ae71a06150ac1e0272a967fb1dcab928032e56776"
 
 
 @dataclass
@@ -28,6 +31,13 @@ class LicenseStatus:
 
 class LicenseError(Exception):
     pass
+
+
+def license_enforced() -> bool:
+    value = os.environ.get("PORTALCALC_LICENSE_ENFORCED")
+    if value is None:
+        return DEFAULT_LICENSE_ENFORCED
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def app_data_dir() -> Path:
@@ -108,8 +118,16 @@ class LicenseManager:
     """
 
     def __init__(self, api_base_url: str = "", public_key_hex: str = "", storage_path: Path | None = None):
-        self.api_base_url = (api_base_url or os.environ.get("PORTALCALC_LICENSE_API", "")).rstrip("/")
-        self.public_key_hex = public_key_hex or os.environ.get("PORTALCALC_LICENSE_PUBLIC_KEY", "")
+        self.api_base_url = (
+            api_base_url
+            or os.environ.get("PORTALCALC_LICENSE_API", "")
+            or DEFAULT_LICENSE_API_BASE_URL
+        ).rstrip("/")
+        self.public_key_hex = (
+            public_key_hex
+            or os.environ.get("PORTALCALC_LICENSE_PUBLIC_KEY", "")
+            or DEFAULT_LICENSE_PUBLIC_KEY_HEX
+        )
         self.storage_path = storage_path or license_path()
 
     @property

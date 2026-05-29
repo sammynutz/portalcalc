@@ -66,7 +66,11 @@ def run_license_smoke_checks() -> None:
 
 
 def run_ui_smoke_checks() -> None:
+    import os
+
     from PySide6.QtWidgets import QApplication
+
+    os.environ["PORTALCALC_LICENSE_ENFORCED"] = "0"
 
     import main
 
