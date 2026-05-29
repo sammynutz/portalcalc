@@ -2741,26 +2741,206 @@ resize();
 </html>
 """
 
+    def concept_3d_dae(self, data):
+        vertices = []
+        triangles = []
+
+        def add_vertex(point):
+            vertices.append(point)
+            return len(vertices) - 1
+
+        def add_triangle(a, b, c):
+            triangles.append((add_vertex(a), add_vertex(b), add_vertex(c)))
+
+        def add_quad(a, b, c, d):
+            add_triangle(a, b, c)
+            add_triangle(a, c, d)
+
+        def sub(a, b):
+            return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+        def cross(a, b):
+            return (
+                a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0],
+            )
+
+        def length(v):
+            return math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+
+        def normalize(v):
+            size = length(v)
+            if size <= 1e-12:
+                return (0.0, 0.0, 0.0)
+            return (v[0] / size, v[1] / size, v[2] / size)
+
+        def scale(v, factor):
+            return (v[0] * factor, v[1] * factor, v[2] * factor)
+
+        def add(a, b):
+            return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+        def point(node_index, z_m):
+            node = data["nodes"][node_index]
+            # Collada is exported Z-up for SketchUp: X = frame width,
+            # Y = building length, Z = height.
+            return (node["x"], z_m, node["y"])
+
+        def add_prism(a, b, thickness):
+            axis = sub(b, a)
+            if length(axis) <= 1e-9:
+                return
+            direction = normalize(axis)
+            up = (0.0, 0.0, 1.0)
+            side = normalize(cross(direction, up))
+            if length(side) <= 1e-9:
+                side = (1.0, 0.0, 0.0)
+            other = normalize(cross(direction, side))
+            half = thickness / 2.0
+            offsets = [
+                add(scale(side, -half), scale(other, -half)),
+                add(scale(side, half), scale(other, -half)),
+                add(scale(side, half), scale(other, half)),
+                add(scale(side, -half), scale(other, half)),
+            ]
+            a_pts = [add(a, offset) for offset in offsets]
+            b_pts = [add(b, offset) for offset in offsets]
+            for i in range(4):
+                add_quad(a_pts[i], a_pts[(i + 1) % 4], b_pts[(i + 1) % 4], b_pts[i])
+            add_quad(a_pts[3], a_pts[2], a_pts[1], a_pts[0])
+            add_quad(b_pts[0], b_pts[1], b_pts[2], b_pts[3])
+
+        def add_cladding():
+            z0 = data["z_positions"][0]
+            z1 = data["z_positions"][-1]
+            roof_indices = data.get("roof_indices", [])
+            if len(roof_indices) >= 2:
+                for a, b in zip(roof_indices[:-1], roof_indices[1:]):
+                    add_quad(point(a, z0), point(b, z0), point(b, z1), point(a, z1))
+
+            main_top = data.get("main_top_indices", [])
+            wall_states = data.get("wall_states", {})
+            if wall_states.get("left") and main_top:
+                top = data["nodes"][main_top[0]]
+                x = top["x"]
+                add_quad((x, z0, 0.0), (x, z0, top["y"]), (x, z1, top["y"]), (x, z1, 0.0))
+            if wall_states.get("right") and main_top:
+                top = data["nodes"][main_top[-1]]
+                x = top["x"]
+                add_quad((x, z1, 0.0), (x, z1, top["y"]), (x, z0, top["y"]), (x, z0, 0.0))
+            for wall_key, z in [("front", z0), ("back", z1)]:
+                if not wall_states.get(wall_key) or len(main_top) < 2:
+                    continue
+                for a, b in zip(main_top[:-1], main_top[1:]):
+                    pa = point(a, z)
+                    pb = point(b, z)
+                    add_quad((pa[0], z, 0.0), pa, pb, (pb[0], z, 0.0))
+
+        add_cladding()
+        member_thickness = 0.08
+        longitudinal_thickness = 0.035
+        for z_m in data["z_positions"]:
+            for line in data["frame_lines"]:
+                group = str(line.get("group", ""))
+                thickness = 0.12 if group in {"TOP", "BOTTOM", "LEFT_COLUMN", "RIGHT_COLUMN", "INTERNAL_COLUMN"} else member_thickness
+                add_prism(point(line["a"], z_m), point(line["b"], z_m), thickness)
+        for z_a, z_b in zip(data["z_positions"][:-1], data["z_positions"][1:]):
+            for node_index in data["longitudinal_nodes"]:
+                add_prism(point(node_index, z_a), point(node_index, z_b), longitudinal_thickness)
+
+        positions = " ".join(f"{coord:.6f}" for vertex in vertices for coord in vertex)
+        indices = " ".join(str(index) for tri in triangles for index in tri)
+        vertex_count = len(vertices)
+        triangle_count = len(triangles)
+        title = html.escape(data.get("title", "PortalCalc 3D concept"))
+        return f"""<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <asset>
+    <contributor><authoring_tool>PortalCalc</authoring_tool></contributor>
+    <unit name="meter" meter="1"/>
+    <up_axis>Z_UP</up_axis>
+  </asset>
+  <library_effects>
+    <effect id="portalcalc-effect">
+      <profile_COMMON>
+        <technique sid="common">
+          <lambert>
+            <diffuse><color>0.42 0.56 0.62 1</color></diffuse>
+          </lambert>
+        </technique>
+      </profile_COMMON>
+    </effect>
+  </library_effects>
+  <library_materials>
+    <material id="portalcalc-material" name="PortalCalc Material">
+      <instance_effect url="#portalcalc-effect"/>
+    </material>
+  </library_materials>
+  <library_geometries>
+    <geometry id="portalcalc-geometry" name="{title}">
+      <mesh>
+        <source id="portalcalc-positions">
+          <float_array id="portalcalc-positions-array" count="{vertex_count * 3}">{positions}</float_array>
+          <technique_common>
+            <accessor source="#portalcalc-positions-array" count="{vertex_count}" stride="3">
+              <param name="X" type="float"/>
+              <param name="Y" type="float"/>
+              <param name="Z" type="float"/>
+            </accessor>
+          </technique_common>
+        </source>
+        <vertices id="portalcalc-vertices">
+          <input semantic="POSITION" source="#portalcalc-positions"/>
+        </vertices>
+        <triangles material="portalcalc-material" count="{triangle_count}">
+          <input semantic="VERTEX" source="#portalcalc-vertices" offset="0"/>
+          <p>{indices}</p>
+        </triangles>
+      </mesh>
+    </geometry>
+  </library_geometries>
+  <library_visual_scenes>
+    <visual_scene id="Scene" name="Scene">
+      <node id="PortalCalcConcept" name="PortalCalc Concept">
+        <instance_geometry url="#portalcalc-geometry">
+          <bind_material>
+            <technique_common>
+              <instance_material symbol="portalcalc-material" target="#portalcalc-material"/>
+            </technique_common>
+          </bind_material>
+        </instance_geometry>
+      </node>
+    </visual_scene>
+  </library_visual_scenes>
+  <scene>
+    <instance_visual_scene url="#Scene"/>
+  </scene>
+</COLLADA>
+"""
+
     def export_3d_concept(self):
         try:
             data = self.concept_3d_data()
         except (TypeError, ValueError) as exc:
             QMessageBox.warning(self, "3D concept export", str(exc))
             return
-        default_path = os.path.join(os.getcwd(), "portal_3d_concept.html")
-        path, _ = QFileDialog.getSaveFileName(
+        default_path = os.path.join(os.getcwd(), "portal_3d_concept.dae")
+        path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Export 3D concept",
             default_path,
-            "HTML files (*.html);;All files (*.*)",
+            "SketchUp Collada (*.dae);;HTML files (*.html);;All files (*.*)",
         )
         if not path:
             return
         if not os.path.splitext(path)[1]:
-            path += ".html"
+            path += ".dae" if selected_filter.startswith("SketchUp") else ".html"
         try:
+            extension = os.path.splitext(path)[1].lower()
+            content = self.concept_3d_dae(data) if extension == ".dae" else self.concept_3d_html(data)
             with open(path, "w", encoding="utf-8") as file:
-                file.write(self.concept_3d_html(data))
+                file.write(content)
         except OSError as exc:
             QMessageBox.critical(self, "3D concept export failed", str(exc))
             return
