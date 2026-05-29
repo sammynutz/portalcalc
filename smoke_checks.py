@@ -28,10 +28,25 @@ def run_license_smoke_checks() -> None:
         server_settings = license_server.ServerSettings(db_path=db_path, private_key_hex=private_hex)
         activation = license_server.activate_license(server_settings, license_key, licensing.machine_id())
         assert activation["ok"]
-        manager = licensing.LicenseManager(public_key_hex=public_hex, storage_path=Path(temp_dir) / "license.json")
+        license_file = Path(temp_dir) / "license.json"
+        metadata_file = Path(temp_dir) / "license_state.json"
+        manager = licensing.LicenseManager(
+            public_key_hex=public_hex,
+            storage_path=license_file,
+            metadata_path=metadata_file,
+        )
         payload = manager.verify_token(activation["token"])
         assert payload["customer"] == "Smoke Test"
         assert manager.status_from_payload(payload).valid
+        manager.write_token(activation["token"])
+        manager.write_metadata({"last_successful_server_check_at": licensing.time.time() - 2 * 86400})
+        warning_status = manager.local_status()
+        assert warning_status.valid
+        assert "not checked" in warning_status.warning
+        manager.write_metadata({"last_successful_server_check_at": licensing.time.time() - 8 * 86400})
+        stale_status = manager.local_status()
+        assert not stale_status.valid
+        assert stale_status.server_check_required
         check = license_server.check_license(server_settings, activation["token"], licensing.machine_id())
         assert not check["revoked"]
 

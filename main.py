@@ -1393,7 +1393,7 @@ class MainWindow(QMainWindow):
         self.license_status_label = QLabel()
         self.license_status_label.setWordWrap(True)
         self.refresh_license_status_button = QPushButton("Refresh")
-        self.refresh_license_status_button.clicked.connect(self.update_license_status_label)
+        self.refresh_license_status_button.clicked.connect(lambda: self.update_license_status_label(refresh_server=True))
         license_status_row = QWidget()
         license_status_layout = QHBoxLayout()
         license_status_layout.setContentsMargins(0, 0, 0, 0)
@@ -3540,7 +3540,7 @@ resize();
     def column_half_width_for_span_offset(self, profile):
         return (profile.depth or profile.flange_width or 0.0) / 2.0
 
-    def update_license_status_label(self):
+    def update_license_status_label(self, refresh_server=False):
         label = getattr(self, "license_status_label", None)
         if label is None:
             return
@@ -3553,7 +3553,8 @@ resize();
         try:
             from licensing import LicenseManager
 
-            status = LicenseManager().local_status()
+            manager = LicenseManager()
+            status = manager.refresh() if refresh_server else manager.local_status()
         except Exception as exc:
             label.setText(f"Check failed: {exc}")
             label.setStyleSheet("color: #b00020;")
@@ -3566,9 +3567,12 @@ resize();
                 details.append(status.plan)
             if status.days_remaining is not None:
                 details.append(f"{status.days_remaining} days remaining")
+            if status.warning:
+                details.append(status.warning)
             suffix = f" ({', '.join(details)})" if details else ""
             label.setText(f"Valid{suffix}")
-            label.setStyleSheet("color: #1b7f3a; font-weight: bold;")
+            color = "#9a6700" if status.warning else "#1b7f3a"
+            label.setStyleSheet(f"color: {color}; font-weight: bold;")
         else:
             label.setText(status.reason)
             label.setStyleSheet("color: #b00020; font-weight: bold;")

@@ -14,9 +14,12 @@ from pathlib import Path
 
 APP_NAME = "PortalCalc"
 LICENSE_FILE = "license_token.json"
+LICENSE_METADATA_FILE = "license_state.json"
 DEFAULT_LICENSE_ENFORCED = True
 DEFAULT_LICENSE_API_BASE_URL = "https://portalcalc.onrender.com"
 DEFAULT_LICENSE_PUBLIC_KEY_HEX = "07b75c5894be9353274df66ae71a06150ac1e0272a967fb1dcab928032e56776"
+SERVER_CHECK_GRACE_DAYS = 7
+SERVER_CHECK_GRACE_SECONDS = SERVER_CHECK_GRACE_DAYS * 86400
 
 
 @dataclass
@@ -27,6 +30,10 @@ class LicenseStatus:
     plan: str = ""
     expires_at: int | None = None
     days_remaining: int | None = None
+    last_server_check_at: int | None = None
+    server_check_age_days: int | None = None
+    server_check_required: bool = False
+    warning: str = ""
 
 
 class LicenseError(Exception):
@@ -52,6 +59,10 @@ def app_data_dir() -> Path:
 
 def license_path() -> Path:
     return app_data_dir() / LICENSE_FILE
+
+
+def license_metadata_path() -> Path:
+    return app_data_dir() / LICENSE_METADATA_FILE
 
 
 def machine_id() -> str:
@@ -117,7 +128,13 @@ class LicenseManager:
     the public key embedded/configured locally.
     """
 
-    def __init__(self, api_base_url: str = "", public_key_hex: str = "", storage_path: Path | None = None):
+    def __init__(
+        self,
+        api_base_url: str = "",
+        public_key_hex: str = "",
+        storage_path: Path | None = None,
+        metadata_path: Path | None = None,
+    ):
         self.api_base_url = (
             api_base_url
             or os.environ.get("PORTALCALC_LICENSE_API", "")
@@ -129,6 +146,7 @@ class LicenseManager:
             or DEFAULT_LICENSE_PUBLIC_KEY_HEX
         )
         self.storage_path = storage_path or license_path()
+        self.metadata_path = metadata_path or license_metadata_path()
 
     @property
     def activation_url(self) -> str:
@@ -149,6 +167,29 @@ class LicenseManager:
     def write_token(self, token: str) -> None:
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
         self.storage_path.write_text(json.dumps({"token": token}, indent=2), encoding="utf-8")
+
+    def read_metadata(self) -> dict:
+        try:
+            data = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def write_metadata(self, data: dict) -> None:
+        self.metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        self.metadata_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def record_successful_server_check(self) -> None:
+        metadata = self.read_metadata()
+        metadata["last_successful_server_check_at"] = int(time.time())
+        self.write_metadata(metadata)
+
+    def last_successful_server_check_at(self) -> int | None:
+        value = self.read_metadata().get("last_successful_server_check_at")
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def verify_token(self, token: str) -> dict:
         if not self.public_key_hex:
@@ -193,7 +234,36 @@ class LicenseManager:
             days_remaining=days_remaining,
         )
 
+    def status_with_server_grace(self, status: LicenseStatus) -> LicenseStatus:
+        if not status.valid:
+            return status
+        now = int(time.time())
+        last_check = self.last_successful_server_check_at()
+        status.last_server_check_at = last_check
+        if last_check is None:
+            status.server_check_required = True
+            status.warning = "License needs an online server check."
+            return status
+        age_seconds = max(now - last_check, 0)
+        status.server_check_age_days = int(age_seconds / 86400)
+        if age_seconds > SERVER_CHECK_GRACE_SECONDS:
+            status.valid = False
+            status.server_check_required = True
+            status.reason = f"License server has not been reached for more than {SERVER_CHECK_GRACE_DAYS} days."
+        elif age_seconds > 86400:
+            status.warning = f"License server not checked for {status.server_check_age_days} days."
+        return status
+
     def local_status(self) -> LicenseStatus:
+        token = self.read_token()
+        if not token:
+            return LicenseStatus(False, "No license is activated.")
+        try:
+            return self.status_with_server_grace(self.status_from_payload(self.verify_token(token)))
+        except LicenseError as exc:
+            return LicenseStatus(False, str(exc))
+
+    def token_status(self) -> LicenseStatus:
         token = self.read_token()
         if not token:
             return LicenseStatus(False, "No license is activated.")
@@ -213,6 +283,7 @@ class LicenseManager:
         status = self.status_from_payload(payload)
         if status.valid:
             self.write_token(str(token))
+            self.record_successful_server_check()
         return status
 
     def refresh(self) -> LicenseStatus:
@@ -227,12 +298,24 @@ class LicenseManager:
         refreshed = response.get("token")
         if refreshed:
             self.write_token(str(refreshed))
+        self.record_successful_server_check()
         return self.local_status()
+
+    def startup_status(self) -> LicenseStatus:
+        local = self.local_status()
+        if not local.valid and not local.server_check_required:
+            return local
+        if not self.api_base_url:
+            return local
+        try:
+            return self.refresh()
+        except LicenseError:
+            return local
 
 
 def require_valid_license(parent=None, manager: LicenseManager | None = None) -> bool:
     manager = manager or LicenseManager()
-    status = manager.local_status()
+    status = manager.startup_status()
     if status.valid:
         return True
 
