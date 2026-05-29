@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def compile_sources(root: Path) -> None:
-    for name in ["main.py", "member_checks.py", "loads.py", "wind.py", "licensing.py", "license_server.py"]:
+    for name in ["main.py", "member_checks.py", "loads.py", "wind.py", "licensing.py", "license_server.py", "license_generator_app.py"]:
         py_compile.compile(str(root / name), doraise=True)
 
 
