@@ -50,8 +50,26 @@ python main.py
 - `POST /activate` with `license_key` and `machine_id`
 - `POST /check` with `token` and `machine_id`
 - `POST /admin/licenses` with `X-Admin-Token`, `customer`, `plan`, optional `expires_at`, and `max_machines`
+- `GET /admin/licenses` with `X-Admin-Token` to list issued licenses
+- `GET /admin/licenses/{license_key_hash}` with `X-Admin-Token` to view activations
+- `POST /admin/licenses/{license_key_hash}/cancel` with `X-Admin-Token` to cancel a license
+- `POST /admin/licenses/{license_key_hash}/reactivate` with `X-Admin-Token` to reactivate a canceled license
+- `DELETE /admin/licenses/{license_key_hash}/activations/{machine_id}` with `X-Admin-Token` to remove one machine activation
 
 The desktop app currently uses `/activate` and `/check`.
+
+## Admin view
+
+Open `/admin` on the hosted service, for example:
+
+```text
+https://your-service-name.onrender.com/admin
+```
+
+Enter the same admin token used for `PORTALCALC_LICENSE_ADMIN_TOKEN`. From
+there you can create licenses, list current licenses, cancel/reactivate them,
+and remove an activated machine so a customer can activate a replacement
+machine.
 
 ## Render deployment
 
@@ -68,12 +86,12 @@ Environment variables:
 
 - `PORTALCALC_LICENSE_PRIVATE_KEY`: the server private key from `python license_server.py keygen`
 - `PORTALCALC_LICENSE_ADMIN_TOKEN`: a long random admin password
-- `PORTALCALC_LICENSE_DB`: `portalcalc_licenses.db`
+- `PORTALCALC_LICENSE_DB`: a path on the persistent disk, for example `/var/data/portalcalc_licenses.db`
 - `PORTALCALC_LICENSE_TOKEN_DAYS`: `30`
 
-For production, add a Render persistent disk or move the database to Postgres
-before issuing real customer licenses. Render's normal filesystem is temporary,
-so a plain SQLite file can be lost on restart/redeploy without persistent storage.
+For production, keep the SQLite file on a Render persistent disk. Render's
+normal filesystem is temporary, so a plain SQLite file outside the mounted disk
+can be lost on restart/redeploy.
 
 After deploy, the desktop app should use:
 

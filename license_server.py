@@ -17,6 +17,397 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 
 DEFAULT_DB_PATH = "portalcalc_licenses.db"
 DEFAULT_TOKEN_DAYS = 30
+ADMIN_HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PortalCalc License Admin</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: Arial, Helvetica, sans-serif;
+      --border: #d7dde5;
+      --muted: #5f6b7a;
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --text: #17202c;
+      --accent: #1769aa;
+      --danger: #b42318;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.2;
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 20px 24px 40px;
+    }
+    .toolbar, .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    .toolbar {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(120px, 1fr)) auto;
+      gap: 10px;
+      align-items: end;
+      margin-bottom: 16px;
+    }
+    label {
+      display: grid;
+      gap: 5px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    input, button, select {
+      min-height: 36px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0 10px;
+      font: inherit;
+    }
+    input, select {
+      background: transparent;
+      color: inherit;
+    }
+    button {
+      cursor: pointer;
+      background: #eef4fa;
+      color: var(--text);
+    }
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: white;
+    }
+    button.danger {
+      background: #fff1f0;
+      border-color: #ffccc7;
+      color: var(--danger);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    th, td {
+      padding: 10px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      vertical-align: top;
+      font-size: 14px;
+    }
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    tr:last-child td {
+      border-bottom: 0;
+    }
+    .status {
+      display: inline-block;
+      min-width: 66px;
+      border-radius: 999px;
+      padding: 3px 8px;
+      text-align: center;
+      font-size: 12px;
+      background: #e6f4ea;
+      color: #137333;
+    }
+    .status.canceled {
+      background: #fce8e6;
+      color: var(--danger);
+    }
+    .muted {
+      color: var(--muted);
+    }
+    .hash {
+      font-family: Consolas, monospace;
+      font-size: 12px;
+      word-break: break-all;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    dialog {
+      width: min(740px, calc(100vw - 32px));
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0;
+      color: var(--text);
+      background: var(--panel);
+    }
+    dialog::backdrop {
+      background: rgba(0, 0, 0, .35);
+    }
+    .dialog-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .dialog-body {
+      padding: 16px;
+    }
+    #message {
+      margin: 0 0 12px;
+      min-height: 20px;
+      color: var(--muted);
+    }
+    @media (max-width: 860px) {
+      header {
+        align-items: stretch;
+        flex-direction: column;
+      }
+      .toolbar {
+        grid-template-columns: 1fr;
+      }
+      table, thead, tbody, th, td, tr {
+        display: block;
+      }
+      thead {
+        display: none;
+      }
+      tr {
+        border-bottom: 1px solid var(--border);
+        padding: 8px 0;
+      }
+      td {
+        border: 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>PortalCalc License Admin</h1>
+    <label>Admin token
+      <input id="token" type="password" autocomplete="current-password">
+    </label>
+  </header>
+  <main>
+    <p id="message"></p>
+    <section class="toolbar">
+      <label>Customer
+        <input id="customer" placeholder="Customer name">
+      </label>
+      <label>Plan
+        <input id="plan" value="standard">
+      </label>
+      <label>Expires
+        <input id="expires" type="date">
+      </label>
+      <label>Machines
+        <input id="machines" type="number" min="1" value="1">
+      </label>
+      <span></span>
+      <button id="create" class="primary">Create License</button>
+    </section>
+    <table>
+      <thead>
+        <tr>
+          <th>Customer</th>
+          <th>Plan</th>
+          <th>Status</th>
+          <th>Activations</th>
+          <th>Expires</th>
+          <th>Created</th>
+          <th>Hash</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="licenses"></tbody>
+    </table>
+  </main>
+  <dialog id="detailDialog">
+    <div class="dialog-head">
+      <strong id="detailTitle">License</strong>
+      <button id="closeDetail">Close</button>
+    </div>
+    <div class="dialog-body">
+      <div id="detailBody"></div>
+    </div>
+  </dialog>
+  <script>
+    const tokenInput = document.querySelector("#token");
+    const message = document.querySelector("#message");
+    const tbody = document.querySelector("#licenses");
+    const detailDialog = document.querySelector("#detailDialog");
+    const detailBody = document.querySelector("#detailBody");
+    const detailTitle = document.querySelector("#detailTitle");
+    tokenInput.value = sessionStorage.getItem("portalcalcAdminToken") || "";
+
+    function headers() {
+      const token = tokenInput.value.trim();
+      sessionStorage.setItem("portalcalcAdminToken", token);
+      return {"Content-Type": "application/json", "X-Admin-Token": token};
+    }
+    function fmtDate(seconds) {
+      if (!seconds) return "Never";
+      return new Date(seconds * 1000).toLocaleString();
+    }
+    function setMessage(text, isError) {
+      message.textContent = text || "";
+      message.style.color = isError ? "#b42318" : "";
+    }
+    async function api(path, options = {}) {
+      const response = await fetch(path, {...options, headers: {...headers(), ...(options.headers || {})}});
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || response.statusText);
+      }
+      return await response.json();
+    }
+    async function loadLicenses() {
+      try {
+        const data = await api("/admin/licenses");
+        tbody.innerHTML = "";
+        data.licenses.forEach((license) => {
+          const row = document.createElement("tr");
+          const statusClass = license.status === "active" ? "" : "canceled";
+          row.innerHTML = `
+            <td>${escapeHtml(license.customer)}</td>
+            <td>${escapeHtml(license.plan)}</td>
+            <td><span class="status ${statusClass}">${escapeHtml(license.status)}</span></td>
+            <td>${license.activations} / ${license.max_machines}</td>
+            <td>${fmtDate(license.expires_at)}</td>
+            <td>${fmtDate(license.created_at)}</td>
+            <td class="hash">${license.license_key_hash_short}</td>
+            <td><div class="actions"></div></td>
+          `;
+          const actions = row.querySelector(".actions");
+          addButton(actions, "View", () => showDetail(license.license_key_hash));
+          if (license.status === "active") {
+            addButton(actions, "Cancel", () => setStatus(license.license_key_hash, "cancel"), "danger");
+          } else {
+            addButton(actions, "Reactivate", () => setStatus(license.license_key_hash, "reactivate"));
+          }
+          tbody.appendChild(row);
+        });
+        setMessage(`Loaded ${data.licenses.length} license(s).`);
+      } catch (error) {
+        setMessage(error.message, true);
+      }
+    }
+    function addButton(parent, text, handler, className) {
+      const button = document.createElement("button");
+      button.textContent = text;
+      if (className) button.className = className;
+      button.addEventListener("click", handler);
+      parent.appendChild(button);
+    }
+    async function createLicense() {
+      const expires = document.querySelector("#expires").value;
+      const payload = {
+        customer: document.querySelector("#customer").value.trim(),
+        plan: document.querySelector("#plan").value.trim() || "standard",
+        expires_at: expires ? Math.floor(new Date(`${expires}T23:59:59Z`).getTime() / 1000) : null,
+        max_machines: Number(document.querySelector("#machines").value || 1),
+      };
+      if (!payload.customer) {
+        setMessage("Customer is required.", true);
+        return;
+      }
+      try {
+        const created = await api("/admin/licenses", {method: "POST", body: JSON.stringify(payload)});
+        await loadLicenses();
+        setMessage(`Created license key: ${created.license_key}`);
+      } catch (error) {
+        setMessage(error.message, true);
+      }
+    }
+    async function setStatus(hash, action) {
+      if (action === "cancel" && !confirm("Cancel this license? Existing desktop tokens will fail on their next server check.")) return;
+      try {
+        await api(`/admin/licenses/${hash}/${action}`, {method: "POST"});
+        await loadLicenses();
+      } catch (error) {
+        setMessage(error.message, true);
+      }
+    }
+    async function showDetail(hash) {
+      try {
+        const detail = await api(`/admin/licenses/${hash}`);
+        detailTitle.textContent = `${detail.customer} (${detail.status})`;
+        const activations = detail.activation_rows.map((activation) => `
+          <tr>
+            <td class="hash">${activation.machine_id}</td>
+            <td>${fmtDate(activation.activated_at)}</td>
+            <td>${fmtDate(activation.last_seen_at)}</td>
+            <td><button class="danger" data-machine="${activation.machine_id}">Remove</button></td>
+          </tr>
+        `).join("");
+        detailBody.innerHTML = `
+          <p class="muted hash">${detail.license_key_hash}</p>
+          <table>
+            <thead><tr><th>Machine</th><th>Activated</th><th>Last seen</th><th>Actions</th></tr></thead>
+            <tbody>${activations || '<tr><td colspan="4" class="muted">No activations yet.</td></tr>'}</tbody>
+          </table>
+        `;
+        detailBody.querySelectorAll("[data-machine]").forEach((button) => {
+          button.addEventListener("click", () => removeActivation(hash, button.dataset.machine));
+        });
+        detailDialog.showModal();
+      } catch (error) {
+        setMessage(error.message, true);
+      }
+    }
+    async function removeActivation(hash, machine) {
+      if (!confirm("Remove this machine activation? The customer can activate another machine if capacity allows.")) return;
+      try {
+        await api(`/admin/licenses/${hash}/activations/${machine}`, {method: "DELETE"});
+        await showDetail(hash);
+        await loadLicenses();
+      } catch (error) {
+        setMessage(error.message, true);
+      }
+    }
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      }[char]));
+    }
+    document.querySelector("#create").addEventListener("click", createLicense);
+    document.querySelector("#closeDetail").addEventListener("click", () => detailDialog.close());
+    tokenInput.addEventListener("change", loadLicenses);
+    if (tokenInput.value) loadLicenses();
+  </script>
+</body>
+</html>
+"""
 
 
 @dataclass
@@ -183,6 +574,72 @@ def activation_count(db: sqlite3.Connection, license_key_hash: str) -> int:
     return int(row["count"]) if row else 0
 
 
+def license_summary(row: sqlite3.Row, activations: int) -> dict[str, Any]:
+    license_key_hash = str(row["license_key_hash"])
+    return {
+        "license_key_hash": license_key_hash,
+        "license_key_hash_short": license_key_hash[:12],
+        "customer": row["customer"],
+        "plan": row["plan"],
+        "expires_at": row["expires_at"],
+        "max_machines": row["max_machines"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "activations": activations,
+    }
+
+
+def list_licenses(db_path: str) -> list[dict[str, Any]]:
+    with db_session(db_path) as db:
+        rows = db.execute(
+            """
+            SELECT l.*, COUNT(a.machine_id) AS activation_count
+            FROM licenses l
+            LEFT JOIN activations a ON a.license_key_hash = l.license_key_hash
+            GROUP BY l.license_key_hash
+            ORDER BY l.created_at DESC
+            """
+        ).fetchall()
+        return [license_summary(row, int(row["activation_count"])) for row in rows]
+
+
+def license_detail(db_path: str, license_key_hash: str) -> dict[str, Any] | None:
+    with db_session(db_path) as db:
+        row = license_row(db, license_key_hash)
+        if row is None:
+            return None
+        activations = db.execute(
+            """
+            SELECT machine_id, activated_at, last_seen_at
+            FROM activations
+            WHERE license_key_hash = ?
+            ORDER BY last_seen_at DESC
+            """,
+            (license_key_hash,),
+        ).fetchall()
+        detail = license_summary(row, len(activations))
+        detail["activation_rows"] = [dict(activation) for activation in activations]
+        return detail
+
+
+def set_license_status(db_path: str, license_key_hash: str, status: str) -> bool:
+    with db_session(db_path) as db:
+        result = db.execute(
+            "UPDATE licenses SET status = ? WHERE license_key_hash = ?",
+            (status, license_key_hash),
+        )
+        return result.rowcount > 0
+
+
+def delete_activation(db_path: str, license_key_hash: str, machine_id: str) -> bool:
+    with db_session(db_path) as db:
+        result = db.execute(
+            "DELETE FROM activations WHERE license_key_hash = ? AND machine_id = ?",
+            (license_key_hash, machine_id),
+        )
+        return result.rowcount > 0
+
+
 def build_token_payload(row: sqlite3.Row, license_key_hash: str, machine_id: str) -> dict[str, Any]:
     return {
         "license_key_hash": license_key_hash,
@@ -260,6 +717,7 @@ def check_license(settings: ServerSettings, token: str, machine_id: str) -> dict
 def create_app(settings: ServerSettings | None = None):
     try:
         from fastapi import FastAPI, Header, HTTPException
+        from fastapi.responses import HTMLResponse
         from pydantic import BaseModel
     except ImportError as exc:
         raise RuntimeError("Install fastapi and uvicorn to run the license server.") from exc
@@ -321,6 +779,57 @@ def create_app(settings: ServerSettings | None = None):
             max_machines=request.max_machines,
         )
         return {"license_key": license_key}
+
+    @app.get("/admin/licenses")
+    def admin_list_licenses(x_admin_token: str | None = Header(default=None)) -> dict[str, Any]:
+        require_admin(x_admin_token)
+        return {"licenses": list_licenses(settings.db_path)}
+
+    @app.get("/admin/licenses/{license_key_hash}")
+    def admin_license_detail(
+        license_key_hash: str,
+        x_admin_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        require_admin(x_admin_token)
+        detail = license_detail(settings.db_path, license_key_hash)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="License not found")
+        return detail
+
+    @app.post("/admin/licenses/{license_key_hash}/cancel")
+    def admin_cancel_license(
+        license_key_hash: str,
+        x_admin_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        require_admin(x_admin_token)
+        if not set_license_status(settings.db_path, license_key_hash, "canceled"):
+            raise HTTPException(status_code=404, detail="License not found")
+        return {"ok": True, "status": "canceled"}
+
+    @app.post("/admin/licenses/{license_key_hash}/reactivate")
+    def admin_reactivate_license(
+        license_key_hash: str,
+        x_admin_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        require_admin(x_admin_token)
+        if not set_license_status(settings.db_path, license_key_hash, "active"):
+            raise HTTPException(status_code=404, detail="License not found")
+        return {"ok": True, "status": "active"}
+
+    @app.delete("/admin/licenses/{license_key_hash}/activations/{machine_id}")
+    def admin_delete_activation(
+        license_key_hash: str,
+        machine_id: str,
+        x_admin_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        require_admin(x_admin_token)
+        if not delete_activation(settings.db_path, license_key_hash, machine_id):
+            raise HTTPException(status_code=404, detail="Activation not found")
+        return {"ok": True}
+
+    @app.get("/admin", response_class=HTMLResponse)
+    def admin_view() -> HTMLResponse:
+        return HTMLResponse(ADMIN_HTML)
 
     return app
 
