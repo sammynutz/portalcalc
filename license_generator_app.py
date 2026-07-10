@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -8,7 +9,7 @@ from datetime import datetime, timezone
 from licensing import _ssl_context
 
 from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -31,6 +32,22 @@ from PySide6.QtWidgets import (
 
 
 DEFAULT_LICENSE_API = "https://portalcalc.onrender.com"
+APP_ICON_FILENAME = os.path.join("assets", "portalcalc_icon.ico")
+
+
+def resource_path(relative_path: str) -> str:
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
+
+def app_icon() -> QIcon:
+    icon = QIcon(resource_path(APP_ICON_FILENAME))
+    if icon.isNull():
+        icon = QIcon(resource_path(os.path.join("assets", "portalcalc_icon.svg")))
+    return icon
 
 
 def json_request(
@@ -69,6 +86,10 @@ def json_delete(url: str, headers: dict | None = None, timeout: float = 20.0) ->
     return json_request(url, None, headers, "DELETE", timeout)
 
 
+def json_patch(url: str, payload: dict, headers: dict | None = None, timeout: float = 20.0) -> dict:
+    return json_request(url, payload, headers, "PATCH", timeout)
+
+
 def expiry_timestamp(date_text: str) -> int | None:
     text = date_text.strip()
     if not text:
@@ -82,6 +103,7 @@ def expiry_timestamp(date_text: str) -> int | None:
 class LicenseGeneratorApp(QWidget):
     def __init__(self):
         super().__init__()
+        self.setWindowIcon(app_icon())
         self.setWindowTitle("PortalCalc License Admin")
         self.setMinimumWidth(900)
 
@@ -125,6 +147,7 @@ class LicenseGeneratorApp(QWidget):
         self.copy_button = QPushButton("Copy Key")
         self.refresh_button = QPushButton("Refresh List")
         self.view_button = QPushButton("View Activations")
+        self.edit_button = QPushButton("Edit License")
         self.cancel_button = QPushButton("Cancel")
         self.reactivate_button = QPushButton("Reactivate")
         self.remove_activation_button = QPushButton("Remove Activation")
@@ -134,6 +157,7 @@ class LicenseGeneratorApp(QWidget):
         self.copy_button.clicked.connect(self.copy_license_key)
         self.refresh_button.clicked.connect(self.refresh_licenses)
         self.view_button.clicked.connect(self.view_selected_license)
+        self.edit_button.clicked.connect(self.edit_selected_license)
         self.cancel_button.clicked.connect(self.cancel_selected_license)
         self.reactivate_button.clicked.connect(self.reactivate_selected_license)
         self.remove_activation_button.clicked.connect(self.remove_selected_activation)
@@ -142,6 +166,7 @@ class LicenseGeneratorApp(QWidget):
         button_row.addWidget(self.copy_button)
         button_row.addWidget(self.refresh_button)
         button_row.addWidget(self.view_button)
+        button_row.addWidget(self.edit_button)
         button_row.addWidget(self.cancel_button)
         button_row.addWidget(self.reactivate_button)
         button_row.addWidget(self.remove_activation_button)
@@ -214,6 +239,7 @@ class LicenseGeneratorApp(QWidget):
         has_selection = selected is not None
         status = str(selected.get("status", "")) if selected else ""
         self.view_button.setEnabled(has_selection)
+        self.edit_button.setEnabled(has_selection)
         self.cancel_button.setEnabled(has_selection and status == "active")
         self.reactivate_button.setEnabled(has_selection and status != "active")
         self.remove_activation_button.setEnabled(bool(self.current_detail and self.current_detail.get("activation_rows")))
@@ -352,9 +378,12 @@ class LicenseGeneratorApp(QWidget):
         if not activations:
             lines.append("  None")
         for index, activation in enumerate(activations, start=1):
+            machine_name = str(activation.get("machine_name") or "Unnamed computer")
+            machine_id = str(activation.get("machine_id", ""))
             lines.extend(
                 [
-                    f"  {index}. Machine: {activation.get('machine_id', '')}",
+                    f"  {index}. Machine: {machine_name}",
+                    f"     ID: {machine_id}",
                     f"     Activated: {self.format_timestamp(activation.get('activated_at'))}",
                     f"     Last seen: {self.format_timestamp(activation.get('last_seen_at'))}",
                 ]
@@ -362,6 +391,91 @@ class LicenseGeneratorApp(QWidget):
         self.output.setPlainText("\n".join(lines))
         self.set_status("License details loaded.")
         self.update_action_state()
+
+    def edit_selected_license(self) -> None:
+        admin_inputs = self.require_admin_inputs()
+        selected = self.selected_license()
+        license_hash = self.selected_license_hash()
+        if admin_inputs is None or selected is None or not license_hash:
+            return
+
+        customer, accepted = QInputDialog.getText(
+            self,
+            "Edit license",
+            "Customer",
+            text=str(selected.get("customer", "")),
+        )
+        if not accepted:
+            return
+        customer = customer.strip()
+        if not customer:
+            QMessageBox.warning(self, "Missing customer", "Customer is required.")
+            return
+
+        plans = ["standard", "trial", "business"]
+        current_plan = str(selected.get("plan", "standard") or "standard")
+        if current_plan not in plans:
+            plans.insert(0, current_plan)
+        plan, accepted = QInputDialog.getItem(
+            self,
+            "Edit license",
+            "Plan",
+            plans,
+            plans.index(current_plan),
+            True,
+        )
+        if not accepted:
+            return
+
+        max_machines, accepted = QInputDialog.getInt(
+            self,
+            "Edit license",
+            "Max machines",
+            int(selected.get("max_machines", 1) or 1),
+            1,
+            999,
+        )
+        if not accepted:
+            return
+
+        expires_at = selected.get("expires_at")
+        expiry_text = (
+            datetime.fromtimestamp(int(expires_at), tz=timezone.utc).strftime("%Y-%m-%d")
+            if expires_at
+            else ""
+        )
+        expiry_text, accepted = QInputDialog.getText(
+            self,
+            "Edit license",
+            "Expiry date (blank or YYYY-MM-DD)",
+            text=expiry_text,
+        )
+        if not accepted:
+            return
+        try:
+            parsed_expiry = expiry_timestamp(expiry_text)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid expiry", str(exc))
+            return
+
+        api_url, _token = admin_inputs
+        payload = {
+            "customer": customer,
+            "plan": str(plan).strip() or "standard",
+            "max_machines": max_machines,
+            "expires_at": parsed_expiry,
+        }
+        try:
+            json_patch(
+                f"{api_url}/admin/licenses/{license_hash}",
+                payload,
+                headers=self.admin_headers(),
+            )
+        except Exception as exc:
+            self.set_status(f"Failed: {exc}", ok=False)
+            return
+        self.set_status("License updated.")
+        self.refresh_licenses()
 
     def set_selected_license_status(self, action: str) -> None:
         admin_inputs = self.require_admin_inputs()
@@ -400,16 +514,22 @@ class LicenseGeneratorApp(QWidget):
             return
         machine_id = str(activations[0].get("machine_id", ""))
         if len(activations) > 1:
-            machine_id, accepted = QInputDialog.getItem(
+            activation_labels = [
+                f"{item.get('machine_name') or 'Unnamed computer'} - {item.get('machine_id', '')}"
+                for item in activations
+            ]
+            selected_label, accepted = QInputDialog.getItem(
                 self,
                 "Remove activation",
                 "Machine",
-                [str(item.get("machine_id", "")) for item in activations],
+                activation_labels,
                 0,
                 False,
             )
             if not accepted:
                 return
+            selected_index = activation_labels.index(selected_label)
+            machine_id = str(activations[selected_index].get("machine_id", ""))
         confirmed = QMessageBox.question(
             self,
             "Remove activation",
@@ -440,6 +560,7 @@ class LicenseGeneratorApp(QWidget):
 
 def main() -> None:
     app = QApplication(sys.argv)
+    app.setWindowIcon(app_icon())
     window = LicenseGeneratorApp()
     window.show()
     sys.exit(app.exec())

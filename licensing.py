@@ -70,6 +70,14 @@ def machine_id() -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def machine_name() -> str:
+    host = (platform.node() or os.environ.get("COMPUTERNAME") or "").strip()
+    user = (os.environ.get("USERNAME") or os.environ.get("USER") or "").strip()
+    if host and user:
+        return f"{host} ({user})"[:120]
+    return (host or user or "Unknown computer")[:120]
+
+
 def _b64url_decode(value: str) -> bytes:
     padding = "=" * (-len(value) % 4)
     return base64.urlsafe_b64decode((value + padding).encode("ascii"))
@@ -275,7 +283,10 @@ class LicenseManager:
     def activate(self, license_key: str) -> LicenseStatus:
         if not self.api_base_url:
             return LicenseStatus(False, "License API URL is not configured.")
-        response = _json_post(self.activation_url, {"license_key": license_key, "machine_id": machine_id()})
+        response = _json_post(
+            self.activation_url,
+            {"license_key": license_key, "machine_id": machine_id(), "machine_name": machine_name()},
+        )
         token = response.get("token")
         if not token:
             return LicenseStatus(False, response.get("message", "Activation failed."))
@@ -292,7 +303,7 @@ class LicenseManager:
             return LicenseStatus(False, "No license is activated.")
         if not self.api_base_url:
             return self.local_status()
-        response = _json_post(self.check_url, {"token": token, "machine_id": machine_id()})
+        response = _json_post(self.check_url, {"token": token, "machine_id": machine_id(), "machine_name": machine_name()})
         if response.get("revoked"):
             return LicenseStatus(False, response.get("message", "License has been revoked."))
         refreshed = response.get("token")
@@ -324,7 +335,16 @@ def require_valid_license(parent=None, manager: LicenseManager | None = None) ->
     except ImportError:
         return False
 
-    key, accepted = QInputDialog.getText(parent, "Activate License", f"{status.reason}\n\nEnter license key:")
+    key, accepted = QInputDialog.getText(
+        parent,
+        "Activate License",
+        (
+            f"{status.reason}\n\n"
+            "Enter license key:\n\n"
+            "By pressing OK, you confirm that you accept the terms of the EULA. "
+            "The EULA can be accessed from Help > EULA."
+        ),
+    )
     if not accepted or not key.strip():
         return False
     activated = manager.activate(key.strip())

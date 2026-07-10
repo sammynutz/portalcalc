@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -17,6 +18,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 
 DEFAULT_DB_PATH = "portalcalc_licenses.db"
 DEFAULT_TOKEN_DAYS = 30
+DEFAULT_PERSISTENT_ROOT = "/var/data"
+_BACKUP_LOCK = threading.Lock()
 ADMIN_HTML = r"""
 <!doctype html>
 <html lang="en">
@@ -306,6 +309,7 @@ ADMIN_HTML = r"""
           `;
           const actions = row.querySelector(".actions");
           addButton(actions, "View", () => showDetail(license.license_key_hash));
+          addButton(actions, "Edit", () => editLicense(license));
           if (license.status === "active") {
             addButton(actions, "Cancel", () => setStatus(license.license_key_hash, "cancel"), "danger");
           } else {
@@ -354,16 +358,51 @@ ADMIN_HTML = r"""
         setMessage(error.message, true);
       }
     }
+    async function editLicense(license) {
+      const customer = prompt("Customer", license.customer || "");
+      if (customer === null) return;
+      const plan = prompt("Plan", license.plan || "standard");
+      if (plan === null) return;
+      const machinesText = prompt("Max machines", license.max_machines || 1);
+      if (machinesText === null) return;
+      const currentExpiry = license.expires_at ? new Date(license.expires_at * 1000).toISOString().slice(0, 10) : "";
+      const expiryText = prompt("Expiry date (YYYY-MM-DD, blank for none)", currentExpiry);
+      if (expiryText === null) return;
+      const payload = {
+        customer: customer.trim(),
+        plan: plan.trim() || "standard",
+        expires_at: expiryText.trim() ? Math.floor(new Date(`${expiryText.trim()}T23:59:59Z`).getTime() / 1000) : null,
+        max_machines: Number(machinesText || 1),
+      };
+      if (!payload.customer) {
+        setMessage("Customer is required.", true);
+        return;
+      }
+      if (!Number.isFinite(payload.max_machines) || payload.max_machines < 1) {
+        setMessage("Max machines must be at least 1.", true);
+        return;
+      }
+      try {
+        await api(`/admin/licenses/${license.license_key_hash}`, {method: "PATCH", body: JSON.stringify(payload)});
+        await loadLicenses();
+        setMessage("License updated.");
+      } catch (error) {
+        setMessage(error.message, true);
+      }
+    }
     async function showDetail(hash) {
       try {
         const detail = await api(`/admin/licenses/${hash}`);
         detailTitle.textContent = `${detail.customer} (${detail.status})`;
         const activations = detail.activation_rows.map((activation) => `
           <tr>
-            <td class="hash">${activation.machine_id}</td>
+            <td>
+              <strong>${escapeHtml(activation.machine_name || "Unnamed computer")}</strong>
+              <div class="muted hash">${escapeHtml(activation.machine_id)}</div>
+            </td>
             <td>${fmtDate(activation.activated_at)}</td>
             <td>${fmtDate(activation.last_seen_at)}</td>
-            <td><button class="danger" data-machine="${activation.machine_id}">Remove</button></td>
+            <td><button class="danger" data-machine="${escapeHtml(activation.machine_id)}">Remove</button></td>
           </tr>
         `).join("");
         detailBody.innerHTML = `
@@ -416,6 +455,8 @@ class ServerSettings:
     private_key_hex: str = ""
     admin_token: str = ""
     token_days: int = DEFAULT_TOKEN_DAYS
+    require_persistent_db: bool = False
+    persistent_root: str = DEFAULT_PERSISTENT_ROOT
 
 
 def load_settings() -> ServerSettings:
@@ -424,6 +465,8 @@ def load_settings() -> ServerSettings:
         private_key_hex=os.environ.get("PORTALCALC_LICENSE_PRIVATE_KEY", ""),
         admin_token=os.environ.get("PORTALCALC_LICENSE_ADMIN_TOKEN", ""),
         token_days=int(os.environ.get("PORTALCALC_LICENSE_TOKEN_DAYS", str(DEFAULT_TOKEN_DAYS))),
+        require_persistent_db=os.environ.get("PORTALCALC_REQUIRE_PERSISTENT_DB", "").lower() in {"1", "true", "yes"},
+        persistent_root=os.environ.get("PORTALCALC_PERSISTENT_ROOT", DEFAULT_PERSISTENT_ROOT),
     )
 
 
@@ -493,21 +536,73 @@ def make_license_key(prefix: str = "PC") -> str:
     return f"{prefix}-{secrets.token_urlsafe(18).replace('_', '').replace('-', '').upper()[:24]}"
 
 
+def backup_path(db_path: str) -> Path:
+    return Path(f"{db_path}.backup")
+
+
+def validate_database_location(settings: ServerSettings) -> None:
+    if not settings.require_persistent_db:
+        return
+    db_path = Path(settings.db_path).resolve()
+    persistent_root = Path(settings.persistent_root).resolve()
+    if not persistent_root.is_dir():
+        raise RuntimeError(f"Persistent disk is not mounted at {persistent_root}.")
+    if db_path == persistent_root or persistent_root not in db_path.parents:
+        raise RuntimeError(
+            f"Refusing to use ephemeral database path {db_path}; it must be inside {persistent_root}."
+        )
+
+
 def connect(db_path: str) -> sqlite3.Connection:
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA synchronous = FULL")
     return connection
 
 
+def backup_database(db_path: str) -> None:
+    destination_path = backup_path(db_path)
+    temporary_path = Path(f"{destination_path}.tmp")
+    with _BACKUP_LOCK:
+        source = sqlite3.connect(db_path)
+        destination = sqlite3.connect(temporary_path)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+        os.replace(temporary_path, destination_path)
+
+
+def restore_database_backup(db_path: str) -> bool:
+    source_path = backup_path(db_path)
+    if Path(db_path).exists() or not source_path.exists():
+        return False
+    temporary_path = Path(f"{db_path}.restore")
+    with _BACKUP_LOCK:
+        source = sqlite3.connect(source_path)
+        destination = sqlite3.connect(temporary_path)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+        os.replace(temporary_path, db_path)
+        return True
+
+
 @contextmanager
-def db_session(db_path: str):
+def db_session(db_path: str, backup_on_commit: bool = False):
     connection = connect(db_path)
     try:
         yield connection
         connection.commit()
     finally:
         connection.close()
+    if backup_on_commit:
+        backup_database(db_path)
 
 
 def init_db(db_path: str) -> None:
@@ -528,6 +623,7 @@ def init_db(db_path: str) -> None:
             CREATE TABLE IF NOT EXISTS activations (
                 license_key_hash TEXT NOT NULL,
                 machine_id TEXT NOT NULL,
+                machine_name TEXT,
                 activated_at INTEGER NOT NULL,
                 last_seen_at INTEGER NOT NULL,
                 PRIMARY KEY (license_key_hash, machine_id),
@@ -535,6 +631,12 @@ def init_db(db_path: str) -> None:
             );
             """
         )
+        columns = {
+            str(row["name"])
+            for row in db.execute("PRAGMA table_info(activations)").fetchall()
+        }
+        if "machine_name" not in columns:
+            db.execute("ALTER TABLE activations ADD COLUMN machine_name TEXT")
 
 
 def create_license(
@@ -546,7 +648,7 @@ def create_license(
     license_key: str | None = None,
 ) -> str:
     license_key = license_key or make_license_key()
-    with db_session(db_path) as db:
+    with db_session(db_path, backup_on_commit=True) as db:
         db.execute(
             """
             INSERT INTO licenses (
@@ -610,7 +712,7 @@ def license_detail(db_path: str, license_key_hash: str) -> dict[str, Any] | None
             return None
         activations = db.execute(
             """
-            SELECT machine_id, activated_at, last_seen_at
+            SELECT machine_id, machine_name, activated_at, last_seen_at
             FROM activations
             WHERE license_key_hash = ?
             ORDER BY last_seen_at DESC
@@ -623,7 +725,7 @@ def license_detail(db_path: str, license_key_hash: str) -> dict[str, Any] | None
 
 
 def set_license_status(db_path: str, license_key_hash: str, status: str) -> bool:
-    with db_session(db_path) as db:
+    with db_session(db_path, backup_on_commit=True) as db:
         result = db.execute(
             "UPDATE licenses SET status = ? WHERE license_key_hash = ?",
             (status, license_key_hash),
@@ -631,8 +733,28 @@ def set_license_status(db_path: str, license_key_hash: str, status: str) -> bool
         return result.rowcount > 0
 
 
+def update_license(
+    db_path: str,
+    license_key_hash: str,
+    customer: str,
+    plan: str,
+    expires_at: int | None,
+    max_machines: int,
+) -> bool:
+    with db_session(db_path, backup_on_commit=True) as db:
+        result = db.execute(
+            """
+            UPDATE licenses
+            SET customer = ?, plan = ?, expires_at = ?, max_machines = ?
+            WHERE license_key_hash = ?
+            """,
+            (customer, plan, expires_at, max_machines, license_key_hash),
+        )
+        return result.rowcount > 0
+
+
 def delete_activation(db_path: str, license_key_hash: str, machine_id: str) -> bool:
-    with db_session(db_path) as db:
+    with db_session(db_path, backup_on_commit=True) as db:
         result = db.execute(
             "DELETE FROM activations WHERE license_key_hash = ? AND machine_id = ?",
             (license_key_hash, machine_id),
@@ -651,10 +773,15 @@ def build_token_payload(row: sqlite3.Row, license_key_hash: str, machine_id: str
     }
 
 
-def activate_license(settings: ServerSettings, license_key: str, machine_id: str) -> dict[str, Any]:
+def normalized_machine_name(machine_name: str | None) -> str:
+    return str(machine_name or "").strip()[:120]
+
+
+def activate_license(settings: ServerSettings, license_key: str, machine_id: str, machine_name: str | None = None) -> dict[str, Any]:
     license_key_hash = hash_license_key(license_key.strip())
     now = utc_now()
-    with db_session(settings.db_path) as db:
+    display_name = normalized_machine_name(machine_name)
+    with db_session(settings.db_path, backup_on_commit=True) as db:
         row = license_row(db, license_key_hash)
         if row is None:
             return {"ok": False, "message": "License key was not found."}
@@ -672,18 +799,20 @@ def activate_license(settings: ServerSettings, license_key: str, machine_id: str
 
         db.execute(
             """
-            INSERT INTO activations (license_key_hash, machine_id, activated_at, last_seen_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO activations (license_key_hash, machine_id, machine_name, activated_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(license_key_hash, machine_id)
-            DO UPDATE SET last_seen_at = excluded.last_seen_at
+            DO UPDATE SET
+                machine_name = COALESCE(NULLIF(excluded.machine_name, ''), activations.machine_name),
+                last_seen_at = excluded.last_seen_at
             """,
-            (license_key_hash, machine_id, now, now),
+            (license_key_hash, machine_id, display_name, now, now),
         )
         token = sign_payload(build_token_payload(row, license_key_hash, machine_id), settings.private_key_hex)
         return {"ok": True, "token": token}
 
 
-def check_license(settings: ServerSettings, token: str, machine_id: str) -> dict[str, Any]:
+def check_license(settings: ServerSettings, token: str, machine_id: str, machine_name: str | None = None) -> dict[str, Any]:
     try:
         public_key_hex = public_key_hex_from_private(settings.private_key_hex)
         payload = verify_token(token, public_key_hex)
@@ -695,6 +824,7 @@ def check_license(settings: ServerSettings, token: str, machine_id: str) -> dict
         return {"revoked": True, "message": "License is activated for another machine."}
 
     now = utc_now()
+    display_name = normalized_machine_name(machine_name)
     with db_session(settings.db_path) as db:
         row = license_row(db, license_key_hash)
         if row is None or row["status"] != "active":
@@ -707,10 +837,16 @@ def check_license(settings: ServerSettings, token: str, machine_id: str) -> dict
         ).fetchone()
         if existing is None:
             return {"revoked": True, "message": "Machine is not activated for this license."}
-        db.execute(
-            "UPDATE activations SET last_seen_at = ? WHERE license_key_hash = ? AND machine_id = ?",
-            (now, license_key_hash, machine_id),
-        )
+        if display_name:
+            db.execute(
+                "UPDATE activations SET machine_name = ?, last_seen_at = ? WHERE license_key_hash = ? AND machine_id = ?",
+                (display_name, now, license_key_hash, machine_id),
+            )
+        else:
+            db.execute(
+                "UPDATE activations SET last_seen_at = ? WHERE license_key_hash = ? AND machine_id = ?",
+                (now, license_key_hash, machine_id),
+            )
         return {"revoked": False, "token": sign_payload(build_token_payload(row, license_key_hash, machine_id), settings.private_key_hex)}
 
 
@@ -728,12 +864,20 @@ def create_app(settings: ServerSettings | None = None):
     class ActivateRequest(BaseModel):
         license_key: str
         machine_id: str
+        machine_name: str | None = None
 
     class CheckRequest(BaseModel):
         token: str
         machine_id: str
+        machine_name: str | None = None
 
     class CreateLicenseRequest(BaseModel):
+        customer: str
+        plan: str = "standard"
+        expires_at: int | None = None
+        max_machines: int = 1
+
+    class UpdateLicenseRequest(BaseModel):
         customer: str
         plan: str = "standard"
         expires_at: int | None = None
@@ -747,11 +891,16 @@ def create_app(settings: ServerSettings | None = None):
 
     @app.on_event("startup")
     def startup() -> None:
+        validate_database_location(settings)
+        Path(settings.db_path).parent.mkdir(parents=True, exist_ok=True)
+        restore_database_backup(settings.db_path)
         init_db(settings.db_path)
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {"ok": True}
+        with db_session(settings.db_path) as db:
+            db.execute("SELECT 1 FROM licenses LIMIT 1").fetchone()
+        return {"ok": True, "database": "ok"}
 
     @app.get("/public-key")
     def public_key() -> dict[str, Any]:
@@ -759,11 +908,11 @@ def create_app(settings: ServerSettings | None = None):
 
     @app.post("/activate")
     def activate(request: ActivateRequest) -> dict[str, Any]:
-        return activate_license(settings, request.license_key, request.machine_id)
+        return activate_license(settings, request.license_key, request.machine_id, request.machine_name)
 
     @app.post("/check")
     def check(request: CheckRequest) -> dict[str, Any]:
-        return check_license(settings, request.token, request.machine_id)
+        return check_license(settings, request.token, request.machine_id, request.machine_name)
 
     @app.post("/admin/licenses")
     def admin_create_license(
@@ -795,6 +944,29 @@ def create_app(settings: ServerSettings | None = None):
         if detail is None:
             raise HTTPException(status_code=404, detail="License not found")
         return detail
+
+    @app.patch("/admin/licenses/{license_key_hash}")
+    def admin_update_license(
+        license_key_hash: str,
+        request: UpdateLicenseRequest,
+        x_admin_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        require_admin(x_admin_token)
+        customer = request.customer.strip()
+        plan = request.plan.strip() or "standard"
+        max_machines = max(int(request.max_machines), 1)
+        if not customer:
+            raise HTTPException(status_code=400, detail="Customer is required")
+        if not update_license(
+            settings.db_path,
+            license_key_hash,
+            customer=customer,
+            plan=plan,
+            expires_at=request.expires_at,
+            max_machines=max_machines,
+        ):
+            raise HTTPException(status_code=404, detail="License not found")
+        return {"ok": True}
 
     @app.post("/admin/licenses/{license_key_hash}/cancel")
     def admin_cancel_license(
