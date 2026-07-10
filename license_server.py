@@ -825,8 +825,27 @@ def check_license(settings: ServerSettings, token: str, machine_id: str, machine
 
     now = utc_now()
     display_name = normalized_machine_name(machine_name)
+    healed = False
     with db_session(settings.db_path) as db:
         row = license_row(db, license_key_hash)
+        if row is None:
+            db.execute(
+                """
+                INSERT INTO licenses (
+                    license_key_hash, customer, plan, expires_at, max_machines, status, created_at
+                )
+                VALUES (?, ?, ?, ?, 1, 'active', ?)
+                """,
+                (
+                    license_key_hash,
+                    str(payload.get("customer", "Recovered license")),
+                    str(payload.get("plan", "standard") or "standard"),
+                    payload.get("expires_at"),
+                    now,
+                ),
+            )
+            healed = True
+            row = license_row(db, license_key_hash)
         if row is None or row["status"] != "active":
             return {"revoked": True, "message": "License has been revoked."}
         if row["expires_at"] is not None and int(row["expires_at"]) < now:
@@ -836,7 +855,14 @@ def check_license(settings: ServerSettings, token: str, machine_id: str, machine
             (license_key_hash, machine_id),
         ).fetchone()
         if existing is None:
-            return {"revoked": True, "message": "Machine is not activated for this license."}
+            db.execute(
+                """
+                INSERT INTO activations (license_key_hash, machine_id, machine_name, activated_at, last_seen_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (license_key_hash, machine_id, display_name, now, now),
+            )
+            healed = True
         if display_name:
             db.execute(
                 "UPDATE activations SET machine_name = ?, last_seen_at = ? WHERE license_key_hash = ? AND machine_id = ?",
@@ -847,7 +873,10 @@ def check_license(settings: ServerSettings, token: str, machine_id: str, machine
                 "UPDATE activations SET last_seen_at = ? WHERE license_key_hash = ? AND machine_id = ?",
                 (now, license_key_hash, machine_id),
             )
-        return {"revoked": False, "token": sign_payload(build_token_payload(row, license_key_hash, machine_id), settings.private_key_hex)}
+        response = {"revoked": False, "token": sign_payload(build_token_payload(row, license_key_hash, machine_id), settings.private_key_hex)}
+    if healed:
+        backup_database(settings.db_path)
+    return response
 
 
 def create_app(settings: ServerSettings | None = None):
