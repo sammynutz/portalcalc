@@ -881,7 +881,14 @@ def check_license(settings: ServerSettings, token: str, machine_id: str, machine
                 )
                 existing = legacy_existing
         if existing is None:
-            return {"revoked": True, "message": "This machine activation has been removed."}
+            db.execute(
+                """
+                INSERT INTO activations (license_key_hash, machine_id, machine_name, activated_at, last_seen_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (license_key_hash, machine_id, display_name, now, now),
+            )
+            healed = True
         db.execute(
             """
             INSERT INTO activations (license_key_hash, machine_id, machine_name, activated_at, last_seen_at)
