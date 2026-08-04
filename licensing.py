@@ -66,8 +66,42 @@ def license_metadata_path() -> Path:
 
 
 def machine_id() -> str:
-    raw = f"{platform.node()}|{uuid.getnode()}|{platform.system()}|{platform.machine()}"
+    machine_guid = _windows_machine_guid()
+    if machine_guid:
+        raw = f"windows-machine-guid|{machine_guid.lower()}"
+    else:
+        raw = _legacy_machine_id_source()
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def legacy_machine_id() -> str:
+    """Identifier used before MachineGuid was adopted, for server-side migration."""
+    return hashlib.sha256(_legacy_machine_id_source().encode("utf-8")).hexdigest()
+
+
+def _legacy_machine_id_source() -> str:
+    return f"{platform.node()}|{uuid.getnode()}|{platform.system()}|{platform.machine()}"
+
+
+def _windows_machine_guid() -> str | None:
+    if platform.system() != "Windows":
+        return None
+    try:
+        import winreg
+
+        access = winreg.KEY_READ
+        if hasattr(winreg, "KEY_WOW64_64KEY"):
+            access |= winreg.KEY_WOW64_64KEY
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Cryptography",
+            0,
+            access,
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "MachineGuid")
+        return str(value).strip() or None
+    except (OSError, ImportError):
+        return None
 
 
 def machine_name() -> str:
@@ -285,7 +319,12 @@ class LicenseManager:
             return LicenseStatus(False, "License API URL is not configured.")
         response = _json_post(
             self.activation_url,
-            {"license_key": license_key, "machine_id": machine_id(), "machine_name": machine_name()},
+            {
+                "license_key": license_key,
+                "machine_id": machine_id(),
+                "legacy_machine_id": legacy_machine_id(),
+                "machine_name": machine_name(),
+            },
         )
         token = response.get("token")
         if not token:
@@ -303,7 +342,15 @@ class LicenseManager:
             return LicenseStatus(False, "No license is activated.")
         if not self.api_base_url:
             return self.local_status()
-        response = _json_post(self.check_url, {"token": token, "machine_id": machine_id(), "machine_name": machine_name()})
+        response = _json_post(
+            self.check_url,
+            {
+                "token": token,
+                "machine_id": machine_id(),
+                "legacy_machine_id": legacy_machine_id(),
+                "machine_name": machine_name(),
+            },
+        )
         if response.get("revoked"):
             return LicenseStatus(False, response.get("message", "License has been revoked."))
         refreshed = response.get("token")
@@ -314,7 +361,8 @@ class LicenseManager:
 
     def startup_status(self) -> LicenseStatus:
         local = self.local_status()
-        if not local.valid and not local.server_check_required:
+        identity_migration_required = local.reason == "License is activated for another machine."
+        if not local.valid and not local.server_check_required and not identity_migration_required:
             return local
         if not self.api_base_url:
             return local

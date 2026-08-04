@@ -777,7 +777,7 @@ def normalized_machine_name(machine_name: str | None) -> str:
     return str(machine_name or "").strip()[:120]
 
 
-def activate_license(settings: ServerSettings, license_key: str, machine_id: str, machine_name: str | None = None) -> dict[str, Any]:
+def activate_license(settings: ServerSettings, license_key: str, machine_id: str, machine_name: str | None = None, legacy_machine_id: str | None = None) -> dict[str, Any]:
     license_key_hash = hash_license_key(license_key.strip())
     now = utc_now()
     display_name = normalized_machine_name(machine_name)
@@ -794,8 +794,21 @@ def activate_license(settings: ServerSettings, license_key: str, machine_id: str
             "SELECT 1 FROM activations WHERE license_key_hash = ? AND machine_id = ?",
             (license_key_hash, machine_id),
         ).fetchone()
+        legacy_existing = None
+        if legacy_machine_id and legacy_machine_id != machine_id:
+            legacy_existing = db.execute(
+                "SELECT 1 FROM activations WHERE license_key_hash = ? AND machine_id = ?",
+                (license_key_hash, legacy_machine_id),
+            ).fetchone()
         if existing is None and activation_count(db, license_key_hash) >= int(row["max_machines"]):
-            return {"ok": False, "message": "License has reached its machine limit."}
+            if legacy_existing is None:
+                return {"ok": False, "message": "License has reached its machine limit."}
+
+        if legacy_existing is not None:
+            db.execute(
+                "DELETE FROM activations WHERE license_key_hash = ? AND machine_id = ?",
+                (license_key_hash, legacy_machine_id),
+            )
 
         db.execute(
             """
@@ -812,7 +825,7 @@ def activate_license(settings: ServerSettings, license_key: str, machine_id: str
         return {"ok": True, "token": token}
 
 
-def check_license(settings: ServerSettings, token: str, machine_id: str, machine_name: str | None = None) -> dict[str, Any]:
+def check_license(settings: ServerSettings, token: str, machine_id: str, machine_name: str | None = None, legacy_machine_id: str | None = None) -> dict[str, Any]:
     try:
         public_key_hex = public_key_hex_from_private(settings.private_key_hex)
         payload = verify_token(token, public_key_hex)
@@ -820,7 +833,9 @@ def check_license(settings: ServerSettings, token: str, machine_id: str, machine
         return {"revoked": True, "message": "License token is invalid."}
 
     license_key_hash = str(payload.get("license_key_hash", ""))
-    if str(payload.get("machine_id", "")) != machine_id:
+    token_machine_id = str(payload.get("machine_id", ""))
+    migration_allowed = bool(legacy_machine_id and token_machine_id == legacy_machine_id)
+    if token_machine_id != machine_id and not migration_allowed:
         return {"revoked": True, "message": "License is activated for another machine."}
 
     now = utc_now()
@@ -854,15 +869,27 @@ def check_license(settings: ServerSettings, token: str, machine_id: str, machine
             "SELECT 1 FROM activations WHERE license_key_hash = ? AND machine_id = ?",
             (license_key_hash, machine_id),
         ).fetchone()
+        if existing is None and migration_allowed:
+            legacy_existing = db.execute(
+                "SELECT 1 FROM activations WHERE license_key_hash = ? AND machine_id = ?",
+                (license_key_hash, token_machine_id),
+            ).fetchone()
+            if legacy_existing is not None:
+                db.execute(
+                    "DELETE FROM activations WHERE license_key_hash = ? AND machine_id = ?",
+                    (license_key_hash, token_machine_id),
+                )
+                existing = legacy_existing
         if existing is None:
-            db.execute(
-                """
-                INSERT INTO activations (license_key_hash, machine_id, machine_name, activated_at, last_seen_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (license_key_hash, machine_id, display_name, now, now),
-            )
-            healed = True
+            return {"revoked": True, "message": "This machine activation has been removed."}
+        db.execute(
+            """
+            INSERT INTO activations (license_key_hash, machine_id, machine_name, activated_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(license_key_hash, machine_id) DO NOTHING
+            """,
+            (license_key_hash, machine_id, display_name, now, now),
+        )
         if display_name:
             db.execute(
                 "UPDATE activations SET machine_name = ?, last_seen_at = ? WHERE license_key_hash = ? AND machine_id = ?",
@@ -894,11 +921,13 @@ def create_app(settings: ServerSettings | None = None):
         license_key: str
         machine_id: str
         machine_name: str | None = None
+        legacy_machine_id: str | None = None
 
     class CheckRequest(BaseModel):
         token: str
         machine_id: str
         machine_name: str | None = None
+        legacy_machine_id: str | None = None
 
     class CreateLicenseRequest(BaseModel):
         customer: str
@@ -937,11 +966,11 @@ def create_app(settings: ServerSettings | None = None):
 
     @app.post("/activate")
     def activate(request: ActivateRequest) -> dict[str, Any]:
-        return activate_license(settings, request.license_key, request.machine_id, request.machine_name)
+        return activate_license(settings, request.license_key, request.machine_id, request.machine_name, request.legacy_machine_id)
 
     @app.post("/check")
     def check(request: CheckRequest) -> dict[str, Any]:
-        return check_license(settings, request.token, request.machine_id, request.machine_name)
+        return check_license(settings, request.token, request.machine_id, request.machine_name, request.legacy_machine_id)
 
     @app.post("/admin/licenses")
     def admin_create_license(
