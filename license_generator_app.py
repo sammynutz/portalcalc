@@ -559,6 +559,11 @@ class LicenseGeneratorApp(QWidget):
 
 
 def main() -> None:
+    if "--packaged-smoke-test" in sys.argv[1:]:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        packaged_smoke_app = QApplication([sys.argv[0]])
+        raise SystemExit(0)
+
     app = QApplication(sys.argv)
     app.setWindowIcon(app_icon())
     window = LicenseGeneratorApp()

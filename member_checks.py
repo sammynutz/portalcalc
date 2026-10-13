@@ -13,6 +13,7 @@ from typing import Dict, Optional
 
 PHI_STEEL = 0.9
 E_STEEL_MPA = 200_000.0
+HOLLOW_FULLY_SUPPORTED_WALL_LAMBDA_LIMIT = 40.0
 
 
 @dataclass
@@ -121,6 +122,55 @@ def compression_section_capacity_kn(section: SectionCheckProperties) -> float:
     return PHI_STEEL * section.kf * section.design_net_area_mm2 * section.fy_mpa / 1000.0
 
 
+def is_hollow_section(section: SectionCheckProperties) -> bool:
+    text = f"{section.name} {section.shape_type}".upper()
+    return any(token in text for token in ["SHS", "RHS", "HOLLOW", "TUBE"])
+
+
+def hollow_wall_flat_widths_mm(section: SectionCheckProperties) -> list:
+    if not is_hollow_section(section):
+        return []
+    if not section.web_thickness_mm or section.web_thickness_mm <= 0.0:
+        return []
+    dimensions = [
+        value for value in [section.depth_mm, section.flange_width_mm]
+        if value is not None and value > 0.0
+    ]
+    if not dimensions:
+        return []
+    # Conservative flat wall estimate for RHS/SHS. Catalogue dimensions do not
+    # include corner radii, so use outside dimension less 3t to avoid treating
+    # curved corners as effective flat plate width.
+    return [
+        max(dimension - 3.0 * section.web_thickness_mm, 0.0)
+        for dimension in dimensions
+    ]
+
+
+def hollow_local_compression_capacity_info(section: SectionCheckProperties) -> Optional[dict]:
+    flat_widths = hollow_wall_flat_widths_mm(section)
+    if not flat_widths:
+        return None
+    wall = section.web_thickness_mm or 0.0
+    fy = section.fy_mpa
+    if wall <= 0.0 or fy <= 0.0 or section.area_mm2 <= 0.0:
+        return None
+    width = max(flat_widths)
+    slenderness = (width / wall) * math.sqrt(fy / 250.0)
+    limit = HOLLOW_FULLY_SUPPORTED_WALL_LAMBDA_LIMIT
+    effective_area_factor = min(1.0, limit / slenderness) if slenderness > 1e-12 else 1.0
+    effective_area_mm2 = section.area_mm2 * effective_area_factor
+    capacity_kn = PHI_STEEL * section.kf * effective_area_mm2 * fy / 1000.0
+    return {
+        "capacity_kn": capacity_kn,
+        "effective_area_factor": effective_area_factor,
+        "slenderness": slenderness,
+        "limit": limit,
+        "flat_width_mm": width,
+        "wall_mm": wall,
+    }
+
+
 def alpha_a(lambda_n: float) -> float:
     denominator = lambda_n**2 - 15.3 * lambda_n + 2050.0
     if abs(denominator) < 1e-12:
@@ -191,10 +241,8 @@ def bending_slenderness_reduction(ms_knm: float, mo_knm: float) -> float:
         return 0.0
     if not math.isfinite(mo_knm) or mo_knm <= 0.0:
         return 1.0
-    ratio = math.sqrt(max(ms_knm / mo_knm, 0.0))
-    if ratio <= 0.4:
-        return 1.0
-    return min(max(0.6 * (math.sqrt((ratio / 0.6) ** 2 + 3.0) - ratio / 0.6), 0.0), 1.0)
+    ratio = max(ms_knm / mo_knm, 0.0)
+    return min(max(0.6 * (math.sqrt(ratio**2 + 3.0) - ratio), 0.0), 1.0)
 
 
 def bending_capacity_knm(section: SectionCheckProperties, actions: MemberActions) -> float:
@@ -288,13 +336,30 @@ def check_member(section: SectionCheckProperties, actions: MemberActions) -> Mem
     result = MemberCheckResult(section_name=section.name)
 
     nc = member_compression_capacity_kn(section, actions)
+    local_compression = hollow_local_compression_capacity_info(section)
+    if local_compression is not None:
+        nc = min(nc, local_compression["capacity_kn"])
     nt = tension_capacity_kn(section)
     mb = bending_capacity_knm(section, actions)
     vv = shear_capacity_kn(section)
 
     result.checks["compression"] = CapacityCheck(
-        "Compression", actions.compression_kn, nc, safe_ratio(actions.compression_kn, nc), "kN"
+        "Compression", actions.compression_kn, nc, safe_ratio(actions.compression_kn, nc), "kN",
+        "Member compression phi Nc including global buckling and hollow-section local wall slenderness where applicable.",
     )
+    if local_compression is not None:
+        result.checks["local_compression"] = CapacityCheck(
+            "Hollow local",
+            actions.compression_kn,
+            local_compression["capacity_kn"],
+            safe_ratio(actions.compression_kn, local_compression["capacity_kn"]),
+            "kN",
+            (
+                "Preliminary AS 4100-style fully-supported hollow wall slenderness check: "
+                f"lambda_e={local_compression['slenderness']:.1f}, limit={local_compression['limit']:.1f}, "
+                f"effective area factor={local_compression['effective_area_factor']:.3f}."
+            ),
+        )
     result.checks["tension"] = CapacityCheck(
         "Tension", actions.tension_kn, nt, safe_ratio(actions.tension_kn, nt), "kN"
     )
@@ -307,7 +372,11 @@ def check_member(section: SectionCheckProperties, actions: MemberActions) -> Mem
         "First-pass Clause 5.11-style shear capacity.",
     )
 
-    compression_bending_ratio = result.checks["compression"].ratio + result.checks["bending"].ratio
+    compression_ratio = max(
+        result.checks["compression"].ratio,
+        result.checks.get("local_compression", result.checks["compression"]).ratio,
+    )
+    compression_bending_ratio = compression_ratio + result.checks["bending"].ratio
     tension_bending_ratio = result.checks["tension"].ratio + result.checks["bending"].ratio
     interaction_ratio = max(compression_bending_ratio, tension_bending_ratio)
     result.checks["combined"] = CapacityCheck(

@@ -1,25 +1,45 @@
+# Python caches and local environments
 __pycache__/
 *.py[cod]
-*.pyo
-
-.env
 .venv/
 venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
+# Credentials and local license state
+.env
+.env.*
+!.env.example
 *.db
 *.sqlite
 *.sqlite3
+*.pem
+*.key
 license_token.json
 license_state.json
-
-.pytest_cache/
-.mypy_cache/
-
-*.log
-*.tmp
 License Key Setup.txt
+
+# Desktop packages and generated binaries (keep source .spec files)
+/build/
+/dist/
+/release/
+*.exe
+*.dll
+*.zip
+*.7z
+
+# Generated drawings, reports and study output
+*.pdf
 portal_3d_concept.html
 portal_3d_concept.dae
+/hay_shed_*/
+*.log
+*.tmp
+~$*
 
-Archive/
-Archive 2/
+# Local agent state and archives
+/.agents/
+/.codex/
+/Archive/
+/Archive 2/

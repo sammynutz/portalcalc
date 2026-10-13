@@ -87,11 +87,20 @@ Environment variables:
 - `PORTALCALC_LICENSE_PRIVATE_KEY`: the server private key from `python license_server.py keygen`
 - `PORTALCALC_LICENSE_ADMIN_TOKEN`: a long random admin password
 - `PORTALCALC_LICENSE_DB`: a path on the persistent disk, for example `/var/data/portalcalc_licenses.db`
+- `PORTALCALC_REQUIRE_PERSISTENT_DB`: `1` to refuse startup unless the database is on the persistent disk
+- `PORTALCALC_PERSISTENT_ROOT`: the disk mount path, normally `/var/data`
 - `PORTALCALC_LICENSE_TOKEN_DAYS`: `30`
 
 For production, keep the SQLite file on a Render persistent disk. Render's
 normal filesystem is temporary, so a plain SQLite file outside the mounted disk
 can be lost on restart/redeploy.
+
+The included `render.yaml` provisions a 1 GB disk at `/var/data` and enables the
+startup guard. The server also keeps `portalcalc_licenses.db.backup` on that disk
+and restores it automatically if the primary database file is missing. Download
+occasional copies of both files for protection from deletion of the Render disk
+itself; a persistent disk protects restarts and deploys, but is not an off-site
+backup.
 
 After deploy, the desktop app should use:
 

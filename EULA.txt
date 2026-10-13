@@ -1,0 +1,56 @@
+Portal Calc End User License Agreement
+
+This End User License Agreement (EULA) governs use of Portal Calc and any
+related materials provided with it.
+
+1. Ownership
+
+Portal Calc remains the property of SLS Structural Software. No ownership,
+title, copyright, intellectual property right or other proprietary interest in
+the software is transferred to the user.
+
+2. License
+
+SLS Structural Software provides Portal Calc free of charge under this license.
+The user is granted a limited, revocable, non-exclusive and non-transferable
+license to install and use the software only for evaluation, testing and
+feedback purposes.
+
+3. No Editing, Modification or Reverse Engineering
+
+The user must not edit, modify, adapt, translate, decompile, disassemble,
+reverse engineer, copy, reproduce, redistribute, sell, sublicense or create
+derivative works from Portal Calc, except with the prior written consent of
+SLS Structural Software.
+
+4. Trial and Experimental Use
+
+Portal Calc is provided on a trial basis. The software is experimental and may
+contain errors, omissions, incomplete features or calculation defects.
+
+5. No Engineering Design or Production Use
+
+Portal Calc must not be used for engineering design, certification,
+construction, fabrication, production work or any other purpose where reliance
+on the software output could affect safety, compliance, cost, delivery or
+commercial decisions.
+
+All outputs must be independently checked by a suitably qualified engineer
+using accepted engineering methods and current project requirements.
+
+6. No Warranty
+
+Portal Calc is provided as-is, without warranty of any kind. SLS Structural
+Software does not warrant that the software is accurate, complete, reliable,
+fit for a particular purpose or free from defects.
+
+7. Limitation of Liability
+
+To the maximum extent permitted by law, SLS Structural Software is not liable
+for any loss, damage, claim, cost or liability arising from use of, inability
+to use, or reliance on Portal Calc.
+
+8. Acceptance
+
+By installing, opening or using Portal Calc, the user accepts this EULA. If the
+user does not accept this EULA, the user must not use the software.

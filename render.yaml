@@ -5,3 +5,14 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn license_server:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
+    envVars:
+      - key: PORTALCALC_LICENSE_DB
+        value: /var/data/portalcalc_licenses.db
+      - key: PORTALCALC_REQUIRE_PERSISTENT_DB
+        value: "1"
+      - key: PORTALCALC_PERSISTENT_ROOT
+        value: /var/data
+    disk:
+      name: portalcalc-license-data
+      mountPath: /var/data
+      sizeGB: 1

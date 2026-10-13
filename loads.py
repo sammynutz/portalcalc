@@ -195,7 +195,8 @@ class BasicLoadCase:
     Current behaviour:
     - G is made from G, Solar, Fire service, HVAC and Other roof loads.
     - Q is factored separately.
-    - Roof line load is distributed to top chord nodes using horizontal tributary width.
+    - Roof line load is applied as a vertical distributed load to top-chord members,
+      using horizontal tributary width.
     - Wall loads are treated as permanent line loads and factored with G.
     - Wu is applied by wind.py after this non-wind portion is applied.
     """
@@ -207,7 +208,17 @@ class BasicLoadCase:
     def apply(self, structure, top_nodes, left_base, right_base) -> LoadApplicationResult:
         return self.apply_factored(structure, top_nodes, left_base, right_base, 1.0, 1.0)
 
-    def apply_factored(self, structure, top_nodes, left_base, right_base, g_factor: float, q_factor: float, roof_top_nodes=None) -> LoadApplicationResult:
+    def apply_factored(
+        self,
+        structure,
+        top_nodes,
+        left_base,
+        right_base,
+        g_factor: float,
+        q_factor: float,
+        roof_top_nodes=None,
+        roof_element_groups=None,
+    ) -> LoadApplicationResult:
         result = LoadApplicationResult()
         roof_nodes = roof_top_nodes or top_nodes
 
@@ -220,6 +231,7 @@ class BasicLoadCase:
                     placement.side,
                     placement.from_percent,
                     placement.to_percent,
+                    element_groups=roof_element_groups,
                 )
             )
         result.arrows.extend(
@@ -264,12 +276,18 @@ class BasicLoadCase:
         return lines
 
 
-def apply_roof_vertical_loads(structure, top_nodes, roof_load_kn_per_m: float) -> List[LoadArrow]:
+def apply_roof_vertical_loads(
+    structure,
+    top_nodes,
+    roof_load_kn_per_m: float,
+    element_groups=None,
+) -> List[LoadArrow]:
     """
-    Convert a roof vertical line load in kN/m into equivalent nodal Y loads.
+    Apply a roof vertical line load in kN/m to the top-chord members.
 
     The line load is already the roof area load multiplied by the tributary bay
-    size. Horizontal panel length is then used to generate equivalent nodal loads.
+    size. Horizontal panel length controls the total load, while the member UDL
+    is resolved over the actual sloping chord length.
     """
     return apply_roof_vertical_loads_in_zones(
         structure,
@@ -278,6 +296,7 @@ def apply_roof_vertical_loads(structure, top_nodes, roof_load_kn_per_m: float) -
         application_side="Both",
         from_percent=0.0,
         to_percent=100.0,
+        element_groups=element_groups,
     )
 
 
@@ -310,12 +329,15 @@ def apply_roof_vertical_loads_in_zones(
     application_side: str = "Both",
     from_percent: float = 0.0,
     to_percent: float = 100.0,
+    element_groups=None,
 ) -> List[LoadArrow]:
     """
-    Convert a roof vertical line load into equivalent nodal loads within selected side-span zones.
+    Apply a roof vertical line load to members within selected side-span zones.
 
-    Percentages are measured from each eave toward the apex. Loads are still
-    applied using horizontal tributary width to match the existing roof load model.
+    Percentages are measured from each eave toward the apex. The total load on
+    each chord segment is based on its loaded horizontal projection. Where a
+    zone boundary crosses a panel, the same resultant is spread over that chord
+    segment; normal full-roof G/Q cases are therefore exact member UDLs.
     """
     load_arrows: List[LoadArrow] = []
     intervals = roof_load_intervals(top_nodes, application_side, from_percent, to_percent)
@@ -337,8 +359,21 @@ def apply_roof_vertical_loads_in_zones(
         if loaded_width_mm <= 1e-9:
             continue
         tributary_load_n = roof_load_kn_per_m * (loaded_width_mm / 1000.0) * 1000
-        structure.add_load(n1.uy, tributary_load_n / 2)
-        structure.add_load(n2.uy, tributary_load_n / 2)
+        chord_length_mm = ((n2.x - n1.x) ** 2 + (n2.y - n1.y) ** 2) ** 0.5
+        if hasattr(structure, "add_uniform_global_line_load_between") and chord_length_mm > 1e-9:
+            matched = structure.add_uniform_global_line_load_between(
+                n1,
+                n2,
+                fy_n_per_mm=tributary_load_n / chord_length_mm,
+                element_groups=element_groups,
+            )
+            if not matched:
+                raise ValueError("No top-chord member found for the requested roof line load.")
+        else:
+            # Diagram-only collectors have no elements; retain equivalent end
+            # forces solely to build their display arrows.
+            structure.add_load(n1.uy, tributary_load_n / 2)
+            structure.add_load(n2.uy, tributary_load_n / 2)
         mx = loaded_center_sum / loaded_width_mm
         my = (n1.y + n2.y) / 2
         load_arrows.append((mx, my + 800, 0, tributary_load_n))
@@ -347,14 +382,30 @@ def apply_roof_vertical_loads_in_zones(
 
 def apply_wall_horizontal_loads(structure, base_node, top_node, wall_load_kn_per_m: float, direction: int) -> List[LoadArrow]:
     """
-    Convert a wall horizontal line load in kN/m into equivalent nodal X loads.
+    Apply a wall horizontal line load in kN/m to the column members.
 
     direction = +1 for +X, -1 for -X.
     """
     height_m = abs(top_node.y - base_node.y) / 1000
     total_load_n = wall_load_kn_per_m * height_m * 1000 * direction
-    structure.add_load(base_node.ux, total_load_n / 2)
-    structure.add_load(top_node.ux, total_load_n / 2)
+    if hasattr(structure, "add_uniform_global_line_load_between"):
+        column_groups = {
+            element.group
+            for element in structure.elements
+            if "COLUMN" in str(element.group).upper()
+        }
+        matched = structure.add_uniform_global_line_load_between(
+            base_node,
+            top_node,
+            fx_n_per_mm=wall_load_kn_per_m * direction,
+            element_groups=column_groups,
+        )
+        if not matched:
+            raise ValueError("No column elements found for the requested wall line load.")
+    else:
+        # Plot-only collectors intentionally receive arrows without analysis loads.
+        structure.add_load(base_node.ux, total_load_n / 2)
+        structure.add_load(top_node.ux, total_load_n / 2)
     return [(top_node.x, (base_node.y + top_node.y) / 2, total_load_n, 0)]
 
 

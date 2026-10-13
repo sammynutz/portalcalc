@@ -1,0 +1,182 @@
+{
+  "version": 1,
+  "geometry": {
+    "span_mm": "30000",
+    "roof_pitch_deg": "10",
+    "eave_height_mm": "11000",
+    "truss_depth_mm": "1300",
+    "frame_system": "Truss",
+    "rafter_haunch_length_mm": "3000",
+    "internal_column_count": "None",
+    "internal_column_offset_mm": "3000",
+    "left_support": "Pinned",
+    "right_support": "Pinned",
+    "eave_x_restraint": "None",
+    "eave_x_spring_kn_mm": "0.0",
+    "end_wall_brace_dia_mm": "12.0"
+  },
+  "canopies": {
+    "left_length_mm": "0",
+    "left_type": "None",
+    "left_wind_model": "Main roof Cpe + Cpi",
+    "left_underside": "Empty under",
+    "left_cpn_uplift": "0.0",
+    "left_cpn_downward": "0.0",
+    "left_lean_outer_wall_clad": "No",
+    "left_lean_enclosure": {
+      "back": false,
+      "left": false,
+      "right": true,
+      "front": false
+    },
+    "left_eave_height_mm": "",
+    "left_pitch_deg": "5",
+    "left_shallow_depth_mm": "300",
+    "left_g_kpa": "0.0",
+    "left_q_kpa": "0.0",
+    "left_solar_kpa": "0.0",
+    "right_length_mm": "0",
+    "right_type": "None",
+    "right_wind_model": "Main roof Cpe + Cpi",
+    "right_underside": "Empty under",
+    "right_cpn_uplift": "0.0",
+    "right_cpn_downward": "0.0",
+    "right_lean_outer_wall_clad": "No",
+    "right_lean_enclosure": {
+      "back": false,
+      "left": true,
+      "right": false,
+      "front": false
+    },
+    "right_eave_height_mm": "",
+    "right_pitch_deg": "5",
+    "right_shallow_depth_mm": "300",
+    "right_g_kpa": "0.0",
+    "right_q_kpa": "0.0",
+    "right_solar_kpa": "0.0"
+  },
+  "sections": {
+    "left_column": "610 UB 125",
+    "right_column": "610 UB 125",
+    "internal_column": "200 UC 46.2",
+    "top_chord": "100*3 SHS",
+    "bottom_chord": "100*3 SHS",
+    "purlin_span_type": "Single span",
+    "wall_girt_span_type": "Single span",
+    "webs_posts": "50*2.5 SHS",
+    "left_canopy_top_chord": "20*1.6 SHS",
+    "left_canopy_bottom_chord": "20*1.6 SHS",
+    "left_canopy_webs_posts": "50*2.5 SHS",
+    "left_lean_to_column": "150 UC 23.4",
+    "right_canopy_top_chord": "20*1.6 SHS",
+    "right_canopy_bottom_chord": "20*1.6 SHS",
+    "right_canopy_webs_posts": "50*2.5 SHS",
+    "right_lean_to_column": "150 UC 23.4"
+  },
+  "costing": {
+    "shs_rate_per_kg": "2.07",
+    "ub_rate_per_kg": "2.07",
+    "wb_rate_per_kg": "2.80",
+    "purlin_rate_per_kg": "1.90"
+  },
+  "foundations": {
+    "allowable_bearing_kpa": "150",
+    "skin_friction_kpa": "15",
+    "use_skin_friction_for_bearing": false
+  },
+  "crane_beam": {
+    "beam_profile": "310 UC 118",
+    "pfc_cap": "No PFC cap",
+    "rail_profile": "31 kg/m rail",
+    "span_mm": "6000",
+    "wheelbase_mm": "3500",
+    "load_height_mm": "120",
+    "beam_self_weight_kn_m": "1.155",
+    "rail_self_weight_kn_m": "0.310",
+    "rail_bte_mm": "50",
+    "rail_k": "4",
+    "pmax_21_kn": "81.3",
+    "pmax_22_kn": "81.3",
+    "pmin_11_kn": "18.9",
+    "pmin_12_kn": "18.9",
+    "pstatic_21_kn": "67.4",
+    "pstatic_22_kn": "67.4",
+    "pstatic_min_11_kn": "17.0",
+    "pstatic_min_12_kn": "17.0",
+    "phb_21_kn": "10.50",
+    "phb_22_kn": "-10.50",
+    "phi_2_kn": "11.27",
+    "ix_x10_6_mm4": "277.0",
+    "iy_top_x10_6_mm4": "45.1",
+    "iy_oblique_x10_6_mm4": "45.1",
+    "zx_x10_3_mm3": "1960",
+    "zy_x10_3_mm3": "893",
+    "depth_mm": "315.0",
+    "flange_thickness_mm": "18.7",
+    "fy_mpa": "300",
+    "include_self_weight_in_deflection": true
+  },
+  "loads": {
+    "bay_size_mm": "6000",
+    "bay_size_m": 6.0,
+    "g_kpa": "0.15",
+    "q_kpa": "0.25",
+    "solar_kpa": "0.15",
+    "fire_service_kpa": "0.0",
+    "hvac_kpa": "0.0",
+    "other_kpa": "0.0",
+    "crane_rating_t": "10",
+    "snow_region": "None",
+    "snow_ahd_height_m": "0",
+    "roof_load_placements": {
+      "g": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      },
+      "q": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      },
+      "solar": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      },
+      "other": {
+        "side": "Both",
+        "from_percent": "0",
+        "to_percent": "100"
+      }
+    },
+    "left_wall_kn_m": "0.0",
+    "right_wall_kn_m": "0.0",
+    "load_combination": "1.2G + Wu (Left +, Cpi +)"
+  },
+  "wind": {
+    "region": "B2",
+    "importance_level": "2",
+    "terrain_category": "2.5",
+    "orientation": "E",
+    "frame_type": "3 Sided",
+    "wall_enclosure": {
+      "back": true,
+      "left": true,
+      "right": true,
+      "front": true
+    },
+    "internal_pressure_mode": "Standard",
+    "single_wind_case": "Left +",
+    "building_length_m": "40.0",
+    "additional_pressure_factor": "1.0"
+  },
+  "display": {
+    "diagram_view": "Geometry",
+    "load_view_mode": "Combination loads",
+    "single_load": "G",
+    "second_order_analysis": false,
+    "deflection_scale": "100",
+    "diagram_scale": "1.0"
+  }
+}

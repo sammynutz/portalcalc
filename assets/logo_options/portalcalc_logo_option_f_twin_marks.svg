@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 280" role="img" aria-labelledby="title desc">
+  <title id="title">Portal Calc logo option F</title>
+  <desc id="desc">Twin matching portal frame marks, one with PC for product and one with SLS for company.</desc>
+  <rect width="940" height="280" rx="18" fill="#ffffff"/>
+  <g transform="translate(42 44)">
+    <rect width="188" height="188" rx="36" fill="#10243a"/>
+    <path d="M36 144V72l58-38 58 38v72" fill="none" stroke="#f7fbff" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M36 144h116" fill="none" stroke="#39c98c" stroke-width="12" stroke-linecap="round"/>
+    <text x="54" y="123" fill="#f7fbff" font-family="Segoe UI, Arial, sans-serif" font-size="56" font-weight="850">PC</text>
+    <path d="M66 138l60-70" fill="none" stroke="#39c98c" stroke-width="8" stroke-linecap="round"/>
+  </g>
+  <text x="270" y="108" fill="#10243a" font-family="Segoe UI, Arial, sans-serif" font-size="56" font-weight="780" letter-spacing="0">Portal Calc</text>
+  <text x="274" y="148" fill="#34506d" font-family="Segoe UI, Arial, sans-serif" font-size="19" font-weight="600" letter-spacing="1.1">STRUCTURAL DESIGN SOFTWARE</text>
+  <path d="M274 171h260" stroke="#39c98c" stroke-width="7" stroke-linecap="round"/>
+  <g transform="translate(572 78)">
+    <rect width="100" height="100" rx="22" fill="#10243a"/>
+    <path d="M20 76V38l30-20 30 20v38" fill="none" stroke="#f7fbff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M20 76h60" fill="none" stroke="#39c98c" stroke-width="7" stroke-linecap="round"/>
+    <text x="24" y="63" fill="#f7fbff" font-family="Segoe UI, Arial, sans-serif" font-size="28" font-weight="850">SLS</text>
+  </g>
+  <text x="692" y="118" fill="#10243a" font-family="Segoe UI, Arial, sans-serif" font-size="25" font-weight="750">SLS</text>
+  <text x="692" y="148" fill="#34506d" font-family="Segoe UI, Arial, sans-serif" font-size="17" font-weight="600" letter-spacing="0.8">STRUCTURAL</text>
+  <text x="692" y="171" fill="#34506d" font-family="Segoe UI, Arial, sans-serif" font-size="17" font-weight="600" letter-spacing="0.8">SOFTWARE</text>
+</svg>

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 280" role="img" aria-labelledby="title desc">
+  <title id="title">Portal Calc logo option G</title>
+  <desc id="desc">Product-first PC portal frame mark with SLS in a clean publisher wordline.</desc>
+  <rect width="940" height="280" rx="18" fill="#ffffff"/>
+  <g transform="translate(44 36)">
+    <rect width="208" height="208" rx="42" fill="#10243a"/>
+    <path d="M40 158V80l64-42 64 42v78" fill="none" stroke="#f7fbff" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M40 158h128" fill="none" stroke="#39c98c" stroke-width="14" stroke-linecap="round"/>
+    <text x="70" y="142" fill="#f7fbff" font-family="Segoe UI, Arial, sans-serif" font-size="62" font-weight="850" text-anchor="middle">P</text>
+    <text x="122" y="142" fill="#f7fbff" font-family="Segoe UI, Arial, sans-serif" font-size="62" font-weight="850" text-anchor="middle">C</text>
+  </g>
+  <text x="292" y="113" fill="#10243a" font-family="Segoe UI, Arial, sans-serif" font-size="70" font-weight="800" letter-spacing="0">Portal Calc</text>
+  <path d="M296 132h426" stroke="#39c98c" stroke-width="7" stroke-linecap="round"/>
+  <text x="296" y="176" fill="#10243a" font-family="Segoe UI, Arial, sans-serif" font-size="31" font-weight="780" letter-spacing="1.5">SLS</text>
+  <text x="366" y="176" fill="#34506d" font-family="Segoe UI, Arial, sans-serif" font-size="24" font-weight="600" letter-spacing="1.3">STRUCTURAL SOFTWARE</text>
+</svg>

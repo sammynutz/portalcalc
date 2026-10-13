@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1240" role="img" aria-labelledby="title desc">
+  <title id="title">Portal Calc PC and SLS logo options</title>
+  <desc id="desc">Four logo concepts based around option B with PC as product mark and SLS as company mark.</desc>
+  <rect width="1920" height="1240" fill="#eef3f7"/>
+  <text x="70" y="86" fill="#10243a" font-family="Segoe UI, Arial, sans-serif" font-size="42" font-weight="750">Portal Calc logo options</text>
+  <text x="70" y="126" fill="#34506d" font-family="Segoe UI, Arial, sans-serif" font-size="22" font-weight="500">Option B direction: PC product mark + matching SLS company mark</text>
+  <g transform="translate(70 170)">
+    <rect width="820" height="420" rx="16" fill="#ffffff"/>
+    <text x="34" y="48" fill="#10243a" font-family="Segoe UI, Arial, sans-serif" font-size="26" font-weight="750">E. Product mark + publisher badge</text>
+    <image href="portalcalc_logo_option_e_pc_product_sls_publisher.png" x="30" y="90" width="760" height="226"/>
+    <text x="36" y="358" fill="#34506d" font-family="Segoe UI, Arial, sans-serif" font-size="21">PC owns the icon; SLS appears as a smaller framed publisher badge.</text>
+  </g>
+  <g transform="translate(1030 170)">
+    <rect width="820" height="420" rx="16" fill="#ffffff"/>
+    <text x="34" y="48" fill="#10243a" font-family="Segoe UI, Arial, sans-serif" font-size="26" font-weight="750">F. Twin matching marks</text>
+    <image href="portalcalc_logo_option_f_twin_marks.png" x="30" y="90" width="760" height="226"/>
+    <text x="36" y="358" fill="#34506d" font-family="Segoe UI, Arial, sans-serif" font-size="21">Clear product/company system; useful if both brands need equal visibility.</text>
+  </g>
+  <g transform="translate(70 690)">
+    <rect width="820" height="420" rx="16" fill="#ffffff"/>
+    <text x="34" y="48" fill="#10243a" font-family="Segoe UI, Arial, sans-serif" font-size="26" font-weight="750">G. PC icon + SLS wordline</text>
+    <image href="portalcalc_logo_option_g_pc_icon_sls_wordline.png" x="30" y="90" width="760" height="226"/>
+    <text x="36" y="358" fill="#34506d" font-family="Segoe UI, Arial, sans-serif" font-size="21">Cleanest product-first lockup; probably strongest for app chrome.</text>
+  </g>
+  <g transform="translate(1030 690)">
+    <rect width="820" height="420" rx="16" fill="#ffffff"/>
+    <text x="34" y="48" fill="#10243a" font-family="Segoe UI, Arial, sans-serif" font-size="26" font-weight="750">H. Stacked SLS endorsement</text>
+    <image href="portalcalc_logo_option_h_pc_sls_stacked.png" x="30" y="90" width="760" height="226"/>
+    <text x="36" y="358" fill="#34506d" font-family="Segoe UI, Arial, sans-serif" font-size="21">Good for About screens, docs and splash layouts where height is available.</text>
+  </g>
+</svg>

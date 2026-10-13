@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 280" role="img" aria-labelledby="title desc">
+  <title id="title">Portal Calc logo option E</title>
+  <desc id="desc">Portal Calc product logo with PC inside the frame and SLS shown as the publisher mark.</desc>
+  <rect width="940" height="280" rx="18" fill="#ffffff"/>
+  <g transform="translate(42 42)">
+    <rect width="196" height="196" rx="38" fill="#10243a"/>
+    <path d="M38 150V76l60-40 60 40v74" fill="none" stroke="#f7fbff" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M38 150h120" fill="none" stroke="#39c98c" stroke-width="13" stroke-linecap="round"/>
+    <path d="M70 132V74h34c19 0 31 11 31 28s-12 28-31 28H70" fill="none" stroke="#f7fbff" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M146 83c-8-8-18-12-31-12-25 0-43 18-43 45s18 45 43 45c14 0 25-5 33-14" fill="none" stroke="#f7fbff" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M68 144l70-70" fill="none" stroke="#39c98c" stroke-width="9" stroke-linecap="round"/>
+  </g>
+  <text x="278" y="118" fill="#10243a" font-family="Segoe UI, Arial, sans-serif" font-size="68" font-weight="780" letter-spacing="0">Portal Calc</text>
+  <text x="282" y="160" fill="#34506d" font-family="Segoe UI, Arial, sans-serif" font-size="23" font-weight="600" letter-spacing="1.4">STRUCTURAL DESIGN SOFTWARE</text>
+  <g transform="translate(282 184)">
+    <path d="M0 12h356" stroke="#39c98c" stroke-width="7" stroke-linecap="round"/>
+    <rect x="386" y="-26" width="86" height="56" rx="12" fill="#10243a"/>
+    <path d="M402 18V-8l27-18 27 18v26" fill="none" stroke="#f7fbff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M402 18h54" fill="none" stroke="#39c98c" stroke-width="5" stroke-linecap="round"/>
+    <text x="413" y="9" fill="#f7fbff" font-family="Segoe UI, Arial, sans-serif" font-size="22" font-weight="800">SLS</text>
+    <text x="492" y="5" fill="#34506d" font-family="Segoe UI, Arial, sans-serif" font-size="18" font-weight="650" letter-spacing="0.8">SLS STRUCTURAL</text>
+    <text x="492" y="27" fill="#34506d" font-family="Segoe UI, Arial, sans-serif" font-size="18" font-weight="650" letter-spacing="0.8">SOFTWARE</text>
+  </g>
+</svg>

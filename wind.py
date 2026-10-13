@@ -35,7 +35,7 @@ from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 import math
 
 
-WindDirection = Literal["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+WindDirection = str | float
 CpeCaseName = Literal["Left +", "Left -", "Right +", "Right -", "End +", "End -"]
 CpiCaseName = Literal["Cpi +", "Cpi -"]
 WindCaseName = Literal["Left +", "Left -", "Right +", "Right -", "End +", "End -", "Cpi +", "Cpi -"]
@@ -92,8 +92,89 @@ DIRECTION_MULTIPLIERS: Dict[WindDirection, Dict[str, float]] = {
     "SE": {"A0": 0.90, "A1": 0.80, "A2": 0.95, "A3": 0.90, "A4": 0.80, "A5": 0.80, "B1": 0.90, "B2": 0.90, "C": 0.90, "D": 0.90},
     "S":  {"A0": 0.90, "A1": 0.80, "A2": 0.95, "A3": 0.90, "A4": 0.80, "A5": 0.80, "B1": 0.95, "B2": 0.90, "C": 0.90, "D": 0.90},
     "SW": {"A0": 0.95, "A1": 0.95, "A2": 0.95, "A3": 0.95, "A4": 0.90, "A5": 0.95, "B1": 0.95, "B2": 0.90, "C": 0.90, "D": 0.95},
-    "W":  {"A0": 1.00, "A1": 0.10, "A2": 1.00, "A3": 1.00, "A4": 1.00, "A5": 1.00, "B1": 0.95, "B2": 0.90, "C": 0.90, "D": 0.95},
+    "W":  {"A0": 1.00, "A1": 1.00, "A2": 1.00, "A3": 1.00, "A4": 1.00, "A5": 1.00, "B1": 0.95, "B2": 0.90, "C": 0.90, "D": 0.95},
 }
+
+# Synthetic design envelope, not an additional geographic subregion. Build it
+# from the same source tables so changes cannot leave a stale envelope behind.
+A_SUBREGIONS = tuple(f"A{i}" for i in range(6))
+A_ENVELOPE_REGION = "A-ALL"
+for _speeds in REGIONAL_WIND_SPEEDS.values():
+    _speeds[A_ENVELOPE_REGION] = max(_speeds[r] for r in A_SUBREGIONS)
+SERVICEABILITY_WIND_SPEEDS[A_ENVELOPE_REGION] = max(
+    SERVICEABILITY_WIND_SPEEDS[r] for r in A_SUBREGIONS)
+for _multipliers in DIRECTION_MULTIPLIERS.values():
+    _multipliers[A_ENVELOPE_REGION] = max(_multipliers[r] for r in A_SUBREGIONS)
+
+
+def direction_bearing_degrees(direction: WindDirection) -> float:
+    """Compass name or numeric bearing, clockwise from north; reject invalid input."""
+    if isinstance(direction, bool):
+        raise ValueError("wind bearing must be a compass direction or finite angle")
+    if isinstance(direction, str):
+        if direction in DIRECTION_ORDER:
+            return DIRECTION_ORDER.index(direction) * 45.0
+        direction = direction.strip().removesuffix("°").strip()
+    try:
+        bearing = float(direction)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("wind bearing must be a compass direction or finite angle") from exc
+    if not math.isfinite(bearing):
+        raise ValueError("wind bearing must be finite")
+    return bearing % 360.0
+
+
+def interpolated_direction_multiplier(region: str, bearing_deg: float) -> float:
+    """Interpolate Md clockwise from north, for orientation analysis.
+
+    For A-ALL, envelope the regional curves *after* interpolation. Interpolating
+    the cardinal maxima instead is safe but can unnecessarily increase Md where
+    different subregions govern the two bounding cardinal points.
+    """
+    region = region.upper()
+    bearing = float(bearing_deg)
+    if not math.isfinite(bearing):
+        raise ValueError("wind bearing must be finite")
+    if region == A_ENVELOPE_REGION:
+        return max(interpolated_direction_multiplier(r, bearing) for r in A_SUBREGIONS)
+    index, fraction = divmod(bearing % 360.0, 45.0)
+    first = int(index)
+    a = DIRECTION_MULTIPLIERS[DIRECTION_ORDER[first]][region]
+    b = DIRECTION_MULTIPLIERS[DIRECTION_ORDER[(first + 1) % 8]][region]
+    return a + (b - a) * fraction / 45.0
+
+
+def design_direction_multiplier(region: str, direction: str | float) -> float:
+    """Maximum Md within ±45°, including arbitrary numeric bearings.
+    All other site multipliers in this calculator are direction independent,
+    so maximising Md is equivalent to maximising the interpolated site speed.
+    """
+    region = region.upper()
+    if direction == "Any":
+        return max(DIRECTION_MULTIPLIERS[d][region] for d in DIRECTION_ORDER)
+    bearing = direction_bearing_degrees(direction)
+    start, end = bearing - 45.0, bearing + 45.0
+    points = [start, end]
+    points.extend(i * 45.0 for i in range(math.ceil(start / 45.0), math.floor(end / 45.0) + 1))
+    # Each regional curve is linear between knots. Its maximum on a sector
+    # occurs at a knot or boundary; maxima over directions and regions commute.
+    return max(interpolated_direction_multiplier(region, point) for point in points)
+
+
+def symmetric_end_source_direction(region: str, direction: WindDirection) -> WindDirection:
+    """Closed identical ends share a pressure pattern; use their larger Md.
+
+    Reversing end wind does not change a transverse frame's end-wind pattern.
+    Taking the larger source window checks both ends without another solve.
+    """
+    if direction == "Any":
+        return direction
+    if direction in DIRECTION_ORDER:
+        opposite = DIRECTION_ORDER[(DIRECTION_ORDER.index(direction) + 4) % 8]
+    else:
+        opposite = (direction_bearing_degrees(direction) + 180) % 360
+    return max((direction, opposite),
+               key=lambda d: design_direction_multiplier(region, d))
 
 # Terrain multiplier table from the spreadsheet.
 # heights in metres; columns are terrain categories.
@@ -157,7 +238,7 @@ FREE_ROOF_CPN = {
 }
 
 CPI_BY_FRAME_TYPE: Dict[str, Tuple[float, float]] = {
-    "Enclosed": (0.10, -0.20),
+    "Enclosed": (0.20, -0.20),
     "Roof Only": (0.0, 0.0),
     "3 Sided": (0.76, -0.11),
     "2 Sided": (0.40, -0.10),
@@ -175,6 +256,7 @@ class WindInputs:
     terrain_category: float = 2.0
     eave_height_m: float = 10.0
     roof_pitch_deg: float = 7.5
+    roof_shape: str = "Gable"
     building_width_m: float = 21.0
     building_length_m: float = 40.0
     bay_size_m: float = 8.0
@@ -189,6 +271,7 @@ class WindInputs:
     right_canopy_length_m: float = 0.0
     reduction_factor: float = 1.0
     air_density: float = 1.2
+    internal_pressure_mode: str = "Standard"
 
     def validate(self) -> None:
         region = self.wind_region.upper()
@@ -200,12 +283,14 @@ class WindInputs:
             raise ValueError("terrain_category must be one of 1, 2, 2.5, 3 or 4")
         if self.eave_height_m <= 0 or self.building_width_m <= 0 or self.building_length_m <= 0 or self.bay_size_m <= 0:
             raise ValueError("eave height, building width, building length and bay size must be positive")
-        if self.orientation not in DIRECTION_MULTIPLIERS:
-            raise ValueError(f"Unsupported wind orientation: {self.orientation}")
+        if self.orientation != "Any":
+            direction_bearing_degrees(self.orientation)
         if self.frame_type not in CPI_BY_FRAME_TYPE:
             raise ValueError(f"Unsupported frame type: {self.frame_type}")
         if self.cpi_case not in CPI_CASE_OPTIONS:
             raise ValueError(f"Unsupported Cpi case: {self.cpi_case}")
+        if self.roof_shape not in {"Gable", "Skillion"}:
+            raise ValueError("roof_shape must be Gable or Skillion")
 
 
 @dataclass
@@ -255,7 +340,13 @@ class WindCalculationResult:
         one tributary bay width anywhere along the building length.
         """
         if self.inputs.roof_pitch_deg >= 10.0:
-            source_zone = next((zone for zone in self.roof_zones if zone.name == "Downwind rafter"), self.roof_zones[-1])
+            source_zone = next(
+                (
+                    zone for zone in self.roof_zones
+                    if zone.name in {"Downwind/crosswind monoslope", "Downwind rafter"}
+                ),
+                self.roof_zones[-1],
+            )
             return source_zone.line_load_max_kn_m if use_max else source_zone.line_load_min_kn_m
 
         cpe_rows = low_pitch_cpe_values(self.h_over_d)
@@ -312,9 +403,21 @@ class WindCalculationResult:
         if case.startswith("End"):
             q = self.end_wind_critical_roof_line_load_kn_m(use_max)
             return [(0.0, total_roof_length, q)]
+        if self.inputs.roof_shape == "Skillion":
+            if case.startswith("Left"):
+                if self.inputs.roof_pitch_deg >= 10.0:
+                    source_zone = next((zone for zone in self.roof_zones if zone.name == "Upwind rafter"), self.roof_zones[0])
+                    q = source_zone.line_load_max_kn_m if use_max else source_zone.line_load_min_kn_m
+                    return [(0.0, total_roof_length, q)]
+                return self._mirrored_roof_strips(use_max, total_roof_length, from_right=False)
+            q = self.end_wind_critical_roof_line_load_kn_m(use_max)
+            return [(0.0, total_roof_length, q)]
 
         from_right = case.startswith("Right")
 
+        return self._mirrored_roof_strips(use_max, total_roof_length, from_right)
+
+    def _mirrored_roof_strips(self, use_max: bool, total_roof_length: float, from_right: bool) -> List[Tuple[float, float, float]]:
         strips = []
         for zone in self.roof_zones:
             q = zone.line_load_max_kn_m if use_max else zone.line_load_min_kn_m
@@ -333,10 +436,15 @@ class WindCalculationResult:
 
     @property
     def roof_slope_length_m(self) -> float:
-        half_span = self.inputs.building_width_m / 2.0
-        half_rise = math.tan(math.radians(self.inputs.roof_pitch_deg)) * half_span
+        if self.inputs.roof_shape == "Skillion":
+            rise = math.tan(math.radians(self.inputs.roof_pitch_deg)) * self.inputs.building_width_m
+            main_roof_length = math.hypot(self.inputs.building_width_m, rise)
+        else:
+            half_span = self.inputs.building_width_m / 2.0
+            half_rise = math.tan(math.radians(self.inputs.roof_pitch_deg)) * half_span
+            main_roof_length = 2.0 * math.hypot(half_span, half_rise)
         return (
-            2.0 * math.hypot(half_span, half_rise)
+            main_roof_length
             + max(self.inputs.left_canopy_length_m, 0.0)
             + max(self.inputs.right_canopy_length_m, 0.0)
         )
@@ -344,8 +452,11 @@ class WindCalculationResult:
     def summary_lines(self) -> List[str]:
         lines = ["WIND LOAD INPUTS / RESULTS"]
         lines.append(f"Region / IL / TC : {self.inputs.wind_region} / {self.inputs.importance_level} / {self.inputs.terrain_category}")
-        lines.append(f"Orientation       : {self.inputs.orientation}")
+        orientation_text = "Any (worst direction for region)" if self.inputs.orientation == "Any" else self.inputs.orientation
+        lines.append(f"Orientation       : {orientation_text}")
+        lines.append(f"Roof shape        : {self.inputs.roof_shape}")
         lines.append(f"Frame type        : {derived_frame_type_from_walls(self.inputs)}")
+        lines.append(f"Internal pressure : {getattr(self.inputs, 'internal_pressure_mode', 'Standard')}")
         cladding = wall_cladding(self.inputs)
         lines.append(
             "Wall enclosure   : "
@@ -455,6 +566,18 @@ def derived_frame_type_from_walls(inputs) -> str:
     return "1 Sided"
 
 
+def cyclonic_enclosed_cpi(inputs, derived_frame_type: Optional[str] = None) -> Optional[Tuple[float, float]]:
+    frame_type = derived_frame_type or derived_frame_type_from_walls(inputs)
+    if frame_type != "Enclosed":
+        return None
+    if str(inputs.wind_region).upper() not in {"B2", "C", "D"}:
+        return None
+    mode = str(getattr(inputs, "internal_pressure_mode", "Standard")).strip().lower()
+    if "louvre" in mode or "louver" in mode or "vent" in mode:
+        return (0.30, -0.30)
+    return (0.60, -0.60)
+
+
 def wall_surface_for_cpe_case(cpe_case: Optional[CpeCaseName], wall: str) -> str:
     case = str(cpe_case or "").strip()
     if case.startswith("Left"):
@@ -510,7 +633,8 @@ def local_pressure_dimension_a(result_or_inputs) -> float:
     inputs = getattr(result_or_inputs, "inputs", result_or_inputs)
     h_m = getattr(result_or_inputs, "h_m", None)
     if h_m is None:
-        h_m = inputs.eave_height_m + math.tan(math.radians(inputs.roof_pitch_deg)) * inputs.building_width_m * 0.25
+        roof_rise = math.tan(math.radians(inputs.roof_pitch_deg)) * inputs.building_width_m
+        h_m = inputs.eave_height_m + roof_rise * (0.5 if getattr(inputs, "roof_shape", "Gable") == "Skillion" else 0.25)
     return max(min(0.2 * inputs.building_width_m, 0.2 * inputs.building_length_m, h_m), 0.0)
 
 
@@ -646,7 +770,7 @@ def bilinear_grid_value(x: float, y: float, x_points: Sequence[float], y_points:
     return lerp(y, y1, v1, y2, v2)
 
 
-def pitched_roof_cpe_values(roof_pitch_deg: float, h_over_d: float, roof_slope_length_m: float) -> List[Tuple[str, float, float, float, float]]:
+def pitched_roof_cpe_values(roof_pitch_deg: float, h_over_d: float, roof_slope_length_m: float, roof_shape: str = "Gable") -> List[Tuple[str, float, float, float, float]]:
     """Return pitch >=10° zones as name, from_m, to_m, cpe_plus, cpe_minus.
 
     The zones are measured from the windward eave along the roof slope.
@@ -658,6 +782,11 @@ def pitched_roof_cpe_values(roof_pitch_deg: float, h_over_d: float, roof_slope_l
     upwind_minus = bilinear_grid_value(pitch, h_d, PITCHED_ROOF_PITCH_POINTS, PITCHED_ROOF_HD_POINTS, PITCHED_UPWIND_SLOPE_2)
     downwind_plus = bilinear_grid_value(pitch, h_d, PITCHED_ROOF_PITCH_POINTS, PITCHED_ROOF_HD_POINTS, PITCHED_DOWNWIND_MAX)
     downwind_minus = 0.0
+    if roof_shape == "Skillion":
+        return [
+            ("Upwind rafter", 0.0, roof_slope_length_m, upwind_plus, upwind_minus),
+            ("Downwind/crosswind monoslope", 0.0, roof_slope_length_m, downwind_plus, downwind_minus),
+        ]
     half = roof_slope_length_m / 2.0
     return [
         ("Upwind rafter", 0.0, half, upwind_plus, upwind_minus),
@@ -684,6 +813,21 @@ def free_roof_cpn(roof_pitch_deg: float, h_over_d: float, roof_part: str, unders
     index = 0 if use_uplift else 1
     pitch = min(max(roof_pitch_deg, FREE_ROOF_PITCH_POINTS[0]), FREE_ROOF_PITCH_POINTS[-1])
     return interpolate_points(pitch, [(p, pair[index]) for p, pair in zip(FREE_ROOF_PITCH_POINTS, values)])
+
+
+def transverse_free_roof_cpn(underside: str, use_uplift: bool) -> float:
+    """
+    Appendix B transverse wind on a free roof uses the monoslope free-roof table
+    with alpha = 0 degrees. For empty-under roofs the pair is -0.3, +0.4.
+    """
+    under = str(underside).strip().lower()
+    values = {
+        "empty": (-0.3, 0.4),
+        "blocked": (-1.0, 0.4),
+    }
+    if under not in values:
+        raise ValueError("underside must be 'empty' or 'blocked'")
+    return values[under][0 if use_uplift else 1]
 
 
 
@@ -728,17 +872,19 @@ def calculate_wind(inputs: WindInputs) -> WindCalculationResult:
 
     vr = REGIONAL_WIND_SPEEDS[inputs.importance_level][region]
     vr_sls = SERVICEABILITY_WIND_SPEEDS[region]
-    md = DIRECTION_MULTIPLIERS[inputs.orientation][region]
-    direction_index = DIRECTION_ORDER.index(inputs.orientation)
-    design_directions = [
-        DIRECTION_ORDER[(direction_index - 1) % len(DIRECTION_ORDER)],
-        inputs.orientation,
-        DIRECTION_ORDER[(direction_index + 1) % len(DIRECTION_ORDER)],
-    ]
-    m_design = max(DIRECTION_MULTIPLIERS[direction][region] for direction in design_directions)
+    if inputs.orientation == "Any":
+        md = max(DIRECTION_MULTIPLIERS[direction][region] for direction in DIRECTION_ORDER)
+    else:
+        md = interpolated_direction_multiplier(region, direction_bearing_degrees(inputs.orientation))
+    m_design = design_direction_multiplier(region, inputs.orientation)
 
-    h = inputs.eave_height_m + math.tan(math.radians(inputs.roof_pitch_deg)) * inputs.building_width_m * 0.25
-    apex = inputs.eave_height_m + math.tan(math.radians(inputs.roof_pitch_deg)) * inputs.building_width_m * 0.5
+    roof_rise = math.tan(math.radians(inputs.roof_pitch_deg)) * inputs.building_width_m
+    if inputs.roof_shape == "Skillion":
+        h = inputs.eave_height_m + roof_rise * 0.5
+        apex = inputs.eave_height_m + roof_rise
+    else:
+        h = inputs.eave_height_m + roof_rise * 0.25
+        apex = inputs.eave_height_m + roof_rise * 0.5
     mz = terrain_multiplier(h, inputs.terrain_category)
 
     vsit = vr * md * mz
@@ -752,18 +898,22 @@ def calculate_wind(inputs: WindInputs) -> WindCalculationResult:
     b_over_d = inputs.building_length_m / inputs.building_width_m
     h_over_d = h / inputs.building_width_m
     derived_frame_type = derived_frame_type_from_walls(inputs)
-    cpi_max, cpi_min = CPI_BY_FRAME_TYPE[derived_frame_type]
+    cpi_max, cpi_min = cyclonic_enclosed_cpi(inputs, derived_frame_type) or CPI_BY_FRAME_TYPE[derived_frame_type]
     active_cpi = cpi_max if inputs.cpi_case == "Cpi +" else cpi_min
     lw_cpe = leeward_wall_cpe(d_over_b, inputs.roof_pitch_deg)
 
     zones: List[RoofPressureZone] = []
+    if inputs.roof_shape == "Skillion":
+        main_roof_slope_length = math.hypot(inputs.building_width_m, apex - inputs.eave_height_m)
+    else:
+        main_roof_slope_length = 2.0 * math.hypot(inputs.building_width_m / 2.0, apex - inputs.eave_height_m)
     roof_slope_length = (
-        2.0 * math.hypot(inputs.building_width_m / 2.0, apex - inputs.eave_height_m)
+        main_roof_slope_length
         + max(inputs.left_canopy_length_m, 0.0)
         + max(inputs.right_canopy_length_m, 0.0)
     )
     if inputs.roof_pitch_deg >= 10.0:
-        roof_cpe_rows = pitched_roof_cpe_values(inputs.roof_pitch_deg, h_over_d, roof_slope_length)
+        roof_cpe_rows = pitched_roof_cpe_values(inputs.roof_pitch_deg, h_over_d, roof_slope_length, inputs.roof_shape)
         distances_are_metres = True
     else:
         roof_cpe_rows = low_pitch_cpe_values(h_over_d)
@@ -950,20 +1100,22 @@ def apply_column_wind_cpe_loads(structure, left_base, left_top, right_base, righ
     """
     Apply Cpe-only wall wind pressure to frame columns.
 
-    For analysis the load is still applied as equivalent nodal loads at the
-    column ends.  For plotting, multiple arrows are returned along the column
-    height so the load diagram reads as a distributed column load rather than a
-    single horizontal line.
+    For analysis the pressure is applied as a consistent uniform member load,
+    including its fixed-end moments and local member curvature.  For plotting,
+    multiple arrows are returned along the column height.
 
-    For 1/2/3-sided open sheds, the clad side is assumed to be the left column
-    only, so the right column receives no wall Cpe load. Roof-only and
-    no-wind frames receive no column load.
+    Side-wall loads follow the selected wall enclosure directly. Open side
+    walls receive no column Cpe load.
     """
-    frame_type = result.inputs.frame_type
-    if frame_type in {"Roof Only", "No Wind"}:
+    walls = wall_cladding(result.inputs)
+    if not (walls.get("left") or walls.get("right")):
         return []
 
     left_wind = str(case).startswith("Left")
+    right_wind = str(case).startswith("Right")
+    if not (left_wind or right_wind):
+        return []
+
     windward_cpe = 0.7
     leeward_cpe = result.leeward_wall_cpe
     arrows: List[LoadArrow] = []
@@ -971,8 +1123,23 @@ def apply_column_wind_cpe_loads(structure, left_base, left_top, right_base, righ
     def add_column_load(base, top, line_kn_m: float, direction: float, arrow_count: int = 5) -> None:
         height_m = abs(top.y - base.y) / 1000.0
         total_n = line_kn_m * height_m * 1000.0 * direction
-        structure.add_load(base.ux, total_n / 2.0)
-        structure.add_load(top.ux, total_n / 2.0)
+        if hasattr(structure, "add_uniform_global_line_load_between"):
+            column_groups = {
+                element.group
+                for element in structure.elements
+                if "COLUMN" in str(element.group).upper()
+            }
+            matched = structure.add_uniform_global_line_load_between(
+                base,
+                top,
+                fx_n_per_mm=line_kn_m * direction,
+                element_groups=column_groups,
+            )
+            if not matched:
+                raise ValueError("No column elements found for wall Cpe load.")
+        else:
+            structure.add_load(base.ux, total_n / 2.0)
+            structure.add_load(top.ux, total_n / 2.0)
 
         # Plot as distributed arrows. The arrows sum to the applied resultant.
         count = max(2, arrow_count)
@@ -982,31 +1149,27 @@ def apply_column_wind_cpe_loads(structure, left_base, left_top, right_base, righ
             y = base.y + (top.y - base.y) * t
             arrows.append((x, y, total_n / count, 0.0))
 
-    wall_area_m2 = result.inputs.bay_size_m * result.inputs.eave_height_m
-    ww_line = wall_cpe_line_load_kn_m(result, windward_cpe, wind_pressure, "windward_wall", wall_area_m2)
-    lw_line = wall_cpe_line_load_kn_m(result, leeward_cpe, wind_pressure, "leeward_wall", wall_area_m2)
-
-    if open_sided_frame_type(frame_type):
-        # User rule: 1/2/3-sided cases are always clad to the left, so the right column is unloaded.
-        if left_wind:
-            add_column_load(left_base, left_top, ww_line, +1.0)
-        else:
-            add_column_load(left_base, left_top, lw_line, -1.0)
-        return arrows
+    def line_for_wall(base, top, cpe, surface):
+        wall_area_m2 = result.inputs.bay_size_m * abs(top.y - base.y) / 1000.0
+        return wall_cpe_line_load_kn_m(result, cpe, wind_pressure, surface, wall_area_m2)
 
     if left_wind:
-        add_column_load(left_base, left_top, ww_line, +1.0)
-        add_column_load(right_base, right_top, lw_line, +1.0)
+        if walls.get("left"):
+            add_column_load(left_base, left_top, line_for_wall(left_base, left_top, windward_cpe, "windward_wall"), +1.0)
+        if walls.get("right"):
+            add_column_load(right_base, right_top, line_for_wall(right_base, right_top, leeward_cpe, "leeward_wall"), +1.0)
     else:
-        add_column_load(right_base, right_top, ww_line, -1.0)
-        add_column_load(left_base, left_top, lw_line, -1.0)
+        if walls.get("right"):
+            add_column_load(right_base, right_top, line_for_wall(right_base, right_top, windward_cpe, "windward_wall"), -1.0)
+        if walls.get("left"):
+            add_column_load(left_base, left_top, line_for_wall(left_base, left_top, leeward_cpe, "leeward_wall"), -1.0)
     return arrows
 
 
 def apply_column_wind_cpi_loads(structure, left_base, left_top, right_base, right_top, result: WindCalculationResult, case: CpiCaseName, wind_pressure: str = "ultimate", cpe_case: Optional[CpeCaseName] = None) -> List[LoadArrow]:
     """Apply Cpi-only wall pressure as a separate internal-pressure column load case."""
-    frame_type = result.inputs.frame_type
-    if frame_type in {"Roof Only", "No Wind"}:
+    walls = wall_cladding(result.inputs)
+    if not (walls.get("left") or walls.get("right")):
         return []
 
     cpi = active_cpi_for_case(result, case, cpe_case)
@@ -1022,8 +1185,23 @@ def apply_column_wind_cpi_loads(structure, left_base, left_top, right_base, righ
     def add_column_load(base, top, direction: float, arrow_count: int = 5) -> None:
         height_m = abs(top.y - base.y) / 1000.0
         total_n = line_kn_m * height_m * 1000.0 * direction
-        structure.add_load(base.ux, total_n / 2.0)
-        structure.add_load(top.ux, total_n / 2.0)
+        if hasattr(structure, "add_uniform_global_line_load_between"):
+            column_groups = {
+                element.group
+                for element in structure.elements
+                if "COLUMN" in str(element.group).upper()
+            }
+            matched = structure.add_uniform_global_line_load_between(
+                base,
+                top,
+                fx_n_per_mm=line_kn_m * direction,
+                element_groups=column_groups,
+            )
+            if not matched:
+                raise ValueError("No column elements found for wall Cpi load.")
+        else:
+            structure.add_load(base.ux, total_n / 2.0)
+            structure.add_load(top.ux, total_n / 2.0)
         count = max(2, arrow_count)
         for i in range(count):
             t = (i + 0.5) / count
@@ -1031,8 +1209,9 @@ def apply_column_wind_cpi_loads(structure, left_base, left_top, right_base, righ
             y = base.y + (top.y - base.y) * t
             arrows.append((x, y, total_n / count, 0.0))
 
-    add_column_load(left_base, left_top, left_direction)
-    if not open_sided_frame_type(frame_type):
+    if walls.get("left"):
+        add_column_load(left_base, left_top, left_direction)
+    if walls.get("right"):
         add_column_load(right_base, right_top, right_direction)
     return arrows
 
