@@ -18,9 +18,14 @@ git commit -m "Back up latest PortalCalc source"
 git push
 ```
 
-Review the staged files before committing. Backups happen when these commands
-are run; this does not schedule automatic pushes. The main branch is kept
-separate so a backup does not update the deployed service.
+Review the staged files before committing. A Codex follow-up named
+`PortalCalc daily source backup` also checks this folder each day at 6:00 pm
+Australia/Sydney time and pushes relevant changes to the backup branch.
+Keep the computer on and Codex running for this local scheduled check.
+It defers while the project is being actively edited or another branch is
+checked out, and reports failures or required action. Routine successful
+backups are quiet. The main branch is kept separate so a backup does not
+update the deployed service.
 
 To restore into a new folder:
 
