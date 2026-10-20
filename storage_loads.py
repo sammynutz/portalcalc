@@ -371,6 +371,13 @@ def panel_service_deflection(
         deflection_mm = 5.0 * service_pressure_n_mm * span_mm**4 / (
             384.0 * e_mpa * max(effective_i_mm4, 1.0)
         )
+        if is_continuous_stub_panel_mode(results.inputs):
+            # Equal two-span continuous beam under a UDL on both spans.
+            # v EI/(q L^4) = t^4/24 - t^3/16 + t/48,
+            # with dv/dt=0 at t=(1+sqrt(33))/16 from the outer support.
+            t = (1.0 + math.sqrt(33.0)) / 16.0
+            coefficient = t**4 / 24.0 - t**3 / 16.0 + t / 48.0
+            deflection_mm = coefficient * service_pressure_n_mm * span_mm**4 / (e_mpa * max(effective_i_mm4, 1.0))
         return (
             deflection_mm,
             0.0,
@@ -765,7 +772,9 @@ def _calculate_centre_stub_storage_loads(inputs: StorageLoadInputs, result: Stor
     if is_continuous_stub_panel_mode(inputs):
         panel_positive_moment_knm_per_m = 9.0 * result.base_pressure_kpa * half_bay_m**2 / 128.0
         panel_negative_moment_knm_per_m = result.base_pressure_kpa * half_bay_m**2 / 8.0
-        panel_negative_level_mm = rail_level_mm
+        # Horizontal panel bending peaks at the lowest strip (maximum p).
+        # The negative moment is over the centre stub at this same elevation.
+        panel_negative_level_mm = 0.0
     else:
         panel_positive_moment_knm_per_m = result.base_pressure_kpa * half_bay_m**2 / 8.0
         panel_negative_moment_knm_per_m = 0.0
@@ -830,8 +839,12 @@ def storage_factor_for_combination(inputs: StorageLoadInputs, combination) -> fl
     if not inputs.enabled:
         return 0.0
     if getattr(combination, "is_serviceability", False):
+        if getattr(combination, "serviceability_component", None) in {"G", "Ws"}:
+            return 0.0
         return inputs.sls_factor
-    return getattr(combination, "q_factor", 0.0) if getattr(combination, "q_factor", 0.0) > 0.0 else inputs.uls_factor
+    # Storage has its own explicit factor; the roof/crane Q factor must not
+    # override it. A separate no-storage case is included in the envelope.
+    return inputs.uls_factor
 
 
 def apply_storage_loads_to_columns(
@@ -854,25 +867,56 @@ def apply_storage_loads_to_columns(
         wall_targets.append((right_nodes, +1.0, right_base_y_mm))
     if inputs.reverse_direction:
         wall_targets = [(nodes, -direction, base_y_mm) for nodes, direction, base_y_mm in wall_targets]
+    # Validate the complete load path before adding any load. Load-only arrow
+    # collectors have no elements; real analysis structures must cover H.
+    planned = []
     for nodes, direction, base_y_mm in wall_targets:
         by_level = {round(node.y, 6): node for node in nodes if node is not None}
         for rail in results.rail_loads:
             node = by_level.get(round(base_y_mm + rail.level_mm, 6))
             if node is None:
-                continue
-            load_n = rail.rail_reaction_kn * factor * 1000.0 * direction
-            structure.add_load(node.ux, load_n)
-            arrows.append((node.x, node.y, load_n, 0.0))
+                raise ValueError("Storage rail reaction has no supporting column node.")
+            segments = []
             if rail.rail_load_type == "centre_point" and rail.direct_column_reaction_kn > 0.0:
                 base_node = by_level.get(round(base_y_mm, 6))
                 loaded_top_y_mm = base_y_mm + rail.tributary_height_m * 1000.0
                 loaded_top_node = by_level.get(round(loaded_top_y_mm, 6))
                 if base_node is None or loaded_top_node is None:
-                    continue
-                direct_load_n = rail.direct_column_reaction_kn * factor * 1000.0 * direction
-                structure.add_load(base_node.ux, direct_load_n * 2.0 / 3.0)
-                structure.add_load(loaded_top_node.ux, direct_load_n / 3.0)
-                arrows.append((loaded_top_node.x, base_y_mm + rail.tributary_height_m * 1000.0 / 3.0, direct_load_n, 0.0))
+                    raise ValueError("Storage direct panel load has no base/top column node.")
+                if hasattr(structure, "elements"):
+                    low, high = base_y_mm, loaded_top_y_mm
+                    for element in structure.elements:
+                        if element.group not in {"LEFT_COLUMN", "RIGHT_COLUMN"}:
+                            continue
+                        a, b = element.start, element.end
+                        if max(abs(a.x-base_node.x), abs(b.x-base_node.x)) > 1e-6:
+                            continue
+                        if min(a.y,b.y) < low-1e-6 or max(a.y,b.y) > high+1e-6:
+                            continue
+                        if abs(a.y-b.y) > 1e-6:
+                            segments.append(element)
+                    intervals = sorted((min(e.start.y,e.end.y), max(e.start.y,e.end.y)) for e in segments)
+                    cursor = low
+                    for a,b in intervals:
+                        if abs(a-cursor) > 1e-6:
+                            raise ValueError("Storage panel column load path has a gap or overlap.")
+                        cursor = b
+                    if abs(cursor-high) > 1e-6 or not hasattr(structure, "add_linear_global_line_load"):
+                        raise ValueError("Storage panel load requires a complete distributed column load path.")
+            planned.append((rail, node, direction, base_y_mm, segments))
+    for rail, node, direction, base_y_mm, segments in planned:
+        load_n = rail.rail_reaction_kn * factor * 1000.0 * direction
+        structure.add_load(node.ux, load_n)
+        arrows.append((node.x, node.y, load_n, 0.0))
+        if rail.rail_load_type == "centre_point" and rail.direct_column_reaction_kn > 0.0:
+            height_mm = rail.tributary_height_m * 1000.0
+            direct_load_n = rail.direct_column_reaction_kn * factor * 1000.0 * direction
+            q0 = 2.0 * direct_load_n / height_mm
+            for element in segments:
+                qa = q0 * (1.0-(element.start.y-base_y_mm)/height_mm)
+                qb = q0 * (1.0-(element.end.y-base_y_mm)/height_mm)
+                structure.add_linear_global_line_load(element, fx_start=qa, fx_end=qb)
+            arrows.append((node.x, base_y_mm+height_mm/3.0, direct_load_n, 0.0))
     return arrows
 
 

@@ -924,17 +924,27 @@ class FrameElement2D:
         d_global = global_displacements[dofs]
         return self.transformation_matrix() @ d_global
 
+    @staticmethod
+    def load_components(local_load):
+        """Legacy (qx,qy) or linear (qx_start,qy_start,qx_end,qy_end), N/mm."""
+        values = tuple(local_load or (0.0, 0.0))
+        if len(values) == 2:
+            return values + values
+        if len(values) == 4:
+            return values
+        raise ValueError("Element line load must have two or four components.")
+
     def equivalent_nodal_load_local(self, uniform_local_load=None):
-        """Consistent nodal load for uniform local axial/transverse loads (N/mm)."""
-        qx, qy = uniform_local_load or (0.0, 0.0)
+        """Exact consistent nodal forces/couples for a linear element load."""
+        qx1, qy1, qx2, qy2 = self.load_components(uniform_local_load)
         L = self.length()
         return np.array([
-            qx * L / 2.0,
-            qy * L / 2.0,
-            qy * L**2 / 12.0,
-            qx * L / 2.0,
-            qy * L / 2.0,
-            -qy * L**2 / 12.0,
+            L * (2.0 * qx1 + qx2) / 6.0,
+            L * (7.0 * qy1 + 3.0 * qy2) / 20.0,
+            L**2 * (3.0 * qy1 + 2.0 * qy2) / 60.0,
+            L * (qx1 + 2.0 * qx2) / 6.0,
+            L * (3.0 * qy1 + 7.0 * qy2) / 20.0,
+            -L**2 * (2.0 * qy1 + 3.0 * qy2) / 60.0,
         ])
 
     def local_end_forces(self, global_displacements, uniform_local_load=None):
@@ -952,12 +962,12 @@ class FrameElement2D:
         t = min(max(float(t), 0.0), 1.0)
         L = self.length()
         x = t * L
-        qx, qy = uniform_local_load or (0.0, 0.0)
+        qx1, qy1, qx2, qy2 = self.load_components(uniform_local_load)
         f = self.local_end_forces(global_displacements, uniform_local_load)
         return (
-            -f[0] - qx * x,
-            f[1] + qy * x,
-            -f[2] + f[1] * x + 0.5 * qy * x**2,
+            -f[0] - qx1 * x - (qx2 - qx1) * x**2 / (2.0 * L),
+            f[1] + qy1 * x + (qy2 - qy1) * x**2 / (2.0 * L),
+            -f[2] + f[1] * x + 0.5 * qy1 * x**2 + (qy2 - qy1) * x**3 / (6.0 * L),
         )
 
     def local_displacement_at(self, global_displacements, t, uniform_local_load=None):
@@ -972,9 +982,11 @@ class FrameElement2D:
         n3 = 3.0 * t**2 - 2.0 * t**3
         n4 = L * (-t**2 + t**3)
         v = n1 * local[1] + n2 * local[2] + n3 * local[4] + n4 * local[5]
-        _, qy = uniform_local_load or (0.0, 0.0)
-        if abs(qy) > 1e-12:
-            v += qy * x**2 * (L - x) ** 2 / (24.0 * self.E * self.I)
+        qx1, qy1, qx2, qy2 = self.load_components(uniform_local_load)
+        # Particular solution is zero at both ends (and has zero end slopes
+        # for bending). Retain the curvature between the FE nodes.
+        u += (qx1 * x * (L - x) / 2.0 + (qx2 - qx1) * x * (L**2 - x**2) / (6.0 * L)) / (self.E * self.A)
+        v += x**2 * (L - x)**2 * (5.0 * qy1 + (qy2 - qy1) * (2.0 + x / L)) / (120.0 * self.E * self.I)
         return u, v
 
     def global_displacement_at(self, global_displacements, t, uniform_local_load=None):
@@ -988,12 +1000,25 @@ class FrameElement2D:
         f = self.local_end_forces(global_displacements, uniform_local_load)
 
         # Positive internal axial force is tension, negative is compression.
-        _, qy = uniform_local_load or (0.0, 0.0)
+        qx1, qy1, qx2, qy2 = self.load_components(uniform_local_load)
         station_candidates = [0.0, 1.0]
-        if abs(qy) > 1e-12:
-            zero_shear_x = -f[1] / qy
-            if 0.0 < zero_shear_x < self.length():
-                station_candidates.append(zero_shear_x / self.length())
+        L = self.length()
+        # M extrema are roots of V(x), quadratic for a linear load.
+        gradient = (qy2 - qy1) / L
+        if abs(gradient) > 1e-12:
+            disc = qy1**2 - 2.0 * gradient * f[1]
+            roots = [] if disc < 0.0 else [(-qy1 + sign * math.sqrt(disc)) / gradient for sign in (-1, 1)]
+        else:
+            roots = [-f[1] / qy1] if abs(qy1) > 1e-12 else []
+        for x in roots:
+            if 0.0 < x < L:
+                station_candidates.append(x / L)
+        # V and N can also have interior extrema when a load changes sign.
+        for q1, q2 in [(qx1, qx2), (qy1, qy2)]:
+            if abs(q2 - q1) > 1e-12:
+                t = -q1 / (q2 - q1)
+                if 0.0 < t < 1.0:
+                    station_candidates.append(t)
         station_forces = [
             self.section_forces_at(global_displacements, station, uniform_local_load)
             for station in station_candidates
@@ -1053,13 +1078,13 @@ class Structure2D:
 
     def element_load_snapshot(self):
         return {
-            int(element_id): (float(load[0]), float(load[1]))
+            int(element_id): tuple(float(value) for value in load)
             for element_id, load in self.element_uniform_loads.items()
         }
 
     def restore_element_load_snapshot(self, snapshot):
         self.element_uniform_loads = {
-            int(element_id): (float(load[0]), float(load[1]))
+            int(element_id): tuple(float(value) for value in load)
             for element_id, load in (snapshot or {}).items()
         }
 
@@ -1073,13 +1098,24 @@ class Structure2D:
             -s * fx_n_per_mm + c * fy_n_per_mm,
         )
         existing = self.uniform_load_for_element(element)
-        self.element_uniform_loads[element.id] = (
-            existing[0] + incremental_local[0],
-            existing[1] + incremental_local[1],
+        self.element_uniform_loads[element.id] = tuple(
+            value + incremental_local[index % 2] for index, value in enumerate(existing)
         )
         local_vector = element.equivalent_nodal_load_local(incremental_local)
         global_vector = element.transformation_matrix().T @ local_vector
         for dof, value in zip(element.dof_indices(), global_vector):
+            self.add_load(dof, value)
+
+    def add_linear_global_line_load(self, element, fx_start=0.0, fy_start=0.0, fx_end=0.0, fy_end=0.0):
+        """Apply linear global N/mm loading, retaining member load recovery."""
+        theta = element.angle()
+        c, s = math.cos(theta), math.sin(theta)
+        incremental = (c*fx_start+s*fy_start, -s*fx_start+c*fy_start,
+                       c*fx_end+s*fy_end, -s*fx_end+c*fy_end)
+        existing = element.load_components(self.uniform_load_for_element(element))
+        self.element_uniform_loads[element.id] = tuple(a+b for a,b in zip(existing, incremental))
+        vector = element.transformation_matrix().T @ element.equivalent_nodal_load_local(incremental)
+        for dof, value in zip(element.dof_indices(), vector):
             self.add_load(dof, value)
 
     def add_uniform_global_line_load_between(
@@ -8251,11 +8287,12 @@ class MainWindow(QMainWindow):
         if span_m <= 0.0 or height_m <= 0.0 or half_bay_m <= 0.0 or base_pressure_kpa <= 0.0:
             return None
 
-        stations = {0.0, min(height_m, span_m), span_m}
+        top_m = max(height_m, span_m)
+        stations = {0.0, height_m, span_m}
         station_count = 160
-        stations.update(span_m * index / station_count for index in range(station_count + 1))
+        stations.update(top_m * index / station_count for index in range(station_count + 1))
         stations.update(min(height_m, span_m) * index / station_count for index in range(station_count + 1))
-        y_nodes_m = sorted(y for y in stations if -1e-9 <= y <= span_m + 1e-9)
+        y_nodes_m = sorted(y for y in stations if -1e-9 <= y <= top_m + 1e-9)
 
         def q_kn_m(y_m, factor):
             if y_m > height_m:
@@ -8282,15 +8319,31 @@ class MainWindow(QMainWindow):
                 - (loaded_height**2 / 2.0 - loaded_height**3 / (3.0 * max(height_m, 1e-9)))
             )
             moment = base_reaction_kn(factor) * y_m
+            if y_m > span_m:
+                moment += top_reaction_kn(factor) * (y_m - span_m)
             return moment - load_moment
 
+        moment_stations = set(y_nodes_m)
+        q0_uls = base_pressure_kpa * half_bay_m * stub_tributary_factor * uls_factor
+        if q0_uls > 0.0:
+            for reaction, low, high in [(base_reaction_kn(uls_factor), 0.0, min(span_m, height_m)),
+                                        (base_reaction_kn(uls_factor) + top_reaction_kn(uls_factor), span_m, height_m)]:
+                disc = 1.0 - 2.0 * reaction / (q0_uls * height_m)
+                if disc >= 0.0:
+                    for y in (height_m * (1.0 - math.sqrt(disc)), height_m * (1.0 + math.sqrt(disc))):
+                        if low <= y <= high:
+                            moment_stations.add(y)
         moment_candidates = []
-        for y_m in y_nodes_m:
+        for y_m in moment_stations:
             moment_candidates.append(abs(moment_at(y_m, uls_factor)))
         moment_knm = max(moment_candidates) if moment_candidates else 0.0
-        shear_kn = max(abs(base_reaction_kn(uls_factor)), abs(top_reaction_kn(uls_factor)))
+        shear_kn = abs(base_reaction_kn(uls_factor))
         for y_m in y_nodes_m:
-            shear_kn = max(shear_kn, abs(base_reaction_kn(uls_factor) - load_integral_to(y_m, uls_factor)))
+            shear = base_reaction_kn(uls_factor) - load_integral_to(y_m, uls_factor)
+            if y_m >= span_m:
+                shear_kn = max(shear_kn, abs(shear + top_reaction_kn(uls_factor)))
+            if y_m <= span_m:
+                shear_kn = max(shear_kn, abs(shear))
 
         inertia_mm4 = max(profile.Iyp, profile.Izp)
         y_nodes_mm = [y * 1000.0 for y in y_nodes_m]
@@ -8323,7 +8376,8 @@ class MainWindow(QMainWindow):
                 for b in range(4):
                     stiffness[dofs[a], dofs[b]] += k[a, b]
 
-        fixed_dofs = {0, 2 * (node_count - 1)}
+        rail_index = min(range(node_count), key=lambda i: abs(y_nodes_mm[i] - span_mm))
+        fixed_dofs = {0, 2 * rail_index}
         free_dofs = [index for index in range(dof_count) if index not in fixed_dofs]
         displacements = np.zeros(dof_count)
         if free_dofs:
@@ -8778,8 +8832,8 @@ class MainWindow(QMainWindow):
             lines.append("Directions assume material stored inside the building: left wall acts -X, right wall acts +X.")
             lines.append("Panel +M and -M are signed face envelopes for reinforcement sizing; map the sign convention to the selected panel face detail.")
             if is_centre_stub_storage_mode(results.inputs):
-                lines.append("Centre-stub mode assumes side-running panels simply span column-to-stub over half the bay; the stub head load is carried by the rail as a midspan point load.")
-                lines.append("The stub base reaction is assumed to transfer into the centre footing/slab; each frame column receives half the stub head load through the rail.")
+                lines.append("Side-running panels use the selected break/continuous support mode over two half-bay spans. The stub head load is carried by the rail as a midspan point load.")
+                lines.append("Each rail end receives half the stub head load per bay; an internal portal column receives both adjacent rail-end reactions plus the direct triangular panel reaction. The stub base reaction transfers to its footing/slab.")
             else:
                 lines.append("The frame load is the horizontal rail reaction; the base reaction is assumed to transfer into the footing/slab.")
         self.storage_results_box.setPlainText("\n".join(lines))
@@ -14054,6 +14108,13 @@ class MainWindow(QMainWindow):
         if storage_inputs.enabled and storage_results.rail_loads:
             left_column_top_y = top_nodes[0].y
             right_column_top_y = top_nodes[-1].y
+            for active, top_y, base_y in [
+                (storage_inputs.left_wall, left_column_top_y, left_base.y),
+                (storage_inputs.right_wall, right_column_top_y, right_base.y),
+            ]:
+                if active and max(storage_inputs.rail_height_mm, storage_inputs.stored_height_m * 1000.0) > top_y - base_y + 1e-6:
+                    self.results_box.setText("Input error: storage rail and stored-material height must not exceed the supporting column height.")
+                    return
             storage_levels_mm = {rail.level_mm for rail in storage_results.rail_loads}
             if is_centre_stub_storage_mode(storage_inputs):
                 storage_levels_mm.add(storage_inputs.stored_height_m * 1000.0)
@@ -14466,8 +14527,8 @@ class MainWindow(QMainWindow):
                 "RIGHT_COLUMN": top_nodes[-1].y - right_base.y,
             },
             storage_restraint_levels_mm={
-                "LEFT_COLUMN": [node.y for node in left_storage_nodes],
-                "RIGHT_COLUMN": [node.y for node in right_storage_nodes],
+                "LEFT_COLUMN": [node.y for node in left_storage_nodes if any(abs(node.y - left_base.y - rail.level_mm) < 1e-6 for rail in storage_results.rail_loads)],
+                "RIGHT_COLUMN": [node.y for node in right_storage_nodes if any(abs(node.y - right_base.y - rail.level_mm) < 1e-6 for rail in storage_results.rail_loads)],
             },
         )
         internal_check_tops = internal_column_roof_tops if internal_column_connection == "Moment" else internal_column_tops
@@ -15593,8 +15654,8 @@ class MainWindow(QMainWindow):
                 storage_arrows = apply_storage_loads_to_columns(
                     arrow_collector(),
                     storage_case_results,
-                    [left_base] + left_storage_nodes,
-                    [right_base] + right_storage_nodes,
+                    [left_base] + left_storage_nodes + [top_nodes[0]],
+                    [right_base] + right_storage_nodes + [top_nodes[-1]],
                     factor=1.0,
                     left_base_y_mm=left_base.y,
                     right_base_y_mm=right_base.y,
@@ -15722,8 +15783,8 @@ class MainWindow(QMainWindow):
                 apply_storage_loads_to_columns(
                     load_structure,
                     applied_storage_results,
-                    [left_base] + left_storage_nodes,
-                    [right_base] + right_storage_nodes,
+                    [left_base] + left_storage_nodes + [top_nodes[0]],
+                    [right_base] + right_storage_nodes + [top_nodes[-1]],
                     factor=storage_factor,
                     left_base_y_mm=left_base.y,
                     right_base_y_mm=right_base.y,

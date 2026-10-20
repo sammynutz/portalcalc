@@ -4,6 +4,15 @@ All notable Portal Calc desktop releases should be recorded here.
 
 ## Unreleased
 
+### Grain/storage load-path corrections - 2026-10-20
+
+- Audited the grain/storage load path using independent statics, beam solutions and actual offscreen desktop solves. Confirmed full-bay rail moments and two-adjacent-bay internal portal reactions; no missing 1 m tributary multiplier. Retained the user-confirmed lateral base support and strong-axis rail orientation assumptions.
+- Apply direct side-running panel reactions as triangular column member loads with consistent nodal forces/couples and exact member force/curvature recovery, including envelope load snapshots. Previously the equivalent endpoint forces preserved force/overturning but omitted local bending.
+- Include free stub overhang above the rail in deflection and member-shear recovery; use exact stationary points for stub bending. Use the selected continuous two-span panel deflection solution and report its governing negative moment at the bottom pressure strip.
+- Reject missing/gapped column load paths before applying loads. Include column-top nodes as valid rail supports and reject rail/grain heights above the supporting column. Do not treat the grain-top mesh node as a storage restraint.
+- Honour the storage ULS factor consistently instead of substituting the roof/crane Q factor; omit grain from isolated G-only and Ws-only serviceability components. Existing no-storage and left/right/both storage envelopes remain.
+- Added storage_load_path_regression.py: 12 focused tests covering bay scaling, split/continuous paths, force and moment conservation, reversed loads/base offsets, member-load snapshots/superposition, FE segmentation, panels, stubs, support gaps and storage factors. Existing storage and roof UDL smoke slices pass; actual desktop solves pass all three panel paths, distinct grain/rail levels, rail at column top and rejection above top. Source change only; packaged releases and Studio release pins are unchanged. Physical bracing/connection design and bulk-solid pressure-code acceptance are not represented as completed.
+
 ## 1.6.2 - 2026-10-12 (Studio development candidate)
 
 - Configurator Review now invokes Physics Optimise automatically instead of the legacy optimiser, retaining frozen project inputs, bounded truss depth, per-member web selections and the final exact checkSpecified return.

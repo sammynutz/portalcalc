@@ -636,24 +636,22 @@ def run_license_smoke_checks() -> None:
     assert math.isclose(stub_storage.rail_loads[0].rail_bending_moment_knm, 32.0, rel_tol=1e-9)
     assert math.isclose(stub_storage.rail_loads[0].direct_column_reaction_kn, 48.0, rel_tol=1e-9)
 
-    class StorageTestNode:
-        def __init__(self, x, y, ux):
-            self.x = x
-            self.y = y
-            self.ux = ux
-
-    class StorageTestStructure:
-        def __init__(self):
-            self.loads = {}
-
-        def add_load(self, dof, value):
-            self.loads[dof] = self.loads.get(dof, 0.0) + value
-
-    test_structure = StorageTestStructure()
-    test_nodes = [StorageTestNode(0.0, 0.0, 0), StorageTestNode(0.0, 3000.0, 1)]
-    apply_storage_loads_to_columns(test_structure, stub_storage, test_nodes, [], factor=1.0)
-    assert math.isclose(test_structure.loads[0], -32000.0, rel_tol=1e-9)
-    assert math.isclose(test_structure.loads[1], -32000.0, rel_tol=1e-9)
+    import main
+    from dataclasses import replace
+    test_profile = main.SectionProfile("TEST", "UB", "I", 5000.0, 1e6, 2e8, 1e8, 0.0)
+    test_structure = main.Structure2D()
+    test_nodes = [main.Node(1, 0.0, 0.0), main.Node(2, 0.0, 3000.0)]
+    for node in test_nodes:
+        test_structure.add_node(node)
+    element = main.FrameElement2D(1, *test_nodes, 200000.0, test_profile, "LEFT_COLUMN")
+    test_structure.add_element(element)
+    for dof in [test_nodes[0].ux, test_nodes[0].uy, test_nodes[1].ux]:
+        test_structure.add_support(dof)
+    one_wall = replace(stub_storage, inputs=replace(stub_storage.inputs, right_wall=False))
+    apply_storage_loads_to_columns(test_structure, one_wall, test_nodes, [], factor=1.0)
+    displacements, _, _ = test_structure.solve()
+    assert math.isclose(sum(test_structure.loads.get(node.ux, 0.0) for node in test_nodes), -64000.0, rel_tol=1e-9)
+    assert math.isclose(test_structure.element_force_summary(element, displacements)["moment_knm"], 32.0 / math.sqrt(3.0), rel_tol=1e-9)
     continuous_stub_storage = calculate_storage_loads(
         StorageLoadInputs(
             enabled=True,
@@ -669,7 +667,7 @@ def run_license_smoke_checks() -> None:
     )
     assert math.isclose(continuous_stub_storage.rail_loads[0].panel_positive_moment_knm_per_m, 9.0, rel_tol=1e-9)
     assert math.isclose(continuous_stub_storage.rail_loads[0].panel_negative_moment_knm_per_m, 16.0, rel_tol=1e-9)
-    assert math.isclose(continuous_stub_storage.rail_loads[0].panel_negative_moment_level_mm, 3000.0, rel_tol=1e-9)
+    assert math.isclose(continuous_stub_storage.rail_loads[0].panel_negative_moment_level_mm, 0.0, abs_tol=1e-9)
     assert math.isclose(continuous_stub_storage.total_per_wall_kn, 60.0, rel_tol=1e-9)
     assert math.isclose(continuous_stub_storage.rail_loads[0].rail_reaction_kn, 20.0, rel_tol=1e-9)
     assert math.isclose(continuous_stub_storage.rail_loads[0].direct_column_reaction_kn, 36.0, rel_tol=1e-9)
