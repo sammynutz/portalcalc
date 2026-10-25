@@ -41,9 +41,11 @@ packaging output.
 | `crane_beam.py` | Crane runway beam input/result dataclasses and section checks. |
 | `storage_loads.py` | Stored-material pressure/load calculations, storage panel design, storage load application and summary text. |
 | `elevation_drawings.py` | PDF elevation/plan/section drawing export using Qt painting. |
+| `computation_report_data.py` | Frozen full-report evidence: actual case results, adopted wind bases, section/web selections and worked capacity values. |
+| `computation_report.py` | Paginated PDF calculation report, bookmarks/contents, tables and vector model/load/bending diagrams. See `COMPUTATION_REPORT.md`. |
+| `computation_report_regression.py` | Real-solver and PDF integrity checks for the full computation-report export. |
 | `finishes.py` | Cladding profile and COLORBOND finish lookup data. |
 | `licensing.py` | Desktop license token storage, machine ID, local verification, activation and refresh client. |
-| `structural_assistant.py` | Read-only OpenAI Responses API clients for full reviews, compact Guided Help and the Guided Optimise supervisor loop, stable snapshot hashing, strict tool schemas, usage/cost accounting and secure Windows API-key storage. |
 | `license_server.py` | FastAPI license server, SQLite persistence, key generation, admin routes and CLI helpers. |
 | `license_generator_app.py` | Admin-only PySide license generator/client. |
 | `smoke_checks.py` | Compile checks plus non-visual and UI smoke tests. |
@@ -110,25 +112,14 @@ For a calculation-only change:
 3. Update `main.py` only at the UI conversion and orchestration boundary.
 4. Add direct smoke checks that import the module without launching the full UI.
 
-For Structural Assistant or Guided Help changes:
+For internal column layouts:
 
-1. `structural_assistant.py` owns OpenAI request payloads, prompts, strict tool schemas, response parsing, hashing and usage accounting.
-2. `MainWindow.assistant_help_snapshot` assembles the compact solved-design evidence; `assistant_help_member_economics` adds the cost/utilisation signals used to prioritise downsizing. Keep the full `assistant_design_dossier` for detailed reviews.
-3. `MainWindow.assistant_execute_help_trial` applies Luna-selected changes only to an isolated base state, solves them through PortalCalc and restores the live design.
-4. Keep Guided Help trials bounded and non-persistent; new trial controls require explicit validation, result compression and restoration smoke coverage.
-5. `smoke_checks.py` mocks the network payload and performs a real offscreen trial/restoration check without making a live API call.
+1. Geometry offers the legacy single/paired centre offsets and Custom positions.
+2. `internal_column_positions_mm` validates comma-separated metres from the left main column centreline; no clamping is applied to custom positions.
+3. Presets store the entry text in `geometry.internal_column_positions_m`. Older presets retain their original offset behaviour.
+4. `internal_columns_regression.py` checks layouts, connections, validation and preset compatibility using actual offscreen solves.
 
-For Guided Optimise changes:
-
-1. `structural_assistant.py` owns the bounded `run_optimisation_strategy` schema and supervisor prompt; Luna proposes macro search direction but never verifies or selects a design directly.
-2. `MainWindow.assistant_run_full_optimiser` invokes the production optimiser with completion dialogs and learning writes suppressed for each branch.
-3. `MainWindow.assistant_execute_optimisation_strategy` restores the deterministic baseline, runs one full strategy branch, compresses its verified evidence and restores the baseline before the next model turn.
-4. `MainWindow.structural_optimise_turn_succeeded` adopts the cheapest fully verified incumbent and only then persists optimiser learning.
-5. `MainWindow.assistant_unverified_concept_options` exposes suggestion-only end-wall portal restraint only when calculated serviceability evidence makes it relevant and at least one end wall is clad; these concepts are not counted as verified optimiser savings.
-6. `MainWindow.set_guided_optimise_status` mirrors progress to both the Structural Assistant and Sections tabs; completion and failure also publish a concise dialog while the full audit remains in the assistant output.
-   `start_structural_optimise_turn` must keep the worker success signal blocking-queued: production optimisation processes Qt events, so an ordinary queued success signal can allow `QThread.finished` to tear down the session before `pending_continuation` is recorded.
-   `show_sections_ai_help_dialog` owns the Sections AI Help popup and reuses the standard review/explain/ask request path; mirror completed responses back into that dialog as well as the Structural Assistant tab.
-7. `costing.end_wall_portal_restraint_item` keeps stiffness-path squares separate from material costing, allowing one physical X at every portal position with two diagonal runs per X. `costing_from_structure` prices rod/EA steel at the UB rate and includes the configured rod-size turnbuckle rate per run.
+Calculation evidence is assembled locally by `MainWindow.calculation_design_dossier` for the headless service and Configurator Review. AI requests, API-key settings and the Structural Assistant UI have been removed.
 
 For Metroll section display changes, keep the stored table key such as `C/Z 200 19` unchanged. Route user-facing labels and reports through `MainWindow.metroll_section_display` so single/double spans render as C and continuous-lapped spans render as Z without breaking capacity or weight lookup.
 
@@ -175,7 +166,7 @@ Useful local commands from the repo root:
 
 ```powershell
 $env:QT_QPA_PLATFORM='offscreen'; python smoke_checks.py
-python -m py_compile main.py member_checks.py loads.py wind.py smoke_checks.py licensing.py structural_assistant.py license_server.py license_generator_app.py crane_beam.py storage_loads.py elevation_drawings.py finishes.py
+python -m py_compile main.py member_checks.py loads.py wind.py smoke_checks.py licensing.py license_server.py license_generator_app.py crane_beam.py storage_loads.py elevation_drawings.py finishes.py
 ```
 
 For release packaging:

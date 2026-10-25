@@ -91,6 +91,20 @@ Invoke-Native { & $Python -m PyInstaller --noconfirm --clean PortalCalcAdmin.spe
 Test-PackagedExecutable -Path (Join-Path $PWD "dist\PortalCalc\PortalCalc.exe") -Label "PortalCalc"
 Test-PackagedExecutable -Path (Join-Path $PWD "dist\PortalCalcAdmin\PortalCalcAdmin.exe") -Label "PortalCalcAdmin"
 
+$reportSmokeRoot = Join-Path $PWD "build\packaged-report-smoke"
+New-Item -ItemType Directory -Force -Path $reportSmokeRoot | Out-Null
+$reportSmokePath = Join-Path $reportSmokeRoot "computations.pdf"
+$reportProcess = Start-Process `
+    -FilePath (Join-Path $PWD "dist\PortalCalc\PortalCalc.exe") `
+    -ArgumentList @("--packaged-computation-smoke-test", "`"$reportSmokePath`"") `
+    -WorkingDirectory (Join-Path $PWD "dist\PortalCalc") `
+    -WindowStyle Hidden `
+    -Wait `
+    -PassThru
+if ($reportProcess.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $reportSmokePath)) {
+    throw "PortalCalc packaged computation-report export failed; inspect $reportSmokeRoot"
+}
+
 New-Item -ItemType Directory -Force -Path "dist\PortalCalc\presets" | Out-Null
 Copy-Item -LiteralPath "presets\factory_defaults.json" -Destination "dist\PortalCalc\presets\factory_defaults.json" -Force
 

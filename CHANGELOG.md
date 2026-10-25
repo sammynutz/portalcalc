@@ -2,7 +2,19 @@
 
 All notable Portal Calc desktop releases should be recorded here.
 
-## Unreleased
+## 1.6.4 - 2026-10-25
+
+- Added File > Export Full Computations (PDF), with project/job/revision details, a linked contents page, bookmarks, numbered sections and page headers/footers.
+- Records the full engineering input register, adopted directional and connected-roof wind bases, gravity/other load derivations and combinations, analytical geometry, member/action envelopes and governing source cases.
+- Includes worked section capacities, every selected web/post and governing weld/chord-wall/K-joint connection screens, with the implemented assumptions and validity messages.
+- Includes governing-case load and bending diagrams, applied load workings, reactions and extrema. An optional large appendix adds all nodal movements, member actions, signed end forces and distributed member loads for the governing cases.
+- Report export runs a fresh check of the selected design and preserves web selections. Detailed case capture is active only for report generation. The short Engineering Summary remains available.
+
+## 1.6.3 - 2026-10-25
+
+- Removed AI Help, AI Optimise, the Structural Assistant tab and the OpenAI request/key-management implementation. Ordinary local optimisation and calculation evidence for Configurator Review remain available.
+- Added Custom positions for any number of internal columns, entered as comma-separated distances in metres from the left main column centreline. Supports truss/rafter roofs and pinned/moment top connections, with preset persistence and rejection of missing, duplicate, non-finite or out-of-span positions.
+- Preserved existing single-column and symmetric two-column centre-offset presets. Custom support positions also invalidate retained future-canopy designs when changed.
 
 ### Grain/storage load-path corrections - 2026-10-20
 

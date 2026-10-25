@@ -62,7 +62,7 @@ def verify_in_actual_regions(inputs, directory):
         @staticmethod
         def create_window(window_class):
             window = FutureCanopyBackend.create_window(window_class)
-            original = window.assistant_design_dossier
+            original = window.calculation_design_dossier
             def capture_schedule():
                 dossier = original()
                 main_groups = {"TOP", "BOTTOM", "WEB", "POST", "APEX"}
@@ -87,7 +87,7 @@ def verify_in_actual_regions(inputs, directory):
                                              if z["group"] in {"TOP", "BOTTOM"}),
                 }
                 return dossier
-            window.assistant_design_dossier = capture_schedule
+            window.calculation_design_dossier = capture_schedule
             return window
     service = PortalCalcCalculationService(ScheduleProofBackend())
     reference = service.run({"request_id": "fixed-63-physical-reference", "mode": "checkSpecified", "inputs": inputs})

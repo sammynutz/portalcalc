@@ -28,7 +28,7 @@ def timed_step(label: str):
 
 
 def compile_sources(root: Path) -> None:
-    for name in ["app_metadata.py", "main.py", "portalcalc_service.py", "portalcalc_headless.py", "configurator_review.py", "calculation_service_regression.py", "configurator_review_regression.py", "physics_optimiser_regression.py", "concept_3d.py", "costing.py", "elevation_drawings.py", "finishes.py", "member_checks.py", "loads.py", "wind.py", "end_wall.py", "bracing.py", "licensing.py", "structural_assistant.py", "reduced_optimizer.py", "license_server.py", "license_generator_app.py", "crane_beam.py", "storage_loads.py"]:
+    for name in ["app_metadata.py", "main.py", "computation_report.py", "computation_report_data.py", "computation_report_regression.py", "portalcalc_service.py", "portalcalc_headless.py", "configurator_review.py", "calculation_service_regression.py", "configurator_review_regression.py", "physics_optimiser_regression.py", "concept_3d.py", "costing.py", "elevation_drawings.py", "finishes.py", "member_checks.py", "loads.py", "wind.py", "end_wall.py", "bracing.py", "licensing.py", "reduced_optimizer.py", "license_server.py", "license_generator_app.py", "crane_beam.py", "storage_loads.py"]:
         py_compile.compile(str(root / name), doraise=True)
 
 
@@ -224,212 +224,6 @@ def run_calculation_service_smoke_checks() -> None:
     assert result["verified"] is True
     assert result["sizing"]["top_chord"] == result["sizing"]["bottom_chord"]
     assert result["provenance"]["request_digest_sha256"] == result["dossier"]["request_digest"]
-
-
-def run_structural_assistant_smoke_checks() -> None:
-    from unittest import mock
-
-    import structural_assistant as assistant
-
-    dossier_a = {"value": 1.25, "checks": [{"ratio": float("inf"), "name": "test"}]}
-    dossier_b = {"checks": [{"name": "test", "ratio": float("inf")}], "value": 1.25}
-    assert assistant.dossier_json(dossier_a) == assistant.dossier_json(dossier_b)
-    assert len(assistant.dossier_hash(dossier_a)) == 64
-    assert "infinity" in assistant.dossier_json(dossier_a)
-
-    usage = {
-        "input_tokens": 10_000,
-        "input_tokens_details": {"cached_tokens": 2_000},
-        "output_tokens": 1_500,
-        "output_tokens_details": {"reasoning_tokens": 400},
-        "total_tokens": 11_500,
-    }
-    expected_cost = (8_000 * 0.20 + 2_000 * 0.02 + 1_500 * 1.20) / 1_000_000.0
-    assert math.isclose(
-        assistant.estimate_usage_cost_usd("gpt-5.6-luna", usage),
-        expected_cost,
-        rel_tol=1e-12,
-    )
-    parsed = assistant.parse_usage("gpt-5.6-luna", {"usage": usage})
-    assert parsed.reasoning_tokens == 400
-    assert math.isclose(parsed.estimated_cost_usd, expected_cost, rel_tol=1e-12)
-    assert assistant.extract_response_text({
-        "output": [{"type": "message", "content": [{"type": "output_text", "text": "Grounded review"}]}]
-    }) == "Grounded review"
-    combined = assistant.combine_usage(parsed, parsed)
-    assert combined.total_tokens == parsed.total_tokens * 2
-    assert math.isclose(combined.estimated_cost_usd, parsed.estimated_cost_usd * 2, rel_tol=1e-12)
-
-    fake_payload = {
-        "id": "resp_smoke",
-        "model": "gpt-5.6-luna",
-        "output": [{"type": "message", "content": [{"type": "output_text", "text": "Mock review"}]}],
-        "usage": usage,
-    }
-
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, traceback):
-            return False
-
-        def read(self):
-            return json.dumps(fake_payload).encode("utf-8")
-
-    with mock.patch.object(assistant.urllib.request, "urlopen", return_value=FakeResponse()) as urlopen:
-        response = assistant.request_structural_review(
-            api_key="test-key-that-must-not-enter-the-body",
-            dossier=dossier_a,
-            question="Review this test dossier",
-            reasoning_effort="high",
-        )
-    request = urlopen.call_args.args[0]
-    request_payload = json.loads(request.data.decode("utf-8"))
-    assert request_payload["model"] == "gpt-5.6-luna"
-    assert request_payload["reasoning"] == {"effort": "high", "context": "current_turn"}
-    assert request_payload["text"] == {"verbosity": "low"}
-    assert request_payload["store"] is False
-    assert request_payload["max_output_tokens"] == 8000
-    assert "test-key-that-must-not-enter-the-body" not in request.data.decode("utf-8")
-    assert response.text == "Mock review"
-    assert response.reasoning_effort == "high"
-
-    fake_help_payload = {
-        "id": "resp_help_smoke",
-        "model": "gpt-5.6-luna",
-        "output": [
-            {
-                "type": "reasoning",
-                "id": "reasoning_smoke",
-                "encrypted_content": "opaque-smoke-content",
-                "summary": [],
-            },
-            {
-                "type": "function_call",
-                "name": "run_design_trial",
-                "call_id": "call_trial_smoke",
-                "arguments": json.dumps({
-                    "hypothesis": "Test roof-frame stiffness",
-                    "truss_depth_delta_mm": 100,
-                    "left_addition_depth_delta_mm": 0,
-                    "right_addition_depth_delta_mm": 0,
-                    "left_column_steps": 0,
-                    "right_column_steps": 0,
-                    "top_member_steps": 0,
-                    "bottom_chord_steps": 0,
-                    "web_steps": 0,
-                    "panel_layout_steps": 0,
-                }),
-            },
-        ],
-        "usage": usage,
-    }
-
-    class FakeHelpResponse(FakeResponse):
-        def read(self):
-            return json.dumps(fake_help_payload).encode("utf-8")
-
-    help_input = [{"role": "user", "content": "Compact structural snapshot"}]
-    with mock.patch.object(assistant.urllib.request, "urlopen", return_value=FakeHelpResponse()) as urlopen:
-        help_turn = assistant.request_structural_help_turn(
-            api_key="test-help-key-that-must-not-enter-the-body",
-            input_items=help_input,
-            snapshot_hash="a" * 64,
-            reasoning_effort="medium",
-        )
-    help_request = urlopen.call_args.args[0]
-    help_payload = json.loads(help_request.data.decode("utf-8"))
-    assert help_payload["reasoning"] == {"effort": "medium", "context": "all_turns"}
-    assert help_payload["store"] is False
-    assert help_payload["parallel_tool_calls"] is False
-    assert help_payload["include"] == ["reasoning.encrypted_content"]
-    assert help_payload["text"] == {"verbosity": "low"}
-    assert help_payload["tools"][0]["strict"] is True
-    assert help_payload["tools"][0]["parameters"]["additionalProperties"] is False
-    assert set(help_payload["tools"][0]["parameters"]["required"]) == set(
-        help_payload["tools"][0]["parameters"]["properties"]
-    )
-    right_column_schema = help_payload["tools"][0]["parameters"]["properties"]["right_column_steps"]
-    assert right_column_schema["minimum"] == -8
-    assert right_column_schema["maximum"] == 8
-    assert "right_addition_depth_delta_mm" in help_payload["tools"][0]["parameters"]["properties"]
-    assert "lowest verified estimated total cost" in assistant.HELP_SYSTEM_INSTRUCTIONS
-    assert "Never strengthen a member merely" in assistant.HELP_SYSTEM_INSTRUCTIONS
-    assert "test-help-key-that-must-not-enter-the-body" not in help_request.data.decode("utf-8")
-    assert len(help_turn.tool_calls) == 1
-    assert help_turn.tool_calls[0].name == "run_design_trial"
-    assert help_turn.tool_calls[0].arguments["truss_depth_delta_mm"] == 100
-    assert any(item.get("type") == "reasoning" for item in help_turn.output_items)
-
-    fake_optimise_payload = {
-        "id": "resp_guided_optimise_smoke",
-        "model": "gpt-5.6-luna",
-        "output": [{
-            "type": "function_call",
-            "name": "run_optimisation_strategy",
-            "call_id": "call_optimise_smoke",
-            "arguments": json.dumps({
-                "hypothesis": "Trade greater truss depth for lighter end columns",
-                "search_focus": "column_stiffness_trade",
-                "truss_depth_delta_mm": 200,
-                "left_addition_depth_delta_mm": 0,
-                "right_addition_depth_delta_mm": 200,
-                "left_column_steps": -6,
-                "right_column_steps": 1,
-                "left_lean_column_steps": 0,
-                "right_lean_column_steps": 0,
-                "top_member_steps": -2,
-                "bottom_chord_steps": -2,
-                "web_steps": 0,
-                "panel_layout_steps": 0,
-            }),
-        }],
-        "usage": usage,
-    }
-
-    class FakeOptimiseResponse(FakeResponse):
-        def read(self):
-            return json.dumps(fake_optimise_payload).encode("utf-8")
-
-    with mock.patch.object(assistant.urllib.request, "urlopen", return_value=FakeOptimiseResponse()) as urlopen:
-        optimise_turn = assistant.request_guided_optimise_turn(
-            api_key="test-optimise-key-that-must-not-enter-the-body",
-            input_items=[{"role": "user", "content": "Verified deterministic baseline"}],
-            snapshot_hash="b" * 64,
-            reasoning_effort="medium",
-        )
-    optimise_request = urlopen.call_args.args[0]
-    optimise_payload = json.loads(optimise_request.data.decode("utf-8"))
-    optimise_probe_tool = optimise_payload["tools"][0]
-    optimise_tool = optimise_payload["tools"][1]
-    optimise_decision_tool = optimise_payload["tools"][2]
-    assert optimise_payload["store"] is False
-    assert optimise_payload["parallel_tool_calls"] is False
-    assert optimise_payload["reasoning"] == {"effort": "medium", "context": "all_turns"}
-    assert optimise_probe_tool["name"] == "run_design_probe"
-    assert optimise_probe_tool["strict"] is True
-    assert set(optimise_probe_tool["parameters"]["required"]) == set(
-        optimise_probe_tool["parameters"]["properties"]
-    )
-    assert optimise_tool["name"] == "run_optimisation_strategy"
-    assert optimise_tool["strict"] is True
-    assert set(optimise_tool["parameters"]["required"]) == set(
-        optimise_tool["parameters"]["properties"]
-    )
-    assert "cheapest verified" in assistant.GUIDED_OPTIMISE_SYSTEM_INSTRUCTIONS.lower()
-    assert "incumbent returned" in assistant.GUIDED_OPTIMISE_SYSTEM_INSTRUCTIONS.lower()
-    assert "left_addition_depth_delta_mm" in optimise_tool["parameters"]["properties"]
-    assert "right_column_steps" in optimise_tool["parameters"]["properties"]
-    assert optimise_decision_tool["name"] == "request_design_decision"
-    assert optimise_decision_tool["strict"] is True
-    assert set(optimise_decision_tool["parameters"]["required"]) == set(
-        optimise_decision_tool["parameters"]["properties"]
-    )
-    assert "request_design_decision" in assistant.GUIDED_OPTIMISE_SYSTEM_INSTRUCTIONS
-    assert "deterministic optimisations" in assistant.GUIDED_OPTIMISE_SYSTEM_INSTRUCTIONS
-    assert "test-optimise-key-that-must-not-enter-the-body" not in optimise_request.data.decode("utf-8")
-    assert optimise_turn.tool_calls[0].arguments["search_focus"] == "column_stiffness_trade"
 
 
 def run_license_smoke_checks() -> None:
@@ -896,14 +690,13 @@ def run_license_smoke_checks() -> None:
 def run_ui_smoke_checks(quick: bool = False) -> None:
     import os
 
-    from PySide6.QtCore import QEventLoop, QThread, QTimer, Signal
+    from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication, QMessageBox, QScrollArea
 
     os.environ["PORTALCALC_LICENSE_ENFORCED"] = "0"
     os.environ["APPDATA"] = tempfile.mkdtemp(prefix="portalcalc_smoke_appdata_")
 
     import main
-    import structural_assistant
     from loads import apply_roof_vertical_loads
 
     shorter_eave = {"value": 46.8, "height_mm": 6000.0}
@@ -932,32 +725,6 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     assert max(compensated_angles) - min(compensated_angles) < 1e-6
 
     app = QApplication.instance() or QApplication([])
-
-    event_order = []
-
-    class GuidedEventOrderProbe(QThread):
-        result_ready = Signal(object)
-
-        def run(self):
-            self.result_ready.emit(object())
-
-    event_order_probe = GuidedEventOrderProbe()
-    event_order_loop = QEventLoop()
-
-    def handle_event_order_result(_result):
-        event_order.append("result-start")
-        QApplication.processEvents()
-        event_order.append("result-end")
-
-    main.connect_guided_worker_success(event_order_probe.result_ready, handle_event_order_result)
-    event_order_probe.finished.connect(
-        lambda: (event_order.append("worker-finished"), event_order_loop.quit())
-    )
-    QTimer.singleShot(5000, event_order_loop.quit)
-    event_order_probe.start()
-    event_order_loop.exec()
-    event_order_probe.wait()
-    assert event_order == ["result-start", "result-end", "worker-finished"]
 
     window = main.MainWindow()
     catalogue_chs = window.catalog.chs_profiles()
@@ -994,42 +761,17 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     window.canvas.plot_load_arrows([(0.0, 0.0, 1000.0, 0.0)], show_labels=True)
     assert window.optimise_structure_button.text() == "Optimise"
     assert "low-cost verified design" in window.optimise_structure_button.toolTip()
-    assert window.sections_guided_optimise_button.text() == "AI Optimise"
-    assert window.sections_ai_help_button.text() == "AI Help"
-    window.show_sections_ai_help_dialog()
-    assert window.sections_ai_help_dialog.windowTitle() == "AI Help"
-    assert window.sections_ai_review_button.text() == "Review Current Design"
-    assert window.sections_ai_explain_button.text() == "Explain Governing Check"
-    assert window.sections_ai_ask_button.text() == "Ask Structural Assistant"
-    assert window.sections_ai_new_chat_button.text() == "New chat"
-    captured_help_questions = []
-    original_guided_help = window.guided_help_with_assistant
-    window.guided_help_with_assistant = lambda question=None, continue_chat=True: (
-        captured_help_questions.append((question, continue_chat)) or True
-    )
-    window.sections_ai_help_question_box.setPlainText("Would another 50 mm of lean-to depth save cost?")
-    try:
-        assert window.start_sections_ai_help_request("ask") is True
-    finally:
-        window.guided_help_with_assistant = original_guided_help
-    assert captured_help_questions == [("Would another 50 mm of lean-to depth save cost?", True)]
-    assert window.sections_ai_help_question_box.toPlainText() == ""
-    window.append_sections_ai_help_chat("You", "Test follow-up")
-    window.append_sections_ai_help_chat("Assistant", "Verified answer")
-    assert "You:\nTest follow-up" in window.sections_ai_help_output_box.toPlainText()
-    assert "Assistant:\nVerified answer" in window.sections_ai_help_output_box.toPlainText()
-    window.assistant_help_chat_session = {"conversation": []}
-    window.clear_sections_ai_help_chat()
-    assert window.assistant_help_chat_session is None
-    assert window.sections_ai_help_output_box.toPlainText() == ""
-    window.sections_ai_help_dialog.close()
+    assert not hasattr(window, "sections_guided_optimise_button")
+    assert not hasattr(window, "sections_ai_help_button")
+    assert not hasattr(window, "start_structural_assistant_request")
+    assert all(tab.tabText(i) != "Structural Assistant" for tab in window.findChildren(main.QTabWidget) for i in range(tab.count()))
     assert window.whats_new_action.text().replace("&", "") == "What's New"
     help_dialog = window.show_help_dialog("whats_new")
     assert window.help_tabs.count() == 3
     assert window.help_tabs.tabText(0) == "What's New"
     assert window.help_tabs.tabText(1) == "EULA"
     assert "SLS Structural Software" in window.help_tabs.widget(1).toPlainText()
-    assert "Portal Calc 1.5 - 14 August 2026" in window.whats_new_text.toPlainText()
+    assert "Portal Calc 1.6.4 - 25 October 2026" in window.whats_new_text.toPlainText()
     assert "Longitudinal bracing" in window.whats_new_text.toPlainText()
     assert "406.4 mm diameter" in window.whats_new_text.toPlainText()
     help_dialog.close()
@@ -1090,308 +832,13 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     if quick:
         window._suppress_auto_web_split_on_solve = True
     window.generate_and_solve()
-    assistant_dossier = window.assistant_design_dossier()
-    assert assistant_dossier["schema"] == "portalcalc.structural_assistant.design_dossier.v1"
-    assert assistant_dossier["member_checks"]
-    assert "overall_governing" in assistant_dossier
-    assert window.assistant_model_combo.currentText() == "gpt-5.6-luna"
-    assert window.assistant_reasoning_combo.currentText() in {"none", "low", "medium", "high", "xhigh", "max"}
-    help_snapshot = window.assistant_help_snapshot()
-    assert help_snapshot["schema"] == "portalcalc.structural_assistant.guided_help.v1"
-    assert help_snapshot["objective"] == "minimise verified estimated total cost while every reported check passes"
-    assert 1 <= len(help_snapshot["highest_checks"]) <= 8
-    assert help_snapshot["overall_governing"] == help_snapshot["highest_checks"][0]
-    assert len(json.dumps(help_snapshot, default=str)) < 25_000
-    assert help_snapshot["member_economics"]
-    assert all("approximate_selected_section_cost" in item for item in help_snapshot["member_economics"])
-    economics_costs = [item["approximate_selected_section_cost"] for item in help_snapshot["member_economics"]]
-    assert economics_costs == sorted(economics_costs, reverse=True)
-    bracing_concepts = window.assistant_unverified_concept_options(
-        {"end_wall_bracing": "None"},
-        [{
-            "type": "serviceability",
-            "check": "Column top deflection SLS",
-            "ratio": 0.977,
-            "limit_basis": "H/150",
-        }],
-        {"front": True, "back": True},
-    )
-    assert bracing_concepts[0]["id"] == "end_wall_portal_restraint"
-    assert bracing_concepts[0]["available_trial_settings"] == ["One end", "Both ends"]
-    assert "16, 20, 24, and 30 DIA rods" in bracing_concepts[0]["costing_caveat"]
-    assert "12 DIA" not in bracing_concepts[0]["costing_caveat"]
-    assert "excluded" in bracing_concepts[0]["costing_caveat"]
-    assert window.assistant_unverified_concept_options(
-        {"end_wall_bracing": "One end"},
-        [{"type": "serviceability", "check": "Column top deflection SLS", "ratio": 0.99}],
-        {"front": True, "back": True},
-    ) == []
-    assert window.assistant_unverified_concept_options(
-        {"end_wall_bracing": "None"},
-        [{"type": "serviceability", "check": "Column top deflection SLS", "ratio": 0.50}],
-        {"front": True, "back": True},
-    ) == []
-    one_clad_concept = window.assistant_unverified_concept_options(
-        {"end_wall_bracing": "None"},
-        [{"type": "serviceability", "check": "Column top deflection SLS", "ratio": 0.99}],
-        {"front": True, "back": False},
-    )
-    assert one_clad_concept[0]["available_trial_settings"] == ["One end"]
-    assert window.assistant_unverified_concept_options(
-        {"end_wall_bracing": "None"},
-        [{"type": "serviceability", "check": "Column top deflection SLS", "ratio": 0.99}],
-        {"front": False, "back": False},
-    ) == []
-    assert window.sections_guided_optimise_button.text() == "AI Optimise"
-    assert "cheapest fully verified" in window.sections_guided_optimise_button.toolTip()
-    assert "results will appear here" in window.sections_guided_optimise_status_label.text().lower()
-    assert window.assistant_optimise_button.text() == "Guided Optimise"
-    assert "cheapest fully verified" in window.assistant_optimise_button.toolTip()
-    assert window.assistant_help_button.text() == "Help? Run Guided Trials"
-    assert [
-        window.assistant_model_combo.itemText(index)
-        for index in range(window.assistant_model_combo.count())
-    ] == ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
-    assert {"left_lean_column_steps", "right_lean_column_steps"}.issubset(
-        set(structural_assistant.HELP_TRIAL_TOOL["parameters"]["required"])
-    )
+    dossier = window.calculation_design_dossier()
+    assert dossier["schema"] == "portalcalc.calculation.dossier.v1"
+    assert dossier["member_checks"]
+    assert "overall_governing" in dossier
     assert window.metroll_section_display("C/Z 200 19", "Single span") == "C 200 19"
     assert window.metroll_section_display("C/Z 200 19", "Double span") == "C 200 19"
     assert window.metroll_section_display("C/Z 200 19", "Continuous lapped") == "Z 200 19"
-    column_focus = window.guided_optimisation_search_settings({"search_focus": "column_stiffness_trade"})
-    guided_balanced_focus = window.guided_optimisation_search_settings({"search_focus": "balanced"})
-    baseline_focus = window.guided_optimisation_search_settings(None)
-    assert column_focus["column_depth_steps"] > guided_balanced_focus["column_depth_steps"]
-    assert column_focus["column_candidates"] > guided_balanced_focus["column_candidates"]
-    assert column_focus["chord_candidates"] < baseline_focus["chord_candidates"]
-    assert column_focus["max_passes"] < baseline_focus["max_passes"]
-    guided_snapshot = window.assistant_guided_optimisation_snapshot({
-        "verified": True,
-        "cost": help_snapshot["estimated_total_cost"],
-        "ratio": help_snapshot["overall_governing"]["ratio"],
-        "governing_group": help_snapshot["overall_governing"]["group"],
-        "governing_check": help_snapshot["overall_governing"]["check"],
-        "exact_solves": 12,
-        "search_focus": "baseline",
-    })
-    assert guided_snapshot["schema"] == "portalcalc.structural_assistant.ai_optimise.v3"
-    assert guided_snapshot["strategy_budget"] == 2
-    assert guided_snapshot["probe_budget"] == 4
-    assert guided_snapshot["baseline_optimiser_result"]["verified"] is True
-    assert "structural_efficiency_audit" in guided_snapshot
-    assert "cost_weighted_strength_utilisation" in guided_snapshot["structural_efficiency_audit"]
-    synthetic_imbalance = window.assistant_structural_efficiency_audit([
-        {
-            "group": "LEFT_COLUMN",
-            "section": "Synthetic heavy left",
-            "utilisation": 0.10,
-            "approximate_selected_section_cost": 4000.0,
-            "stiffness_metric": 2.5e9,
-        },
-        {
-            "group": "RIGHT_COLUMN",
-            "section": "Synthetic efficient right",
-            "utilisation": 0.90,
-            "approximate_selected_section_cost": 1000.0,
-            "stiffness_metric": 1.0e8,
-        },
-    ])
-    assert synthetic_imbalance["requires_followup"] is True
-    assert synthetic_imbalance["material_low_utilisation_members"][0]["group"] == "LEFT_COLUMN"
-    assert "material_expensive_member_below_35_percent_strength_utilisation" in synthetic_imbalance["flags"]
-    base = window.assistant_capture_help_base_state(help_snapshot)
-    base_signature = base["model_signature"]
-    window.assistant_help_session = {
-        "snapshot": help_snapshot,
-        "base": base,
-        "trials": [],
-    }
-    current_depth = float(window.depth_input.text())
-    minimum_depth = window.truss_depth_from_span(main.MAIN_TRUSS_DEPTH_MIN_RATIO)
-    maximum_depth = window.max_main_truss_depth_mm()
-    if current_depth + 50.0 <= maximum_depth + 1e-9:
-        depth_delta = 50
-    elif current_depth - 50.0 >= minimum_depth - 1e-9:
-        depth_delta = -50
-    else:
-        depth_delta = 0
-    trial = window.assistant_execute_help_trial({
-        "hypothesis": "Smoke-test isolated depth sensitivity",
-        "truss_depth_delta_mm": depth_delta,
-        "left_addition_depth_delta_mm": 0,
-        "right_addition_depth_delta_mm": 0,
-        "left_column_steps": 1 if depth_delta == 0 else 0,
-        "right_column_steps": 0,
-        "top_member_steps": 0,
-        "bottom_chord_steps": 0,
-        "web_steps": 0,
-        "panel_layout_steps": 0,
-    })
-    assert trial["applied_changes"]
-    assert trial["solved"]
-    assert "estimated_cost_saving" in trial
-    assert "passes_all_reported_checks" in trial
-    assert "eligible_cost_improvement" in trial
-    assert trial["live_design_restored"] is True
-    assert window.assistant_help_model_signature() == base_signature
-    window.assistant_help_session = None
-    baseline_cost = float(help_snapshot["estimated_total_cost"])
-    guided_baseline = {
-        "kind": "baseline",
-        "state": base,
-        "snapshot": guided_snapshot,
-        "result": guided_snapshot["baseline_optimiser_result"],
-        "cost": baseline_cost,
-        "verified": True,
-        "strategy_number": 0,
-        "hypothesis": "Smoke deterministic baseline",
-    }
-    window.assistant_optimise_session = {
-        "baseline": guided_baseline,
-        "best": guided_baseline,
-        "probes": [],
-        "strategies": [],
-    }
-    optimise_probe = window.assistant_execute_optimisation_probe({
-        "hypothesis": "Smoke-test an isolated AI Optimise probe",
-        "truss_depth_delta_mm": depth_delta,
-        "left_addition_depth_delta_mm": 0,
-        "right_addition_depth_delta_mm": 0,
-        "left_column_steps": 1 if depth_delta == 0 else 0,
-        "right_column_steps": 0,
-        "left_lean_column_steps": 0,
-        "right_lean_column_steps": 0,
-        "top_member_steps": 0,
-        "bottom_chord_steps": 0,
-        "web_steps": 0,
-        "panel_layout_steps": 0,
-    })
-    assert optimise_probe["solved"] is True
-    assert optimise_probe["optimiser_invoked"] is False
-    assert "structural_efficiency_audit" in optimise_probe["after"]
-    assert optimise_probe["baseline_live_design_restored"] is True
-    original_run_full_optimiser = window.assistant_run_full_optimiser
-    window.assistant_run_full_optimiser = lambda strategy=None: {
-        "verified": True,
-        "cost": baseline_cost - 100.0,
-        "ratio": help_snapshot["overall_governing"]["ratio"],
-        "governing_group": help_snapshot["overall_governing"]["group"],
-        "governing_check": help_snapshot["overall_governing"]["check"],
-        "exact_solves": 17,
-        "report": "Coordinated search: 17 exact section solve(s)\nFINAL VERIFICATION: OK",
-        "guided_seed_changes": [],
-        "search_focus": "column_stiffness_trade",
-    }
-    try:
-        strategy_result = window.assistant_execute_optimisation_strategy({
-            "hypothesis": "Smoke-test a full optimiser branch",
-            "search_focus": "column_stiffness_trade",
-            "truss_depth_delta_mm": 200,
-            "left_addition_depth_delta_mm": 0,
-            "right_addition_depth_delta_mm": 200,
-            "left_column_steps": -4,
-            "right_column_steps": 1,
-            "left_lean_column_steps": 0,
-            "right_lean_column_steps": 0,
-            "top_member_steps": 0,
-            "bottom_chord_steps": 0,
-            "web_steps": 0,
-            "panel_layout_steps": 0,
-        })
-    finally:
-        window.assistant_run_full_optimiser = original_run_full_optimiser
-    assert strategy_result["verified"] is True
-    assert strategy_result["improved_best_incumbent"] is True
-    assert math.isclose(strategy_result["saving_vs_baseline"], 100.0, abs_tol=1e-9)
-    assert strategy_result["baseline_live_design_restored"] is True
-    assert window.assistant_optimise_session["best"]["strategy_number"] == 1
-    decision_snapshot = copy.deepcopy(guided_snapshot)
-    decision_snapshot["unverified_concept_options"] = copy.deepcopy(bracing_concepts)
-    window.assistant_optimise_session.update({
-        "snapshot": decision_snapshot,
-        "concept_trials": [],
-        "design_decisions": {},
-    })
-    original_prompt_restraint_scope = window.assistant_prompt_end_wall_restraint_scope
-    original_run_full_optimiser = window.assistant_run_full_optimiser
-    original_end_column_balance = window.assistant_end_column_balance
-    window.assistant_prompt_end_wall_restraint_scope = lambda concept, rationale="": {
-        "accepted": True,
-        "configurations": [
-            {"ends": "One end", "sides": "One side"},
-            {"ends": "Both ends", "sides": "Both sides"},
-        ],
-    }
-
-    def fake_restraint_optimiser(strategy=None):
-        saving = 300.0 if (
-            window.eave_x_restraint_combo.currentText() == "Both ends"
-            and window.end_wall_braced_sides_combo.currentText() == "Both sides"
-        ) else 50.0
-        return {
-            "verified": True,
-            "cost": baseline_cost - saving,
-            "ratio": 0.82,
-            "governing_group": "SLS",
-            "governing_check": "Column top deflection SLS",
-            "exact_solves": 19,
-            "report": "FINAL VERIFICATION: OK",
-            "guided_seed_changes": [],
-            "search_focus": "column_stiffness_trade",
-        }
-
-    window.assistant_run_full_optimiser = fake_restraint_optimiser
-    window.assistant_end_column_balance = lambda: {
-        "well_utilised": True,
-        "columns": [
-            {
-                "group": "LEFT_COLUMN",
-                "section": window.left_column_profile_combo.currentText(),
-                "strength_ratio": 0.82,
-                "strength_check": "Combined",
-                "deflection_ratio": 0.70,
-                "deflection_check": "Top deflection",
-            },
-            {
-                "group": "RIGHT_COLUMN",
-                "section": window.right_column_profile_combo.currentText(),
-                "strength_ratio": 0.80,
-                "strength_check": "Combined",
-                "deflection_ratio": 0.72,
-                "deflection_check": "Top deflection",
-            },
-        ],
-        "minimum_strength_ratio": 0.80,
-        "maximum_deflection_ratio": 0.72,
-    }
-    try:
-        decision_result = window.assistant_execute_end_wall_restraint_decision({
-            "decision_id": "end_wall_portal_restraint",
-            "rationale": "Column deflection remains near its serviceability limit.",
-        })
-    finally:
-        window.assistant_prompt_end_wall_restraint_scope = original_prompt_restraint_scope
-        window.assistant_run_full_optimiser = original_run_full_optimiser
-        window.assistant_end_column_balance = original_end_column_balance
-    assert decision_result["user_accepted"] is True
-    # Each layout starts at the lightest brace and tests just one further size
-    # once the columns are strength-led. The unchanged sections then stop the
-    # adaptive search instead of scanning the full brace catalogue.
-    assert len(decision_result["comparisons"]) == 4
-    assert all(item["verified"] for item in decision_result["comparisons"])
-    assert [
-        item["configuration"]["brace_size"]
-        for item in decision_result["comparisons"][:2]
-    ] == ["16 DIA ROD", "20 DIA ROD"]
-    assert window.assistant_optimise_session["best"]["kind"] == "concept"
-    assert window.assistant_optimise_session["best"]["configuration"] == {
-        "ends": "Both ends", "sides": "Both sides", "brace_size": "16 DIA ROD",
-    }
-    assert decision_result["baseline_live_design_restored"] is True
-    assert window.eave_x_restraint_combo.currentText() == base["end_wall_bracing"]
-    assert window.end_wall_braced_sides_combo.currentText() == base["end_wall_braced_sides"]
-    assert window.end_wall_brace_size_combo.currentText() == base["end_wall_brace_size"]
-    window.assistant_optimise_session = None
     deflection_overlay = window.governing_column_deflection_overlay
     assert deflection_overlay is not None
     assert deflection_overlay["combo"] in window.column_deflection_check_label.toolTip()
@@ -2437,32 +1884,6 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     assert window.left_canopy_deflection_check_label in window.deflection_hover_overlays
     assert "Load case:" in window.left_canopy_deflection_check_label.toolTip()
     assert window.deflection_hover_overlays[window.left_canopy_deflection_check_label]["direction"] == "vertical"
-    canopy_help_snapshot = window.assistant_help_snapshot(include_optimiser=False)
-    canopy_help_base = window.assistant_capture_help_base_state(canopy_help_snapshot)
-    window.assistant_help_session = {
-        "snapshot": canopy_help_snapshot,
-        "base": canopy_help_base,
-        "trials": [],
-    }
-    canopy_depth_trial = window.assistant_execute_help_trial({
-        "hypothesis": "Test a deeper left canopy truss",
-        "truss_depth_delta_mm": 0,
-        "left_addition_depth_delta_mm": 50,
-        "right_addition_depth_delta_mm": 0,
-        "left_column_steps": 0,
-        "right_column_steps": 0,
-        "top_member_steps": 0,
-        "bottom_chord_steps": 0,
-        "web_steps": 0,
-        "panel_layout_steps": 0,
-    })
-    assert canopy_depth_trial["solved"] is True
-    assert any(
-        item.get("parameter") == "left_canopy_lean_to_depth_mm"
-        for item in canopy_depth_trial["applied_changes"]
-    )
-    assert canopy_depth_trial["live_design_restored"] is True
-    window.assistant_help_session = None
     assert "eave 5000.0 mm" in window.results_box.toPlainText()
     assert any(
         element.group == "LEFT_CANOPY_TOP"
@@ -2531,7 +1952,15 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
         for element in free_roof_canopy_top_elements
     ]
     assert any(abs(local_qy) > 1e-9 for _, local_qy in free_roof_member_loads)
-    assert all(abs(local_qx) < 1e-9 for local_qx, _ in free_roof_member_loads)
+    # Roof-normal wind adds no local axial load. The 1.2G portion still has
+    # an axial projection on the sloping canopy chord.
+    canopy_permanent_line_load = 1.2 * float(window.load_bay_size_input.text()) * (
+        window.downward_roof_load_from_input(window.left_canopy_g_load_input)
+        + window.downward_roof_load_from_input(window.left_canopy_solar_load_input)
+    )
+    for element, (local_qx, _) in zip(free_roof_canopy_top_elements, free_roof_member_loads):
+        expected_gravity_qx = canopy_permanent_line_load * abs(math.cos(element.angle())) * math.sin(element.angle())
+        assert math.isclose(local_qx, expected_gravity_qx, rel_tol=1e-9, abs_tol=1e-9)
     assert max(
         window.structure.element_force_summary(element, window.displacements)["moment_knm"]
         for element in free_roof_canopy_top_elements
@@ -2558,7 +1987,9 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
         for element in continuous_canopy_top_elements
     ]
     assert any(abs(local_qy) > 1e-9 for _, local_qy in continuous_member_loads)
-    assert all(abs(local_qx) < 1e-9 for local_qx, _ in continuous_member_loads)
+    for element, (local_qx, _) in zip(continuous_canopy_top_elements, continuous_member_loads):
+        expected_gravity_qx = canopy_permanent_line_load * abs(math.cos(element.angle())) * math.sin(element.angle())
+        assert math.isclose(local_qx, expected_gravity_qx, rel_tol=1e-9, abs_tol=1e-9)
     assert max(
         window.structure.element_force_summary(element, window.displacements)["moment_knm"]
         for element in continuous_canopy_top_elements
@@ -2942,7 +2373,7 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     assert "H/" in window.right_lean_column_deflection_check_label.text()
     assert "Load case:" in window.right_lean_column_deflection_check_label.toolTip()
     stability_rows = {
-        item["group"]: item for item in window.assistant_column_stability_context_rows()
+        item["group"]: item for item in window.column_stability_context_rows()
     }
     right_lean_stability = stability_rows["RIGHT_LEAN_COLUMN"]
     assert right_lean_stability["wall_clad"] is True
@@ -2954,36 +2385,6 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     )
     assert right_lean_stability["mid_height_ws_deflection"]["checked"] is True
     assert right_lean_stability["mid_height_ws_deflection"]["ratio"] is not None
-    lean_help_snapshot = window.assistant_help_snapshot()
-    lean_help_base = window.assistant_capture_help_base_state(lean_help_snapshot)
-    original_right_lean_section = window.right_lean_column_profile_combo.currentText()
-    window.assistant_help_session = {
-        "snapshot": lean_help_snapshot,
-        "base": lean_help_base,
-        "trials": [],
-    }
-    lean_column_trial = window.assistant_execute_help_trial({
-        "hypothesis": "Test one stiffer right lean-to outer column",
-        "truss_depth_delta_mm": 0,
-        "left_addition_depth_delta_mm": 0,
-        "right_addition_depth_delta_mm": 0,
-        "left_column_steps": 0,
-        "right_column_steps": 0,
-        "left_lean_column_steps": 0,
-        "right_lean_column_steps": 1,
-        "top_member_steps": 0,
-        "bottom_chord_steps": 0,
-        "web_steps": 0,
-        "panel_layout_steps": 0,
-    })
-    assert lean_column_trial["solved"] is True
-    assert any(
-        change.get("parameter") == "RIGHT_LEAN_COLUMN"
-        for change in lean_column_trial["applied_changes"]
-    )
-    assert lean_column_trial["live_design_restored"] is True
-    assert window.right_lean_column_profile_combo.currentText() == original_right_lean_section
-    window.assistant_help_session = None
     main_right_x = window.concept_main_top_nodes[-1].x
     left_cpe_vertical = sorted(
         (
@@ -3330,8 +2731,11 @@ def main() -> None:
         run_roof_udl_smoke_checks()
     with timed_step("license and calculation checks"):
         run_license_smoke_checks()
-    with timed_step("structural assistant checks"):
-        run_structural_assistant_smoke_checks()
+    with timed_step("internal column layout checks"):
+        import unittest
+        from internal_columns_regression import InternalColumnsRegression
+        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromTestCase(InternalColumnsRegression))
+        assert result.wasSuccessful(), "Internal column layout regression failed"
     with timed_step(f"{mode_name} UI checks"):
         run_ui_smoke_checks(quick=args.quick)
     print(f"{mode_name} smoke checks ok")

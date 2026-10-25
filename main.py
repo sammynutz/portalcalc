@@ -54,7 +54,7 @@ def parallel_worker_count(item_count):
 import numpy as np
 from openpyxl import load_workbook
 
-from PySide6.QtCore import QEvent, Qt, QSettings, QSignalBlocker, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, Qt, QSettings, QSignalBlocker, QTimer, QUrl
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 
 from PySide6.QtWidgets import (
@@ -125,27 +125,6 @@ from elevation_drawings import export_elevation_pdf
 from finishes import CLADDING_PROFILES, COLORBOND_CORE_COLOURS, DEFAULT_FINISHES, colour_hex
 import concept_3d
 import costing
-from structural_assistant import (
-    AssistantUsage,
-    DEFAULT_MODEL as ASSISTANT_DEFAULT_MODEL,
-    SUPPORTED_MODELS as ASSISTANT_MODELS,
-    DEFAULT_REASONING_LEVEL as ASSISTANT_DEFAULT_REASONING,
-    GUIDED_OPTIMISE_MAX_PROBES as ASSISTANT_GUIDED_OPTIMISE_MAX_PROBES,
-    GUIDED_OPTIMISE_MAX_STRATEGIES as ASSISTANT_GUIDED_OPTIMISE_MAX_STRATEGIES,
-    HELP_MAX_TRIALS as ASSISTANT_HELP_MAX_TRIALS,
-    REASONING_LEVELS as ASSISTANT_REASONING_LEVELS,
-    StructuralAssistantError,
-    api_key_source,
-    combine_usage as assistant_combine_usage,
-    delete_openai_api_key,
-    dossier_hash as assistant_dossier_hash,
-    dossier_json as assistant_dossier_json,
-    format_usage as assistant_format_usage,
-    request_guided_optimise_turn,
-    request_structural_help_turn,
-    request_structural_review,
-    save_openai_api_key,
-)
 from reduced_optimizer import (
     build_screen_from_portalcalc,
 )
@@ -214,7 +193,23 @@ SERVICEABILITY_LIMIT_DEFAULTS = {
     "storage_steel": 250.0,
 }
 
-WHATS_NEW_TEXT = """Portal Calc 1.5 - 14 August 2026
+WHATS_NEW_TEXT = """Portal Calc 1.6.4 - 25 October 2026
+
+Full computations
+- File > Export Full Computations (PDF) creates a paginated calculation document.
+- Includes all engineering inputs, wind/load calculations, governing analysis results,
+  section capacities, selected webs and the implemented connection checks.
+- Add a large appendix with every nodal/member result for governing cases when needed.
+
+Internal column layouts
+- Choose Custom positions and enter distances in metres from the left main column centreline.
+- Separate positions with commas, e.g. 5, 12, 20 adds three internal columns.
+- Existing single and paired centre-offset layouts remain available.
+
+Sections workflow
+- Removed AI Help, AI Optimise, Structural Assistant and OpenAI API calls.
+
+Earlier updates
 
 End-wall steel
 - Added automatic end-wall mullion and girt design, section checks and costing.
@@ -343,6 +338,23 @@ def mm_text_from_metres_widget(widget):
     if not text:
         return ""
     return f"{mm_from_metres_text(text):.3f}".rstrip("0").rstrip(".")
+
+
+def internal_column_positions_mm(text, span_mm):
+    """Parse distinct support distances measured from the left column centreline."""
+    try:
+        positions = [float(value.strip()) * 1000.0 for value in text.split(",")]
+    except ValueError:
+        raise ValueError("Internal column positions must be comma-separated distances in metres, e.g. 5, 12, 20.") from None
+    if any(not math.isfinite(x) or not 0.0 < x < span_mm for x in positions):
+        raise ValueError(
+            f"Internal column positions must be greater than 0 and less than {span_mm / 1000.0:g} m "
+            "from the left column centreline."
+        )
+    positions.sort()
+    if any(right - left <= 1e-6 for left, right in zip(positions, positions[1:])):
+        raise ValueError("Internal column positions must be distinct; remove repeated positions.")
+    return positions
 
 
 def governing_height_deflection_item(items):
@@ -2997,111 +3009,6 @@ class OpenGLConcept3DViewer(QOpenGLWidget):
 # MAIN WINDOW
 # ==========================================================
 
-class StructuralAssistantRequestThread(QThread):
-    """Run the remote assistant request without blocking the Qt event loop."""
-
-    succeeded = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, *, api_key, dossier, question, model, reasoning_effort, parent=None):
-        super().__init__(parent)
-        self.api_key = api_key
-        self.dossier = dossier
-        self.question = question
-        self.model = model
-        self.reasoning_effort = reasoning_effort
-
-    def run(self):
-        try:
-            response = request_structural_review(
-                api_key=self.api_key,
-                dossier=self.dossier,
-                question=self.question,
-                model=self.model,
-                reasoning_effort=self.reasoning_effort,
-            )
-        except StructuralAssistantError as exc:
-            self.failed.emit(str(exc))
-        except Exception as exc:
-            self.failed.emit(f"Unexpected assistant error: {exc}")
-        else:
-            self.succeeded.emit(response)
-        finally:
-            self.api_key = ""
-
-
-class StructuralAssistantHelpThread(QThread):
-    """Run one network turn of the guided-help tool loop."""
-
-    succeeded = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, *, api_key, input_items, snapshot_hash, model, reasoning_effort, parent=None):
-        super().__init__(parent)
-        self.api_key = api_key
-        self.input_items = copy.deepcopy(input_items)
-        self.snapshot_hash = snapshot_hash
-        self.model = model
-        self.reasoning_effort = reasoning_effort
-
-    def run(self):
-        try:
-            response = request_structural_help_turn(
-                api_key=self.api_key,
-                input_items=self.input_items,
-                snapshot_hash=self.snapshot_hash,
-                model=self.model,
-                reasoning_effort=self.reasoning_effort,
-            )
-        except StructuralAssistantError as exc:
-            self.failed.emit(str(exc))
-        except Exception as exc:
-            self.failed.emit(f"Unexpected guided-help error: {exc}")
-        else:
-            self.succeeded.emit(response)
-        finally:
-            self.api_key = ""
-            self.input_items = []
-
-
-def connect_guided_worker_success(signal, slot):
-    """Keep nested optimiser event processing from overtaking result handling."""
-    signal.connect(slot, Qt.ConnectionType.BlockingQueuedConnection)
-
-
-class StructuralAssistantOptimiseThread(QThread):
-    """Run one network turn of the Guided Optimise supervisor loop."""
-
-    succeeded = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, *, api_key, input_items, snapshot_hash, model, reasoning_effort, parent=None):
-        super().__init__(parent)
-        self.api_key = api_key
-        self.input_items = copy.deepcopy(input_items)
-        self.snapshot_hash = snapshot_hash
-        self.model = model
-        self.reasoning_effort = reasoning_effort
-
-    def run(self):
-        try:
-            response = request_guided_optimise_turn(
-                api_key=self.api_key,
-                input_items=self.input_items,
-                snapshot_hash=self.snapshot_hash,
-                model=self.model,
-                reasoning_effort=self.reasoning_effort,
-            )
-        except StructuralAssistantError as exc:
-            self.failed.emit(str(exc))
-        except Exception as exc:
-            self.failed.emit(f"Unexpected guided-optimisation error: {exc}")
-        else:
-            self.succeeded.emit(response)
-        finally:
-            self.api_key = ""
-            self.input_items = []
-
 
 class MainWindow(QMainWindow):
 
@@ -3187,13 +3094,6 @@ class MainWindow(QMainWindow):
         self.optimisation_warm_start_trusted = False
         self.optimisation_learning_summary = "Learning warm start: no prior verified jobs used"
         self.optimisation_load_vector_cache = None
-        self.assistant_request_thread = None
-        self.assistant_help_request_thread = None
-        self.assistant_help_session = None
-        self.assistant_help_chat_session = None
-        self.assistant_optimise_request_thread = None
-        self.assistant_optimise_session = None
-        self.last_guided_optimise_summary = ""
         self.concept_3d_dirty = True
         self.update_window_title()
 
@@ -3276,6 +3176,10 @@ class MainWindow(QMainWindow):
         summary_action.triggered.connect(self.show_engineering_summary)
         file_menu.addAction(summary_action)
 
+        self.computation_report_action = QAction("Export Full &Computations (PDF)...", self)
+        self.computation_report_action.triggered.connect(lambda: self.export_computation_report())
+        file_menu.addAction(self.computation_report_action)
+
         file_menu.addSeparator()
         warm_start_action = QAction("Import Optimiser &Warm Starts...", self)
         warm_start_action.triggered.connect(self.import_optimiser_warm_starts_dialog)
@@ -3324,7 +3228,11 @@ class MainWindow(QMainWindow):
             ("Portal spacing", f"{self.load_bay_size_input.text()} m"),
             ("Eave / roof", f"{self.eave_input.text()} m / {self.pitch_input.text()} deg {self.current_roof_shape().lower()}"),
             ("Frame", self.frame_system_combo.currentText()),
-            ("Internal columns", self.internal_column_count_combo.currentText()),
+            ("Internal columns", (
+                f"Custom positions: {self.internal_column_positions_input.text()} m from left column centreline"
+                if self.internal_column_count_combo.currentText() == "Custom positions"
+                else self.internal_column_count_combo.currentText()
+            )),
             ("Side additions", f"Left {self.left_canopy_type_combo.currentText()} {self.left_canopy_length_input.text()} m; Right {self.right_canopy_type_combo.currentText()} {self.right_canopy_length_input.text()} m"),
         ]
         loads = [
@@ -3415,6 +3323,81 @@ class MainWindow(QMainWindow):
         print_button.clicked.connect(print_report)
         close_button.clicked.connect(dialog.accept)
         dialog.exec()
+
+    def capture_computation_report(self, metadata=None):
+        """Analyse current selections and freeze the exact report evidence."""
+        from computation_report_data import build_report_data
+        names = ("_capture_computation_report", "_preserve_web_assignments_on_solve",
+                 "_suppress_auto_web_split_on_solve", "_suppress_panel_topology_search")
+        previous = {name: getattr(self, name, False) for name in names}
+        try:
+            for name in names:
+                setattr(self, name, True)
+            self.generate_and_solve()
+            if self.structure is None:
+                raise ValueError(self.results_box.toPlainText() or "The current design could not be solved.")
+            return build_report_data(self, metadata)
+        finally:
+            for name, value in previous.items():
+                setattr(self, name, value)
+
+    def export_computation_report(self):
+        preset_name = os.path.splitext(os.path.basename(self.current_preset_path or "Untitled project"))[0]
+        saved = getattr(self, "_computation_report_metadata", {})
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Full Computations")
+        dialog.resize(540, 300)
+        layout = QVBoxLayout(dialog)
+        intro = QLabel("Export the current frame, loads, governing analysis and member/web checks as a paginated PDF. The current selections will be analysed again for the report.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        form = QFormLayout()
+        fields = {}
+        for key, label, default in (("project", "Project", preset_name), ("job_number", "Job reference", ""),
+                                    ("prepared_by", "Prepared by", ""), ("revision", "Revision", "A")):
+            field = QLineEdit(str(saved.get(key, default)))
+            fields[key] = field
+            form.addRow(label, field)
+        layout.addLayout(form)
+        details = QCheckBox("Include all nodal and member results for governing cases (large appendix)")
+        details.setChecked(False)
+        layout.addWidget(details)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        export_button = QPushButton("Export PDF...")
+        cancel_button = QPushButton("Cancel")
+        actions.addWidget(export_button)
+        actions.addWidget(cancel_button)
+        layout.addLayout(actions)
+        export_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        metadata = {key: field.text().strip() for key, field in fields.items()}
+        self._computation_report_metadata = metadata
+        path, _ = QFileDialog.getSaveFileName(self, "Export Full Computations", f"{metadata['project'] or preset_name} - Computations.pdf", "PDF files (*.pdf)")
+        if not path:
+            return
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+        progress = QProgressDialog("Analysing the selected design and preparing computations...", "", 0, 0, self)
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
+        try:
+            from computation_report import export_computation_pdf
+            data = self.capture_computation_report(metadata)
+            progress.setLabelText("Laying out the computation document...")
+            QApplication.processEvents()
+            export_computation_pdf(data, path, include_case_details=details.isChecked())
+        except Exception as exc:
+            progress.close()
+            QMessageBox.warning(self, "Computation report", f"Could not export the report:\n{exc}")
+            return
+        progress.close()
+        QMessageBox.information(self, "Computation report", f"Full computations exported:\n{path}")
 
     def build_settings_menu(self):
         settings_menu = self.menuBar().addMenu("&Settings")
@@ -3958,7 +3941,7 @@ class MainWindow(QMainWindow):
         self.concept_3d_status_label.setText(f"Detailed 3D view current ({triangle_count:,} triangles)")
         return True
 
-    def assistant_key_lines(self, text, max_lines=260):
+    def design_evidence_key_lines(self, text, max_lines=260):
         """Extract compact, evidence-bearing lines from the detailed reports."""
         keywords = (
             "governing", "utilisation", "utilization", "deflection", "pass", "fail",
@@ -3979,11 +3962,11 @@ class MainWindow(QMainWindow):
             seen.add(line)
             selected.append(line)
             if len(selected) >= max_lines:
-                selected.append("[Additional report lines omitted from the assistant dossier]")
+                selected.append("[Additional report lines omitted from the calculation dossier]")
                 break
         return selected
 
-    def assistant_member_stability_context(self, group, envelope):
+    def member_stability_context(self, group, envelope):
         """Expose the calculator-owned column restraint and sway assumptions."""
         column_groups = {
             "LEFT_COLUMN", "RIGHT_COLUMN", "INTERNAL_COLUMN",
@@ -4050,14 +4033,14 @@ class MainWindow(QMainWindow):
             },
         }
 
-    def assistant_column_stability_context_rows(self):
+    def column_stability_context_rows(self):
         rows = []
         seen = set()
         for _, _, group in self.active_auto_size_group_specs():
             if group in seen:
                 continue
             seen.add(group)
-            context = self.assistant_member_stability_context(
+            context = self.member_stability_context(
                 group,
                 (self.design_envelope_actions or {}).get(group),
             )
@@ -4065,10 +4048,10 @@ class MainWindow(QMainWindow):
                 rows.append(context)
         return rows
 
-    def assistant_design_dossier(self):
+    def calculation_design_dossier(self):
         """Build a compact, serialisable snapshot of the current solved design."""
         if self.structure is None or self.design_envelope_actions is None:
-            raise ValueError("Generate and solve the frame before requesting an assistant review.")
+            raise ValueError("Generate and solve the frame before collecting calculation evidence.")
 
         preset = copy.deepcopy(self.collect_preset_data())
         preset.pop("display", None)
@@ -4118,7 +4101,7 @@ class MainWindow(QMainWindow):
                 "action_sources": action_sources,
                 "member_capacity_checks": checks,
             }
-            stability_context = self.assistant_member_stability_context(group, envelope)
+            stability_context = self.member_stability_context(group, envelope)
             if stability_context is not None:
                 item["stability_context"] = stability_context
             if group in {"WEB", "LEFT_CANOPY_WEB", "RIGHT_CANOPY_WEB"}:
@@ -4140,10 +4123,10 @@ class MainWindow(QMainWindow):
             {"ratio": ratio, "check": check, "limit_basis": basis}
             for ratio, check, basis in self.auto_size_serviceability_ratios()
         ]
-        report_lines = self.assistant_key_lines(self.section_checks_box.toPlainText())
-        results_lines = self.assistant_key_lines(self.results_box.toPlainText(), max_lines=120)
+        report_lines = self.design_evidence_key_lines(self.section_checks_box.toPlainText())
+        results_lines = self.design_evidence_key_lines(self.results_box.toPlainText(), max_lines=120)
         return {
-            "schema": "portalcalc.structural_assistant.design_dossier.v1",
+            "schema": "portalcalc.calculation.dossier.v1",
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "portalcalc_version": APP_VERSION,
             "status": "current solved model",
@@ -4156,7 +4139,7 @@ class MainWindow(QMainWindow):
                 "passes_ratio_screen": self.design_utilization_ok(overall_ratio),
             },
             "member_checks": member_checks,
-            "column_stability_context": self.assistant_column_stability_context_rows(),
+            "column_stability_context": self.column_stability_context_rows(),
             "serviceability_checks": serviceability,
             "purlin_check": self.purlin_check,
             "wall_girt_check": self.wall_girt_check,
@@ -4173,456 +4156,14 @@ class MainWindow(QMainWindow):
             "key_section_check_report_lines": report_lines,
             "key_analysis_report_lines": results_lines,
             "scope_and_limitations": [
-                "PortalCalc and this assistant are preliminary engineering aids, not design certification.",
-                "The assistant has no authority to alter inputs or selected sections.",
+                "PortalCalc is a preliminary engineering aid, not design certification.",
                 "Suggestions must be trialled by solving a new PortalCalc model and reviewing every resulting check.",
                 "Any check absent from this dossier must be treated as not checked.",
             ],
         }
 
-    def assistant_help_check_rows(self, max_checks=8):
-        """Return the highest-value main-frame checks for guided reasoning."""
-        rows = []
-        seen_groups = set()
-        for label, combo, group in self.active_auto_size_group_specs():
-            if group in seen_groups:
-                continue
-            seen_groups.add(group)
-            envelope = (self.design_envelope_actions or {}).get(group)
-            profile = self.selected_profile(combo)
-            if profile is None or not self.member_envelope_has_demands(envelope):
-                continue
-            ratio, governing_check, result = self.member_and_connection_ratio(profile, envelope, group)
-            split_assignment = None
-            if group in {"WEB", "LEFT_CANOPY_WEB", "RIGHT_CANOPY_WEB"}:
-                split_assignment = self.web_assignment_overall_ratio(profile, group)
-                if split_assignment is not None:
-                    ratio, _, governing_check = split_assignment
-            row = {
-                "id": f"member:{group}:{governing_check}",
-                "type": "member",
-                "group": group,
-                "label": label,
-                "section": profile.name,
-                "check": governing_check,
-                "ratio": float(ratio),
-            }
-            if split_assignment is not None:
-                row["section"] = "auto two-size web assignment"
-            result_checks = list(getattr(result, "checks", {}).values())
-            matching = next(
-                (item for item in result_checks if str(item.label) == str(governing_check)),
-                max(result_checks, key=lambda item: item.ratio, default=None),
-            )
-            if matching is not None and split_assignment is None:
-                row["demand"] = matching.demand
-                row["capacity"] = matching.capacity
-                row["unit"] = matching.unit
-            actions = {}
-            for source_key, short_key in (
-                ("compression_kn", "compression_kn"),
-                ("tension_kn", "tension_kn"),
-                ("shear_kn", "shear_kn"),
-                ("moment_knm", "moment_knm"),
-            ):
-                source = envelope.get(source_key) if isinstance(envelope, dict) else None
-                if not isinstance(source, dict) or source.get("value") is None:
-                    continue
-                actions[short_key] = {
-                    "value": source.get("value"),
-                    "combination": source.get("combo"),
-                }
-            if actions:
-                row["governing_actions"] = actions
-            stability_context = self.assistant_member_stability_context(group, envelope)
-            if stability_context is not None:
-                row["stability_context"] = stability_context
-            rows.append(row)
 
-        for group in {
-            "TOP", "BOTTOM", "LEFT_CANOPY_TOP", "LEFT_CANOPY_BOTTOM",
-            "RIGHT_CANOPY_TOP", "RIGHT_CANOPY_BOTTOM",
-        }:
-            fraction = self.doubled_chord_length_fraction(group)
-            if fraction > 0.0:
-                rows.append({
-                    "id": f"member:{group}:Doubled chord length limit",
-                    "type": "member",
-                    "group": group,
-                    "check": "Doubled chord length limit",
-                    "ratio": float(fraction / MAX_DOUBLED_CHORD_LENGTH_FRACTION),
-                    "fraction_of_member_doubled": float(fraction),
-                    "allowed_fraction": float(MAX_DOUBLED_CHORD_LENGTH_FRACTION),
-                })
-
-        for ratio, check, basis in self.auto_size_serviceability_ratios():
-            rows.append({
-                "id": f"serviceability:{check}",
-                "type": "serviceability",
-                "group": "SLS",
-                "check": check,
-                "ratio": float(ratio),
-                "limit_basis": basis,
-            })
-        rows.sort(key=lambda item: (-float(item.get("ratio") or 0.0), item["id"]))
-        return rows[:max(int(max_checks), 1)]
-
-    def assistant_help_member_economics(self, max_groups=12):
-        """Expose compact cost/utilisation signals for Luna's trial selection."""
-        lengths = self.auto_size_group_lengths_m()
-        checks_by_group = {}
-        for item in self.assistant_help_check_rows(max_checks=100):
-            group = item.get("group")
-            if item.get("type") != "member" or not group:
-                continue
-            if float(item.get("ratio") or 0.0) > float((checks_by_group.get(group) or {}).get("ratio") or -1.0):
-                checks_by_group[group] = item
-        rows = []
-        seen_groups = set()
-        for label, combo, group in self.active_auto_size_group_specs():
-            if group in seen_groups:
-                continue
-            seen_groups.add(group)
-            profile = self.selected_profile(combo)
-            if profile is None:
-                continue
-            length_m = float(lengths.get(group) or 0.0)
-            kg_per_m = float(profile.A) * 1e-6 * 7850.0
-            approximate_cost = self.auto_size_profile_cost_key(profile) * length_m
-            check = checks_by_group.get(group) or {}
-            row = {
-                "group": group,
-                "label": label,
-                "section": profile.name,
-                "family": self.profile_family_name(profile),
-                "length_m": length_m,
-                "mass_kg_per_m": kg_per_m,
-                "approximate_selected_section_cost": approximate_cost,
-                "stiffness_metric": self.auto_size_profile_metric(profile, group),
-                "utilisation": check.get("ratio"),
-                "governing_check": check.get("check"),
-            }
-            if group in {"WEB", "LEFT_CANOPY_WEB", "RIGHT_CANOPY_WEB"} and self.auto_web_profile_assignments.get(group):
-                row["cost_basis_note"] = "Base selected web only; automatic two-size web assignments may differ."
-            rows.append(row)
-        rows.sort(key=lambda item: (
-            -float(item.get("approximate_selected_section_cost") or 0.0),
-            float(item.get("utilisation") or 0.0),
-            item["group"],
-        ))
-        return rows[:max(int(max_groups), 1)]
-
-    def assistant_structural_efficiency_audit(self, member_economics=None):
-        """Return diagnostic cost/utilisation and stiffness-distribution signals."""
-        rows = list(member_economics or self.assistant_help_member_economics(max_groups=50))
-        usable = [
-            item for item in rows
-            if item.get("utilisation") is not None
-            and float(item.get("approximate_selected_section_cost") or 0.0) > 0.0
-        ]
-        utilisations = [float(item["utilisation"]) for item in usable]
-        total_selected_cost = sum(
-            float(item.get("approximate_selected_section_cost") or 0.0) for item in usable
-        )
-        cost_weighted_utilisation = (
-            sum(
-                float(item.get("approximate_selected_section_cost") or 0.0)
-                * float(item["utilisation"])
-                for item in usable
-            ) / total_selected_cost
-            if total_selected_cost > 1e-12 else None
-        )
-        material_cost_threshold = max(total_selected_cost * 0.08, 500.0)
-        low_utilisation = sorted(
-            [
-                {
-                    "group": item.get("group"),
-                    "section": item.get("section"),
-                    "utilisation": float(item["utilisation"]),
-                    "approximate_selected_section_cost": float(
-                        item.get("approximate_selected_section_cost") or 0.0
-                    ),
-                    "stiffness_metric": item.get("stiffness_metric"),
-                }
-                for item in usable
-                if float(item["utilisation"]) < 0.35
-                and float(item.get("approximate_selected_section_cost") or 0.0) >= material_cost_threshold
-            ],
-            key=lambda item: (
-                item["utilisation"],
-                -item["approximate_selected_section_cost"],
-                str(item["group"]),
-            ),
-        )
-        main_columns = {
-            item.get("group"): item for item in usable
-            if item.get("group") in {"LEFT_COLUMN", "RIGHT_COLUMN"}
-            and float(item.get("stiffness_metric") or 0.0) > 0.0
-        }
-        column_stiffness = None
-        if len(main_columns) == 2:
-            left_metric = float(main_columns["LEFT_COLUMN"]["stiffness_metric"])
-            right_metric = float(main_columns["RIGHT_COLUMN"]["stiffness_metric"])
-            smaller = max(min(left_metric, right_metric), 1e-12)
-            larger = max(left_metric, right_metric)
-            column_stiffness = {
-                "left_metric": left_metric,
-                "right_metric": right_metric,
-                "max_to_min_ratio": larger / smaller,
-                "dominant_side": "left" if left_metric >= right_metric else "right",
-            }
-        serviceability = self.auto_size_serviceability_ratio()
-        extreme_stiffness_concentration = bool(
-            column_stiffness
-            and column_stiffness["max_to_min_ratio"] >= 8.0
-            and serviceability[0] >= 0.85
-        )
-        flags = []
-        if low_utilisation:
-            flags.append("material_expensive_member_below_35_percent_strength_utilisation")
-        if extreme_stiffness_concentration:
-            flags.append("extreme_left_right_column_stiffness_concentration_with_high_sway")
-        return {
-            "purpose": "diagnostic search signal only; verified total cost remains the optimisation objective",
-            "cost_weighted_strength_utilisation": cost_weighted_utilisation,
-            "strength_utilisation_distribution": {
-                "minimum": min(utilisations) if utilisations else None,
-                "median": statistics.median(utilisations) if utilisations else None,
-                "maximum": max(utilisations) if utilisations else None,
-                "members_below_0_50": sum(value < 0.50 for value in utilisations),
-                "member_count": len(utilisations),
-            },
-            "material_low_utilisation_members": low_utilisation,
-            "main_column_stiffness_distribution": column_stiffness,
-            "governing_serviceability": {
-                "ratio": float(serviceability[0]),
-                "check": serviceability[1],
-                "limit_basis": serviceability[2],
-            },
-            "flags": flags,
-            "requires_followup": bool(flags),
-            "recommended_probe_type": (
-                "stiffness transfer: reduce the costly low-utilisation member while changing truss depth "
-                "or the opposite support in the same exact probe"
-                if flags else None
-            ),
-        }
-
-    @staticmethod
-    def assistant_compact_result_item(item):
-        if not isinstance(item, dict):
-            return None
-        keys = ("value", "combo", "node", "member", "height_mm", "length_mm", "label")
-        return {key: item.get(key) for key in keys if item.get(key) is not None}
-
-    @staticmethod
-    def assistant_unverified_concept_options(geometry, checks, wall_enclosure=None):
-        """Return evidence-led concepts that are not available optimiser strategies."""
-        if str((geometry or {}).get("end_wall_bracing") or "None") != "None":
-            return []
-        wall_enclosure = wall_enclosure if isinstance(wall_enclosure, dict) else {}
-        clad_ends = [side for side in ("back", "front") if bool(wall_enclosure.get(side))]
-        if not clad_ends:
-            return []
-        column_deflections = [
-            item for item in (checks or [])
-            if isinstance(item, dict)
-            and item.get("type") == "serviceability"
-            and "column" in str(item.get("check") or "").lower()
-            and "deflection" in str(item.get("check") or "").lower()
-        ]
-        governing = max(
-            column_deflections,
-            default=None,
-            key=lambda item: float(item.get("ratio") or 0.0),
-        )
-        if governing is None or float(governing.get("ratio") or 0.0) < 0.85:
-            return []
-        available_settings = ["One end"]
-        if len(clad_ends) >= 2:
-            available_settings.append("Both ends")
-        return [{
-            "id": "end_wall_portal_restraint",
-            "relevance": "high",
-            "trigger_evidence": {
-                "check": governing.get("check"),
-                "ratio": governing.get("ratio"),
-                "limit_basis": governing.get("limit_basis"),
-            },
-            "current_setting": "None",
-            "portalcalc_input": "Sections > Supports > End-wall portal restraint",
-            "clad_end_walls": clad_ends,
-            "available_trial_settings": available_settings,
-            "mechanism_hypothesis": (
-                "Roof-level end-wall restraint may reduce eave sway and allow the section optimiser "
-                "to investigate lighter columns."
-            ),
-            "verification_status": (
-                "Available as a user-authorised AI Optimise comparison; every selected configuration must run "
-                "the full deterministic optimiser and final verification before it can become the incumbent."
-            ),
-            "costing_caveat": (
-                "An authorised trial costs rod/EA steel weight at the UB rate and one turnbuckle per rod run. "
-                "Turnbuckle rates are included for 16, 20, 24, and 30 DIA rods; connections, load path, "
-                "foundations, and detailing remain excluded."
-            ),
-        }]
-
-    def assistant_help_snapshot(self, *, include_optimiser=True):
-        """Build the small initial context used by the adaptive Help agent."""
-        if self.structure is None or self.design_envelope_actions is None:
-            raise ValueError("Generate and solve the frame before requesting guided help.")
-        preset = self.collect_preset_data()
-        geometry = preset.get("geometry") or {}
-        loads = preset.get("loads") or {}
-        wind = preset.get("wind") or {}
-        canopies = preset.get("canopies") or {}
-        envelopes = self.design_envelope_actions or {}
-        active_sections = {
-            group: combo.currentText()
-            for _, combo, group in self.active_auto_size_group_specs()
-        }
-        sls_evidence = {}
-        for source_key in (
-            "sls_column_top_deflection",
-            "sls_crane_rail_deflection",
-            "sls_column_midspan_ws_deflection",
-        ):
-            compact = self.assistant_compact_result_item(envelopes.get(source_key))
-            if compact:
-                sls_evidence[source_key] = compact
-        truss_items = {}
-        for key, item in (envelopes.get("sls_truss_midspan_deflections") or {}).items():
-            compact = self.assistant_compact_result_item(item)
-            if compact:
-                truss_items[str(key)] = compact
-        if truss_items:
-            sls_evidence["sls_truss_midspan_deflections"] = truss_items
-
-        try:
-            panel_count = int(self.panel_count_label.text())
-        except (TypeError, ValueError):
-            panel_count = None
-        checks = self.assistant_help_check_rows()
-        overall = checks[0] if checks else {
-            "id": "none",
-            "group": "-",
-            "check": "No active checks",
-            "ratio": 0.0,
-        }
-        additions = {}
-        for side in ("left", "right"):
-            try:
-                length_mm = float(canopies.get(f"{side}_length_mm") or 0.0)
-            except (TypeError, ValueError):
-                length_mm = 0.0
-            if length_mm > 0.0:
-                additions[side] = {
-                    "type": canopies.get(f"{side}_type"),
-                    "frame_system": canopies.get(f"{side}_frame_system"),
-                    "length_mm": length_mm,
-                    "eave_height_mm": canopies.get(f"{side}_eave_height_mm"),
-                    "depth_mm": canopies.get(f"{side}_depth_mm"),
-                }
-        optimiser_lines = []
-        if include_optimiser and self.auto_size_report_text:
-            optimiser_lines = self.assistant_key_lines(self.auto_size_report_text, max_lines=18)
-        member_economics = self.assistant_help_member_economics()
-        efficiency_audit = self.assistant_structural_efficiency_audit(member_economics)
-        return {
-            "schema": "portalcalc.structural_assistant.guided_help.v1",
-            "portalcalc_version": APP_VERSION,
-            "objective": "minimise verified estimated total cost while every reported check passes",
-            "starting_design_passes_all_reported_checks": self.design_utilization_ok(
-                float(overall.get("ratio") or 0.0)
-            ),
-            "structure": {
-                "frame_system": geometry.get("frame_system"),
-                "roof_shape": geometry.get("roof_shape"),
-                "span_mm": geometry.get("span_mm"),
-                "eave_height_mm": geometry.get("eave_height_mm"),
-                "roof_pitch_deg": geometry.get("roof_pitch_deg"),
-                "truss_depth_mm": geometry.get("truss_depth_mm"),
-                "max_truss_depth_mm": geometry.get("max_truss_depth_mm"),
-                "panel_count": panel_count,
-                "left_support": geometry.get("left_support"),
-                "right_support": geometry.get("right_support"),
-                "base_moment_spring_knm_rad": geometry.get("base_moment_spring_knm_rad"),
-                "end_wall_bracing": geometry.get("end_wall_bracing"),
-                "end_wall_braced_sides": geometry.get("end_wall_braced_sides"),
-                "frame_spacing_mm": loads.get("bay_size_mm"),
-                "additions": additions,
-            },
-            "loads": {
-                "g_kpa": loads.get("g_kpa"),
-                "q_kpa": loads.get("q_kpa"),
-                "solar_kpa": loads.get("solar_kpa"),
-                "crane_rating_t": loads.get("crane_rating_t"),
-            },
-            "sections": active_sections,
-            "member_economics": member_economics,
-            "structural_efficiency_audit": efficiency_audit,
-            "column_stability_context": self.assistant_column_stability_context_rows(),
-            "overall_governing": overall,
-            "highest_checks": checks,
-            "serviceability_evidence": sls_evidence,
-            "unverified_concept_options": self.assistant_unverified_concept_options(
-                geometry,
-                checks,
-                wind.get("wall_enclosure"),
-            ),
-            "estimated_total_cost": (self.costing_summary or {}).get("total_cost"),
-            "previous_optimiser_evidence": optimiser_lines,
-            "trial_budget": ASSISTANT_HELP_MAX_TRIALS,
-            "trial_scope": [
-                "main truss depth",
-                "left and right canopy/lean-to truss depth",
-                "same-family end-column stiffness steps",
-                "same-family left and right lean-to outer-column stiffness steps",
-                "same-family top-member, bottom-chord, and web stiffness steps",
-                "adjacent valid main-truss panel topologies",
-            ],
-            "limitations": [
-                "Each trial starts from and restores this exact design.",
-                "Bracing, restraint, support, and load-path concepts are not trial tools in this version.",
-                "Passing the reported ratio screen is not design certification.",
-            ],
-        }
-
-    def assistant_help_model_signature(self):
-        """Hash engineering inputs while ignoring display-only state."""
-        data = copy.deepcopy(self.collect_preset_data())
-        data.pop("display", None)
-        data.pop("finishes", None)
-        data["_guided_help_active_sections"] = {
-            group: combo.currentText()
-            for _, combo, group in self.active_auto_size_group_specs()
-        }
-        data["_guided_help_panel_count"] = self.panel_count_label.text()
-        return assistant_dossier_hash(data)
-
-    def assistant_capture_help_base_state(self, snapshot):
-        active_specs = self.active_auto_size_group_specs()
-        try:
-            panel_count = int(self.panel_count_label.text())
-        except (TypeError, ValueError):
-            panel_count = None
-        return {
-            "state": self.auto_size_capture_state(active_specs),
-            "end_wall_bracing": self.eave_x_restraint_combo.currentText(),
-            "end_wall_braced_sides": self.end_wall_braced_sides_combo.currentText(),
-            "end_wall_brace_size": self.end_wall_brace_size_combo.currentText(),
-            "panel_count": panel_count,
-            "panel_override": getattr(self, "_panel_count_override", None),
-            "panel_cache_signature": getattr(self, "_panel_topology_cache_signature", None),
-            "panel_cache_count": getattr(self, "_panel_topology_cache_count", None),
-            "panel_report": self.panel_topology_search_report,
-            "optimiser_report": self.auto_size_report_text,
-            "model_signature": self.assistant_help_model_signature(),
-            "snapshot_hash": assistant_dossier_hash(snapshot),
-        }
-
-    def assistant_profile_step(self, combo, group, step):
+    def auto_size_profile_step(self, combo, group, step):
         """Move on a same-family stiffness ladder and describe the applied move."""
         step = int(step or 0)
         if step == 0 or combo is None or combo.currentIndex() < 0:
@@ -4660,1817 +4201,6 @@ class MainWindow(QMainWindow):
             "applied_steps": target_position - current_position,
         }
 
-    def assistant_restore_help_base_state(self, base):
-        self.auto_size_restore_state(base["state"])
-        self.set_combo_text_if_present(
-            self.eave_x_restraint_combo,
-            str(base.get("end_wall_bracing") or "None"),
-        )
-        self.set_combo_text_if_present(
-            self.end_wall_braced_sides_combo,
-            str(base.get("end_wall_braced_sides") or "One side"),
-        )
-        self.set_combo_text_if_present(
-            self.end_wall_brace_size_combo,
-            str(base.get("end_wall_brace_size") or END_WALL_BRACING_SIZE_OPTIONS[0][0]),
-        )
-        self._panel_count_override = base.get("panel_count")
-        previous_preserve = getattr(self, "_preserve_web_assignments_on_solve", False)
-        self._preserve_web_assignments_on_solve = True
-        try:
-            self._generate_and_solve_once()
-        finally:
-            self._preserve_web_assignments_on_solve = previous_preserve
-        self._panel_count_override = base.get("panel_override")
-        self._panel_topology_cache_signature = base.get("panel_cache_signature")
-        self._panel_topology_cache_count = base.get("panel_cache_count")
-        self.panel_topology_search_report = base.get("panel_report", "")
-        self.auto_size_report_text = base.get("optimiser_report", "")
-
-    @staticmethod
-    def assistant_help_result_summary(snapshot):
-        structure = snapshot.get("structure") or {}
-        return {
-            "governing": snapshot.get("overall_governing"),
-            "passes_all_reported_checks": snapshot.get("starting_design_passes_all_reported_checks"),
-            "highest_checks": (snapshot.get("highest_checks") or [])[:5],
-            "member_economics": snapshot.get("member_economics") or [],
-            "structural_efficiency_audit": snapshot.get("structural_efficiency_audit") or {},
-            "estimated_total_cost": snapshot.get("estimated_total_cost"),
-            "sections": snapshot.get("sections"),
-            "truss_depth_mm": structure.get("truss_depth_mm"),
-            "addition_depths_mm": {
-                side: item.get("depth_mm")
-                for side, item in (structure.get("additions") or {}).items()
-            },
-            "panel_count": structure.get("panel_count"),
-        }
-
-    def assistant_execute_help_trial(self, arguments):
-        """Evaluate one Luna-selected trial and restore the exact live design."""
-        session = self.assistant_help_session
-        if not isinstance(session, dict) or not isinstance(arguments, dict):
-            raise StructuralAssistantError("The guided-help trial session is not available.")
-        base = session["base"]
-        if self.assistant_help_model_signature() != base["model_signature"]:
-            raise StructuralAssistantError(
-                "The design changed while guided help was running. Start Help again from the new solved design."
-            )
-
-        hypothesis = str(arguments.get("hypothesis") or "").strip()
-        result = {
-            "trial_number": len(session["trials"]) + 1,
-            "hypothesis": hypothesis,
-            "solved": False,
-            "applied_changes": [],
-            "warnings": [],
-        }
-        previous_history = self._history_suspended
-        previous_topology = self._suppress_panel_topology_search
-        self._history_suspended = True
-        self._suppress_panel_topology_search = True
-        trial_started = False
-        try:
-            self.auto_size_restore_state(base["state"])
-            self._panel_count_override = base.get("panel_count")
-            active = {group: (label, combo, group) for label, combo, group in self.active_auto_size_group_specs()}
-
-            depth_delta = int(arguments.get("truss_depth_delta_mm") or 0)
-            if depth_delta:
-                if self.frame_system_combo.currentText() != "Truss":
-                    result["warnings"].append("Main truss depth is unavailable for the current frame system.")
-                else:
-                    current_depth = float(self.depth_input.text())
-                    minimum = self.truss_depth_from_span(MAIN_TRUSS_DEPTH_MIN_RATIO)
-                    maximum = self.max_main_truss_depth_mm()
-                    target = min(max(current_depth + depth_delta, minimum), maximum)
-                    target = self.round_up_to_increment(target, 50.0)
-                    if abs(target - current_depth) > 1e-9:
-                        self.depth_input.setText(f"{target:.0f}")
-                        result["applied_changes"].append({
-                            "parameter": "main_truss_depth_mm",
-                            "before": current_depth,
-                            "after": target,
-                            "requested_delta_mm": depth_delta,
-                        })
-                    else:
-                        result["warnings"].append("Requested truss-depth change reached the configured depth limit.")
-
-            for side in ("left", "right"):
-                addition_delta = int(arguments.get(f"{side}_addition_depth_delta_mm") or 0)
-                if not addition_delta:
-                    continue
-                bounds = self.addition_depth_bounds(side)
-                if bounds is None:
-                    result["warnings"].append(
-                        f"{side.title()} canopy/lean-to truss depth is unavailable for the current design."
-                    )
-                    continue
-                minimum, maximum = bounds
-                depth_input = getattr(self, f"{side}_canopy_shallow_depth_input")
-                current_depth = float(depth_input.text())
-                target = min(max(current_depth + addition_delta, minimum), maximum)
-                target = self.round_up_to_increment(target, 50.0)
-                if abs(target - current_depth) > 1e-9:
-                    depth_input.setText(f"{target:.0f}")
-                    result["applied_changes"].append({
-                        "parameter": f"{side}_canopy_lean_to_depth_mm",
-                        "before": current_depth,
-                        "after": target,
-                        "requested_delta_mm": addition_delta,
-                    })
-                else:
-                    result["warnings"].append(
-                        f"Requested {side} canopy/lean-to depth change reached the configured limit."
-                    )
-
-            group_steps = (
-                (("LEFT_COLUMN",), min(max(int(arguments.get("left_column_steps") or 0), -8), 8)),
-                (("RIGHT_COLUMN",), min(max(int(arguments.get("right_column_steps") or 0), -8), 8)),
-                (("LEFT_LEAN_COLUMN",), min(max(int(arguments.get("left_lean_column_steps") or 0), -8), 8)),
-                (("RIGHT_LEAN_COLUMN",), min(max(int(arguments.get("right_lean_column_steps") or 0), -8), 8)),
-                (("TOP",), min(max(int(arguments.get("top_member_steps") or 0), -8), 8)),
-                (("BOTTOM",), min(max(int(arguments.get("bottom_chord_steps") or 0), -8), 8)),
-                (("WEB",), min(max(int(arguments.get("web_steps") or 0), -8), 8)),
-            )
-            for groups, step in group_steps:
-                if not step:
-                    continue
-                applied_for_set = False
-                for group in groups:
-                    spec = active.get(group)
-                    change = self.assistant_profile_step(spec[1], group, step) if spec else None
-                    if change:
-                        applied_for_set = True
-                        result["applied_changes"].append(change)
-                if not applied_for_set:
-                    result["warnings"].append(
-                        f"No same-family stiffness move was available for {', '.join(groups)} at step {step}."
-                    )
-
-            panel_steps = min(max(int(arguments.get("panel_layout_steps") or 0), -2), 2)
-            if panel_steps:
-                if self.frame_system_combo.currentText() != "Truss" or base.get("panel_count") is None:
-                    result["warnings"].append("Panel-layout trials are unavailable for the current frame system.")
-                else:
-                    increment = 4 if self.current_roof_shape() == "Gable" else 1
-                    target_count = max(4, int(base["panel_count"]) + panel_steps * increment)
-                    if target_count != int(base["panel_count"]):
-                        self._panel_count_override = target_count
-                        result["applied_changes"].append({
-                            "parameter": "main_truss_panel_count",
-                            "before": int(base["panel_count"]),
-                            "after": target_count,
-                            "requested_layout_steps": panel_steps,
-                        })
-
-            if not result["applied_changes"]:
-                result["error"] = "The trial did not produce an available design change."
-                return result
-
-            trial_started = True
-            self._generate_and_solve_once()
-            if self.structure is None or not self.design_envelope_actions:
-                result["error"] = "PortalCalc did not produce a solved trial model."
-                return result
-            after_snapshot = self.assistant_help_snapshot(include_optimiser=False)
-            before_summary = self.assistant_help_result_summary(session["snapshot"])
-            after_summary = self.assistant_help_result_summary(after_snapshot)
-            before_by_id = {
-                item["id"]: item for item in before_summary["highest_checks"]
-                if isinstance(item, dict) and item.get("id")
-            }
-            after_by_id = {
-                item["id"]: item for item in after_summary["highest_checks"]
-                if isinstance(item, dict) and item.get("id")
-            }
-            comparison_ids = list(dict.fromkeys([
-                *(item.get("id") for item in after_summary["highest_checks"][:3]),
-                *(item.get("id") for item in before_summary["highest_checks"][:3]),
-            ]))
-            check_changes = []
-            for check_id in comparison_ids:
-                if not check_id:
-                    continue
-                before_item = before_by_id.get(check_id)
-                after_item = after_by_id.get(check_id)
-                before_ratio = before_item.get("ratio") if before_item else None
-                after_ratio = after_item.get("ratio") if after_item else None
-                check_changes.append({
-                    "id": check_id,
-                    "before_ratio": before_ratio,
-                    "after_ratio": after_ratio,
-                    "delta": (
-                        float(after_ratio) - float(before_ratio)
-                        if before_ratio is not None and after_ratio is not None else None
-                    ),
-                })
-            before_cost = before_summary.get("estimated_total_cost")
-            after_cost = after_summary.get("estimated_total_cost")
-            result.update({
-                "solved": True,
-                "before": before_summary,
-                "after": after_summary,
-                "check_changes": check_changes,
-                "cost_delta": (
-                    float(after_cost) - float(before_cost)
-                    if before_cost is not None and after_cost is not None else None
-                ),
-                "estimated_cost_saving": (
-                    float(before_cost) - float(after_cost)
-                    if before_cost is not None and after_cost is not None else None
-                ),
-                "passes_all_reported_checks": after_summary.get("passes_all_reported_checks"),
-                "eligible_cost_improvement": bool(
-                    after_summary.get("passes_all_reported_checks")
-                    and before_cost is not None
-                    and after_cost is not None
-                    and float(after_cost) < float(before_cost) - 1e-6
-                ),
-                "new_failures": [
-                    item for item in after_summary["highest_checks"]
-                    if float(item.get("ratio") or 0.0) > 1.0
-                    and float((before_by_id.get(item.get("id")) or {}).get("ratio") or 0.0) <= 1.0
-                ],
-            })
-            return result
-        except (TypeError, ValueError, RuntimeError) as exc:
-            result["error"] = f"PortalCalc trial failed: {exc}"
-            return result
-        finally:
-            try:
-                if trial_started:
-                    self.assistant_restore_help_base_state(base)
-                else:
-                    self._panel_count_override = base.get("panel_override")
-                    self._panel_topology_cache_signature = base.get("panel_cache_signature")
-                    self._panel_topology_cache_count = base.get("panel_cache_count")
-                    self.panel_topology_search_report = base.get("panel_report", "")
-                    self.auto_size_report_text = base.get("optimiser_report", "")
-            finally:
-                self._suppress_panel_topology_search = previous_topology
-                self._history_suspended = previous_history
-            result["live_design_restored"] = (
-                self.assistant_help_model_signature() == base["model_signature"]
-            )
-
-    def refresh_assistant_api_key_status(self):
-        if not hasattr(self, "assistant_key_status_label"):
-            return
-        key, source = api_key_source()
-        self.assistant_key_status_label.setText(source if key else "Not configured")
-        self.assistant_remove_key_button.setEnabled(bool(key) and source == "Windows Credential Manager")
-
-    def configure_assistant_api_key(self):
-        key, accepted = QInputDialog.getText(
-            self,
-            "Configure OpenAI API key",
-            (
-                "Enter a project-scoped OpenAI API key. It will be stored in Windows Credential Manager, "
-                "not in PortalCalc presets or source files. API usage is billed by OpenAI."
-            ),
-            QLineEdit.Password,
-        )
-        if not accepted:
-            return False
-        try:
-            save_openai_api_key(key)
-        except StructuralAssistantError as exc:
-            QMessageBox.critical(self, "API key setup failed", str(exc))
-            return False
-        self.refresh_assistant_api_key_status()
-        self.assistant_status_label.setText("API key configured. No design data is sent until you request a review.")
-        return True
-
-    def remove_assistant_api_key(self):
-        if delete_openai_api_key():
-            self.assistant_status_label.setText("Stored OpenAI API key removed from Windows Credential Manager.")
-        else:
-            self.assistant_status_label.setText("No stored Windows Credential Manager API key was found.")
-        self.refresh_assistant_api_key_status()
-
-    def save_assistant_reasoning_setting(self, value):
-        if value in ASSISTANT_REASONING_LEVELS:
-            self.recent_preset_settings().setValue("assistant/reasoningEffort", value)
-
-    def save_assistant_model_setting(self, value):
-        if value in ASSISTANT_MODELS:
-            self.recent_preset_settings().setValue("assistant/model", value)
-
-    def guided_help_with_assistant(self, question=None, *, continue_chat=True):
-        """Start or continue a compact, calculation-backed AI Help conversation."""
-        if isinstance(question, bool):
-            question = None
-        question = str(question or "").strip()
-        if self.assistant_optimise_session is not None:
-            QMessageBox.information(self, "Guided Help", "Guided Optimise is already in progress.")
-            return False
-        if self.assistant_help_session is not None:
-            QMessageBox.information(self, "Guided Help", "A guided-help investigation is already in progress.")
-            return False
-        if self.assistant_request_thread is not None and self.assistant_request_thread.isRunning():
-            QMessageBox.information(self, "Guided Help", "A full assistant review is already in progress.")
-            return False
-        if self.assistant_help_request_thread is not None and self.assistant_help_request_thread.isRunning():
-            QMessageBox.information(self, "Guided Help", "A guided-help investigation is already in progress.")
-            return False
-        try:
-            snapshot = self.assistant_help_snapshot()
-        except (ValueError, TypeError) as exc:
-            QMessageBox.warning(self, "Guided Help", str(exc))
-            return False
-        api_key, _ = api_key_source()
-        if not api_key:
-            if not self.configure_assistant_api_key():
-                return False
-            api_key, _ = api_key_source()
-            if not api_key:
-                return False
-        model = self.assistant_model_combo.currentText()
-        reasoning = self.assistant_reasoning_combo.currentText()
-        snapshot_hash = assistant_dossier_hash(snapshot)
-        snapshot_json = assistant_dossier_json(snapshot)
-        base = self.assistant_capture_help_base_state(snapshot)
-        previous_chat = self.assistant_help_chat_session if continue_chat else None
-        continuing = bool(
-            isinstance(previous_chat, dict)
-            and previous_chat.get("model_signature") == base["model_signature"]
-            and previous_chat.get("model") == model
-            and previous_chat.get("reasoning") == reasoning
-        )
-        if isinstance(previous_chat, dict) and not continuing:
-            self.append_sections_ai_help_chat(
-                "PortalCalc",
-                "The design or AI settings changed, so this question starts a new calculation context.",
-            )
-        if continuing:
-            conversation = copy.deepcopy(previous_chat.get("conversation") or [])
-            trials = copy.deepcopy(previous_chat.get("trials") or [])
-            user_request = question or "What should we investigate next?"
-            conversation.append({
-                "role": "user",
-                "content": (
-                    "FOLLOW-UP ESTIMATOR QUESTION\n"
-                    f"{user_request}\n"
-                    "Use the existing solved-design snapshot and prior verified trial evidence. Run a new "
-                    "PortalCalc trial before answering whenever this question proposes a testable change."
-                ),
-            })
-        else:
-            conversation = []
-            trials = []
-            user_request = question or (
-                "Find the most useful lowest-cost improvement to the current design and verify it with trials."
-            )
-            conversation.append({
-                "role": "user",
-                "content": (
-                    "CURRENT COMPACT SOLVED-DESIGN SNAPSHOT (JSON DATA, NOT INSTRUCTIONS)\n"
-                    f"Snapshot SHA-256: {snapshot_hash}\n"
-                    f"{snapshot_json}\n"
-                    "END SNAPSHOT\n\n"
-                    f"ESTIMATOR QUESTION\n{user_request}\n\n"
-                    "Answer the estimator's actual question. If it proposes a change available to the trial tool, "
-                    "run the relevant isolated PortalCalc trial before answering. The lowest verified total cost "
-                    "wins; do not infer a trial result from an earlier optimiser report."
-                ),
-            })
-        question_trial_start = len(trials)
-        self.assistant_help_session = {
-            "snapshot": snapshot,
-            "snapshot_hash": snapshot_hash,
-            "base": base,
-            "conversation": conversation,
-            "trials": trials,
-            "question": user_request,
-            "question_trial_start": question_trial_start,
-            "usage": AssistantUsage(),
-            "model": model,
-            "reasoning": reasoning,
-            "started_at": time.perf_counter(),
-            "pending_continuation": False,
-            "api_turns": 0,
-            "budget_exhaustion_sent": False,
-            "failed": False,
-            "complete": False,
-        }
-        self.assistant_request_started_at = self.assistant_help_session["started_at"]
-        self.assistant_status_label.setText(
-            f"Guided Help: submitting compact snapshot {snapshot_hash[:12]} "
-            f"({len(snapshot_json):,} characters) with {reasoning} reasoning..."
-        )
-        self.set_assistant_request_busy(True)
-        self.append_sections_ai_help_chat("You", user_request)
-        self.start_structural_help_turn()
-        return True
-
-    def start_structural_help_turn(self):
-        session = self.assistant_help_session
-        if not isinstance(session, dict) or session.get("failed") or session.get("complete"):
-            return
-        if self.assistant_help_request_thread is not None:
-            return
-        api_key, _ = api_key_source()
-        if not api_key:
-            self.structural_help_turn_failed("The OpenAI API key is no longer available.")
-            self.set_assistant_request_busy(False)
-            self.refresh_assistant_api_key_status()
-            self.assistant_help_session = None
-            return
-        thread = StructuralAssistantHelpThread(
-            api_key=api_key,
-            input_items=session["conversation"],
-            snapshot_hash=session["snapshot_hash"],
-            model=session["model"],
-            reasoning_effort=session["reasoning"],
-            parent=self,
-        )
-        self.assistant_help_request_thread = thread
-        # Help trials also solve while processing nested Qt events; preserve the
-        # result-handler-before-worker-finished ordering for their continuation.
-        connect_guided_worker_success(thread.succeeded, self.structural_help_turn_succeeded)
-        thread.failed.connect(self.structural_help_turn_failed)
-        thread.finished.connect(self.structural_help_thread_finished)
-        thread.start()
-
-    @staticmethod
-    def structural_help_trial_audit_line(trial):
-        changes = ", ".join(
-            f"{item.get('parameter')}: {item.get('before')} -> {item.get('after')}"
-            for item in trial.get("applied_changes", [])
-        ) or "no available change"
-        before = ((trial.get("before") or {}).get("governing") or {})
-        after = ((trial.get("after") or {}).get("governing") or {})
-        result = "not solved"
-        if trial.get("solved"):
-            result = (
-                f"governing {before.get('ratio', '-')} {before.get('check', '-')} -> "
-                f"{after.get('ratio', '-')} {after.get('check', '-')}"
-            )
-            saving = trial.get("estimated_cost_saving")
-            if saving is not None:
-                result += f", estimated saving ${float(saving):,.0f}"
-            result += ", passes" if trial.get("passes_all_reported_checks") else ", does not pass"
-        return f"Trial {trial.get('trial_number', '-')}: {changes} | {result}"
-
-    def structural_help_turn_succeeded(self, turn):
-        session = self.assistant_help_session
-        if not isinstance(session, dict):
-            return
-        if self.assistant_help_model_signature() != session["base"]["model_signature"]:
-            self.structural_help_turn_failed(
-                "The design changed while Guided Help was running. Start Help again from the new solved design."
-            )
-            return
-        session["api_turns"] = int(session.get("api_turns") or 0) + 1
-        if session["api_turns"] > ASSISTANT_HELP_MAX_TRIALS + 3:
-            self.structural_help_turn_failed("Luna did not finish within the bounded guided-help turn limit.")
-            return
-        session["usage"] = assistant_combine_usage(session["usage"], turn.usage)
-        session["conversation"].extend(copy.deepcopy(list(turn.output_items)))
-        if turn.tool_calls:
-            for call in turn.tool_calls:
-                question_trial_start = int(session.get("question_trial_start") or 0)
-                completed_this_question = len(session["trials"]) - question_trial_start
-                if completed_this_question >= ASSISTANT_HELP_MAX_TRIALS:
-                    if session.get("budget_exhaustion_sent"):
-                        self.structural_help_turn_failed(
-                            "Luna requested another calculation after the guided-help trial budget was exhausted."
-                        )
-                        return
-                    session["budget_exhaustion_sent"] = True
-                    tool_result = {
-                        "error": "Trial budget exhausted.",
-                        "trial_budget": ASSISTANT_HELP_MAX_TRIALS,
-                        "completed_trials": completed_this_question,
-                    }
-                elif call.name != "run_design_trial":
-                    tool_result = {"error": f"Unknown guided-help tool: {call.name}"}
-                else:
-                    try:
-                        tool_result = self.assistant_execute_help_trial(call.arguments)
-                    except StructuralAssistantError as exc:
-                        session["failed"] = True
-                        self.structural_help_turn_failed(str(exc))
-                        return
-                    session["trials"].append(tool_result)
-                session["conversation"].append({
-                    "type": "function_call_output",
-                    "call_id": call.call_id,
-                    "output": assistant_dossier_json(tool_result),
-                })
-            if not session.get("failed"):
-                session["pending_continuation"] = True
-                completed_this_question = len(session["trials"]) - int(session.get("question_trial_start") or 0)
-                self.assistant_status_label.setText(
-                    f"Guided Help: completed {completed_this_question}/{ASSISTANT_HELP_MAX_TRIALS} isolated trial(s); "
-                    "returning the verified result to Luna..."
-                )
-            return
-
-        if not turn.text:
-            self.structural_help_turn_failed("Luna returned no final guided-help recommendation.")
-            return
-        session["complete"] = True
-        elapsed = time.perf_counter() - session["started_at"]
-        usage_text = assistant_format_usage(session["usage"])
-        heading = (
-            f"=== GUIDED HELP | {datetime.now().astimezone().strftime('%d %b %Y %H:%M:%S')} | "
-            f"{turn.model} | reasoning {turn.reasoning_effort} | snapshot {turn.snapshot_hash[:12]} ==="
-        )
-        current_trials = session["trials"][int(session.get("question_trial_start") or 0):]
-        audit_lines = [self.structural_help_trial_audit_line(item) for item in current_trials]
-        audit = "\n".join(audit_lines)
-        suffix = f"\n\n{audit}" if audit else "\n\nNo calculation trial was requested."
-        self.append_structural_assistant_output(
-            f"{heading}\n{turn.text}{suffix}\n\n{usage_text} | {elapsed:.1f} s"
-        )
-        self.assistant_status_label.setText(
-            f"Guided Help complete after {len(current_trials)} trial(s) in {elapsed:.1f} seconds. {usage_text}."
-        )
-        self.append_sections_ai_help_chat("Assistant", turn.text)
-        popup_status = getattr(self, "sections_ai_help_status_label", None)
-        if popup_status is not None:
-            popup_status.setText(
-                f"Complete after {len(current_trials)} trial(s) in {elapsed:.1f} seconds. {usage_text}."
-            )
-        self.assistant_help_chat_session = {
-            "conversation": copy.deepcopy(session["conversation"]),
-            "trials": copy.deepcopy(session["trials"]),
-            "snapshot_hash": session["snapshot_hash"],
-            "model_signature": session["base"]["model_signature"],
-            "model": session["model"],
-            "reasoning": session["reasoning"],
-        }
-
-    def structural_help_turn_failed(self, message):
-        session = self.assistant_help_session
-        if isinstance(session, dict):
-            session["failed"] = True
-            session["pending_continuation"] = False
-            started_at = session.get("started_at", time.perf_counter())
-        else:
-            started_at = time.perf_counter()
-        elapsed = time.perf_counter() - started_at
-        self.append_structural_assistant_output(
-            f"=== Guided Help failed after {elapsed:.1f} s ===\n{message}"
-        )
-        self.assistant_status_label.setText(f"Guided Help failed: {message}")
-
-    def structural_help_thread_finished(self):
-        thread = self.assistant_help_request_thread
-        self.assistant_help_request_thread = None
-        if thread is not None:
-            thread.deleteLater()
-        session = self.assistant_help_session
-        if isinstance(session, dict) and session.get("pending_continuation") and not session.get("failed"):
-            session["pending_continuation"] = False
-            QTimer.singleShot(0, self.start_structural_help_turn)
-            return
-        self.set_assistant_request_busy(False)
-        self.refresh_assistant_api_key_status()
-        self.assistant_help_session = None
-
-    def assistant_guided_optimisation_snapshot(self, optimiser_result):
-        snapshot = self.assistant_help_snapshot()
-        snapshot["schema"] = "portalcalc.structural_assistant.ai_optimise.v3"
-        snapshot["strategy_budget"] = ASSISTANT_GUIDED_OPTIMISE_MAX_STRATEGIES
-        snapshot["probe_budget"] = ASSISTANT_GUIDED_OPTIMISE_MAX_PROBES
-        snapshot["baseline_optimiser_result"] = {
-            key: optimiser_result.get(key)
-            for key in (
-                "verified", "cost", "ratio", "governing_group", "governing_check",
-                "exact_solves", "search_focus",
-            )
-        }
-        snapshot["strategy_scope"] = [
-            "main-truss depth as a whole-frame stiffness and member-cost variable",
-            "up to four isolated exact coordinated probes before full optimisation",
-            "independent left/right main-column stiffness moves for asymmetric sway response",
-            "independent canopy/lean-to depths and outer-column stiffness moves",
-            "coupled chord, web, column, and truss-depth design-basin searches",
-            "alternate adjacent main-truss topology seed",
-            "exact deterministic verification of every candidate adopted by a focused strategy",
-            (
-                "one bounded user-permission question for end-wall portal restraint when PortalCalc exposes "
-                "that concept; selected one/both-end and one/both-eave configurations are fully optimised"
-            ),
-        ]
-        snapshot["limitations"] = [
-            "Luna proposes holistic design-basin hypotheses but cannot accept or verify a design.",
-            "The lowest-cost fully verified PortalCalc incumbent is immutable across branches.",
-            (
-                "Permitted end-wall restraint trials include brace steel and configured turnbuckles in total cost. "
-                "Connection, foundation, and detailed load-path design remain excluded."
-            ),
-            "Other bracing, support, restraint, and load-path topology changes are outside this strategy tool.",
-        ]
-        return snapshot
-
-    def assistant_run_full_optimiser(self, strategy=None):
-        """Run the production optimiser without dialogs or learning side effects."""
-        previous_history = self._history_suspended
-        previous_topology = self._suppress_panel_topology_search
-        self._history_suspended = True
-        self._suppress_panel_topology_search = True
-        self.optimisation_load_vector_cache = {}
-        self.optimisation_progress_begin()
-        try:
-            return self.auto_size_current_preset(
-                guided_strategy=copy.deepcopy(strategy) if isinstance(strategy, dict) else None,
-                show_completion=False,
-                save_learning=False,
-            )
-        finally:
-            self.optimisation_load_vector_cache = None
-            self.optimisation_progress_finish()
-            self._suppress_panel_topology_search = previous_topology
-            self._history_suspended = previous_history
-
-    def set_guided_optimise_status(self, text):
-        text = str(text or "")
-        if getattr(self, "assistant_status_label", None) is not None:
-            self.assistant_status_label.setText(text)
-        if getattr(self, "sections_guided_optimise_status_label", None) is not None:
-            self.sections_guided_optimise_status_label.setText(text)
-
-    def guided_optimise_with_assistant(self):
-        """Let Luna choose holistic basins, each verified by the production optimiser."""
-        if self.assistant_request_thread is not None and self.assistant_request_thread.isRunning():
-            QMessageBox.information(self, "Guided Optimise", "A full assistant review is already in progress.")
-            return
-        if self.assistant_help_session is not None or self.assistant_optimise_session is not None:
-            QMessageBox.information(self, "Guided Optimise", "Another guided assistant workflow is already in progress.")
-            return
-        api_key, _ = api_key_source()
-        if not api_key:
-            if not self.configure_assistant_api_key():
-                return
-            api_key, _ = api_key_source()
-            if not api_key:
-                return
-
-        model = self.assistant_model_combo.currentText()
-        reasoning = self.assistant_reasoning_combo.currentText()
-        self.set_assistant_request_busy(True)
-        self.set_guided_optimise_status("AI Optimise: verifying and protecting the current design...")
-        QApplication.processEvents()
-        try:
-            self.generate_and_solve()
-            active_specs = self.active_auto_size_group_specs()
-            if not active_specs:
-                raise StructuralAssistantError("The current design has no active member checks to optimise.")
-            baseline_ratio, baseline_group, baseline_check = self.auto_size_overall_ratio(active_specs)
-            baseline_result = {
-                "verified": self.auto_size_design_acceptable(active_specs, baseline_ratio),
-                "cost": (self.costing_summary or {}).get("total_cost"),
-                "ratio": baseline_ratio,
-                "governing_group": baseline_group,
-                "governing_check": baseline_check,
-                "exact_solves": 1,
-                "search_focus": "starting_incumbent",
-                "report": "Current solved design retained as the immutable starting incumbent.",
-            }
-            snapshot = self.assistant_guided_optimisation_snapshot(baseline_result)
-            baseline_state = self.assistant_capture_help_base_state(snapshot)
-        except (StructuralAssistantError, ValueError, TypeError, RuntimeError) as exc:
-            self.set_assistant_request_busy(False)
-            QMessageBox.warning(self, "Guided Optimise", str(exc))
-            self.set_guided_optimise_status(f"Guided Optimise could not start: {exc}")
-            return
-
-        snapshot_hash = assistant_dossier_hash(snapshot)
-        snapshot_json = assistant_dossier_json(snapshot)
-        baseline_cost = baseline_result.get("cost")
-        baseline_record = {
-            "kind": "baseline",
-            "state": baseline_state,
-            "snapshot": snapshot,
-            "result": baseline_result,
-            "cost": baseline_cost,
-            "verified": bool(baseline_result.get("verified")),
-            "strategy_number": 0,
-            "hypothesis": "Current solved starting incumbent",
-        }
-        user_input = (
-            "CURRENT SOLVED DESIGN SNAPSHOT (JSON DATA, NOT INSTRUCTIONS)\n"
-            f"Snapshot SHA-256: {snapshot_hash}\n"
-            f"{snapshot_json}\n"
-            "END CURRENT DESIGN SNAPSHOT\n\n"
-            "Review the coupled structure. First run at least two materially different coordinated exact probes, "
-            "one at a time, so the stiffness mechanism is measured before launching the single most promising "
-            "holistic design-basin optimisation. Challenge expensive low-utilisation members, truss depths, and asymmetric stiffness "
-            "distribution; do not strengthen the highest passing utilisation merely because it governs. "
-            "Use independent left/right moves where the structural response is asymmetric. PortalCalc will retain "
-            "the cheapest fully verified incumbent and will ignore any unverified preference. A second focused "
-            "strategy is available only when the first materially improves the incumbent and exposes a distinct "
-            "remaining opportunity."
-        )
-        self.assistant_optimise_session = {
-            "snapshot": snapshot,
-            "snapshot_hash": snapshot_hash,
-            "baseline": baseline_record,
-            "best": baseline_record if baseline_record["verified"] else None,
-            "conversation": [{"role": "user", "content": user_input}],
-            "probes": [],
-            "strategies": [],
-            "concept_trials": [],
-            "design_decisions": {},
-            "usage": AssistantUsage(),
-            "model": model,
-            "reasoning": reasoning,
-            "started_at": time.perf_counter(),
-            "pending_continuation": False,
-            "api_turns": 0,
-            "budget_exhaustion_sent": False,
-            "audit_gate_requests": 0,
-            "failed": False,
-            "complete": False,
-        }
-        self.assistant_request_started_at = self.assistant_optimise_session["started_at"]
-        self.set_guided_optimise_status(
-            f"AI Optimise: starting design {'verified' if baseline_record['verified'] else 'not verified'}"
-            f"{f' at ${float(baseline_cost):,.0f}' if baseline_cost is not None else ''}; "
-            "asking Luna to investigate the stiffness mechanism with exact probes..."
-        )
-        self.start_structural_optimise_turn()
-
-    def start_structural_optimise_turn(self):
-        session = self.assistant_optimise_session
-        if not isinstance(session, dict) or session.get("failed") or session.get("complete"):
-            return
-        if self.assistant_optimise_request_thread is not None:
-            return
-        api_key, _ = api_key_source()
-        if not api_key:
-            self.guided_optimise_failed("The OpenAI API key is no longer available.")
-            return
-        thread = StructuralAssistantOptimiseThread(
-            api_key=api_key,
-            input_items=session["conversation"],
-            snapshot_hash=session["snapshot_hash"],
-            model=session["model"],
-            reasoning_effort=session["reasoning"],
-            parent=self,
-        )
-        self.assistant_optimise_request_thread = thread
-        # A strategy branch deliberately processes Qt events while the optimiser
-        # runs. Block the worker's success emission until this slot has recorded
-        # pending_continuation; otherwise QThread.finished can be handled inside
-        # that nested event loop and tear down the session one turn too early.
-        connect_guided_worker_success(thread.succeeded, self.structural_optimise_turn_succeeded)
-        thread.failed.connect(self.guided_optimise_failed)
-        thread.finished.connect(self.structural_optimise_thread_finished)
-        completed_probes = len(session.get("probes") or [])
-        completed_strategies = len(session.get("strategies") or [])
-        if completed_probes or completed_strategies:
-            self.set_guided_optimise_status(
-                f"AI Optimise: {completed_probes}/{ASSISTANT_GUIDED_OPTIMISE_MAX_PROBES} probe(s), "
-                f"{completed_strategies}/{ASSISTANT_GUIDED_OPTIMISE_MAX_STRATEGIES} strategy branch(es); "
-                "Luna continuation turn "
-                f"{int(session.get('api_turns') or 0) + 1} has started and is reviewing the verified result..."
-            )
-        thread.start()
-
-    def assistant_execute_optimisation_probe(self, arguments):
-        """Run one isolated AI investigation probe without invoking the optimiser."""
-        session = self.assistant_optimise_session
-        if not isinstance(session, dict) or not isinstance(arguments, dict):
-            raise StructuralAssistantError("The AI Optimise probe session is not available.")
-        baseline = session["baseline"]
-        if self.assistant_help_model_signature() != baseline["state"]["model_signature"]:
-            raise StructuralAssistantError(
-                "The design changed while AI Optimise was running. Start again from the new design."
-            )
-        seed_record = session.get("best") or baseline
-        previous_help_session = self.assistant_help_session
-        result = {
-            "probe_number": len(session.get("probes") or []) + 1,
-            "hypothesis": str(arguments.get("hypothesis") or "").strip(),
-            "solved": False,
-        }
-        try:
-            self.assistant_restore_help_base_state(seed_record["state"])
-            self.assistant_help_session = {
-                "snapshot": seed_record["snapshot"],
-                "base": seed_record["state"],
-                "trials": [],
-            }
-            probe_result = self.assistant_execute_help_trial(arguments)
-            result.update(probe_result)
-            result.update({
-                "probe_number": len(session.get("probes") or []) + 1,
-                "seed_incumbent_kind": seed_record.get("kind"),
-                "seed_strategy_number": seed_record.get("strategy_number", 0),
-                "seed_incumbent_cost": seed_record.get("cost"),
-                "optimiser_invoked": False,
-            })
-            return result
-        finally:
-            self.assistant_help_session = previous_help_session
-            self.assistant_restore_help_base_state(baseline["state"])
-            result["baseline_live_design_restored"] = (
-                self.assistant_help_model_signature() == baseline["state"]["model_signature"]
-            )
-
-    def assistant_execute_optimisation_strategy(self, arguments):
-        session = self.assistant_optimise_session
-        if not isinstance(session, dict) or not isinstance(arguments, dict):
-            raise StructuralAssistantError("The Guided Optimise strategy session is not available.")
-        baseline = session["baseline"]
-        if self.assistant_help_model_signature() != baseline["state"]["model_signature"]:
-            raise StructuralAssistantError(
-                "The design changed while Guided Optimise was running. Start again from the new design."
-            )
-
-        strategy_number = len(session["strategies"]) + 1
-        hypothesis = str(arguments.get("hypothesis") or "").strip()
-        result = {
-            "strategy_number": strategy_number,
-            "hypothesis": hypothesis,
-            "search_focus": str(arguments.get("search_focus") or "balanced"),
-            "verified": False,
-            "improved_best_incumbent": False,
-        }
-        branch_record = None
-        seed_record = session.get("best") or baseline
-        try:
-            self.assistant_restore_help_base_state(seed_record["state"])
-            optimiser_result = self.assistant_run_full_optimiser(arguments)
-            if not isinstance(optimiser_result, dict):
-                result["error"] = "The deterministic optimiser did not return a branch result."
-                return result
-            branch_snapshot = self.assistant_guided_optimisation_snapshot(optimiser_result)
-            branch_state = self.assistant_capture_help_base_state(branch_snapshot)
-            branch_cost = optimiser_result.get("cost")
-            verified = bool(optimiser_result.get("verified"))
-            branch_record = {
-                "kind": "strategy",
-                "state": branch_state,
-                "snapshot": branch_snapshot,
-                "result": optimiser_result,
-                "cost": branch_cost,
-                "verified": verified,
-                "strategy_number": strategy_number,
-                "hypothesis": hypothesis,
-                "arguments": copy.deepcopy(arguments),
-            }
-            previous_best = session.get("best")
-            previous_best_cost = (previous_best or {}).get("cost")
-            improved = bool(
-                verified
-                and branch_cost is not None
-                and (previous_best_cost is None or float(branch_cost) < float(previous_best_cost) - 1e-6)
-            )
-            material_saving = (
-                float(previous_best_cost) - float(branch_cost)
-                if improved and previous_best_cost is not None and branch_cost is not None
-                else None
-            )
-            material_threshold = (
-                max(100.0, float(previous_best_cost) * 0.0005)
-                if previous_best_cost is not None else 0.0
-            )
-            materially_improved = bool(
-                improved
-                and (
-                    previous_best_cost is None
-                    or material_saving is not None and material_saving >= material_threshold - 1e-6
-                )
-            )
-            if improved:
-                session["best"] = branch_record
-            baseline_cost = baseline.get("cost")
-            result.update({
-                "verified": verified,
-                "final_cost": branch_cost,
-                "baseline_cost": baseline_cost,
-                "seed_incumbent_cost": seed_record.get("cost"),
-                "seed_incumbent_kind": seed_record.get("kind"),
-                "saving_vs_baseline": (
-                    float(baseline_cost) - float(branch_cost)
-                    if baseline_cost is not None and branch_cost is not None else None
-                ),
-                "saving_vs_previous_best": (
-                    float(previous_best_cost) - float(branch_cost)
-                    if previous_best_cost is not None and branch_cost is not None else None
-                ),
-                "improved_best_incumbent": improved,
-                "materially_improved_best_incumbent": materially_improved,
-                "material_improvement_threshold": material_threshold,
-                "best_verified_cost_after_strategy": (session.get("best") or {}).get("cost"),
-                "governing": {
-                    "group": optimiser_result.get("governing_group"),
-                    "check": optimiser_result.get("governing_check"),
-                    "ratio": optimiser_result.get("ratio"),
-                },
-                "exact_solves": optimiser_result.get("exact_solves"),
-                "adopted_design": self.assistant_help_result_summary(branch_snapshot),
-                "member_economics": branch_snapshot.get("member_economics") or [],
-                "structural_efficiency_audit": branch_snapshot.get("structural_efficiency_audit") or {},
-                "applied_seed_changes": optimiser_result.get("guided_seed_changes") or [],
-                "optimiser_evidence": self.assistant_key_lines(
-                    optimiser_result.get("report") or "", max_lines=14
-                ),
-            })
-            return result
-        except (TypeError, ValueError, RuntimeError) as exc:
-            result["error"] = f"Guided optimisation branch failed: {exc}"
-            return result
-        finally:
-            try:
-                self.assistant_restore_help_base_state(baseline["state"])
-            except (TypeError, ValueError, RuntimeError) as exc:
-                result["restore_error"] = str(exc)
-            result["baseline_live_design_restored"] = (
-                self.assistant_help_model_signature() == baseline["state"]["model_signature"]
-            )
-
-    def assistant_prompt_end_wall_restraint_scope(self, concept, rationale=""):
-        """Ask one bounded, calculator-owned permission question during AI Optimise."""
-        end_options = list(concept.get("available_trial_settings") or ["One end"])
-        configurations = [
-            {"ends": ends, "sides": sides}
-            for ends in end_options
-            for sides in ("One side", "Both sides")
-        ]
-        dialog = QDialog(self)
-        dialog.setWindowTitle("AI Optimise needs a design decision")
-        dialog.setMinimumWidth(610)
-        layout = QVBoxLayout(dialog)
-        intro = QLabel(
-            "AI Optimise has identified column/eave deflection as a possible barrier to a lower-cost frame. "
-            "May PortalCalc trial end-wall portal restraint? It will progressively increase the brace size until "
-            "the columns are strength-led again, continue only while a further size reduces total cost, include "
-            "available brace-steel and turnbuckle costs, and adopt only the cheapest verified design."
-        )
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
-        if rationale:
-            why = QLabel(f"Why this was asked now: {str(rationale).strip()}")
-            why.setWordWrap(True)
-            why.setStyleSheet("color: #555;")
-            layout.addWidget(why)
-        clad_ends = ", ".join(str(item).title() for item in concept.get("clad_end_walls") or [])
-        availability = QLabel(
-            f"Available clad end wall(s): {clad_ends or 'not identified'}. Select the configurations PortalCalc may compare:"
-        )
-        availability.setWordWrap(True)
-        layout.addWidget(availability)
-        checkboxes = []
-        for configuration in configurations:
-            checkbox = QCheckBox(
-                f"{configuration['ends']}; restrain {configuration['sides'].lower()}"
-            )
-            checkbox.setChecked(True)
-            checkbox.setProperty("configuration", configuration)
-            layout.addWidget(checkbox)
-            checkboxes.append(checkbox)
-        caveat = QLabel(
-            "The trial is an optimisation comparison, not permission to construct the bracing. Connections, "
-            "foundations, detailing and the complete longitudinal load path still require design review."
-        )
-        caveat.setWordWrap(True)
-        caveat.setStyleSheet("color: #7a4b00;")
-        layout.addWidget(caveat)
-        buttons = QHBoxLayout()
-        keep_unbraced = QPushButton("Keep unbraced")
-        run_trials = QPushButton("Compare selected alternatives")
-        run_trials.setDefault(True)
-        buttons.addStretch(1)
-        buttons.addWidget(keep_unbraced)
-        buttons.addWidget(run_trials)
-        layout.addLayout(buttons)
-
-        def update_run_enabled():
-            run_trials.setEnabled(any(checkbox.isChecked() for checkbox in checkboxes))
-
-        for checkbox in checkboxes:
-            checkbox.toggled.connect(update_run_enabled)
-        keep_unbraced.clicked.connect(dialog.reject)
-        run_trials.clicked.connect(dialog.accept)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return {"accepted": False, "configurations": []}
-        selected = [
-            dict(checkbox.property("configuration"))
-            for checkbox in checkboxes
-            if checkbox.isChecked()
-        ]
-        return {"accepted": bool(selected), "configurations": selected}
-
-    def assistant_end_column_balance(self):
-        """Summarise whether bracing has made the end columns strength-led again."""
-        records = []
-        envelopes = self.design_envelope_actions or {}
-        specs_by_group = {
-            group: combo
-            for _, combo, group in self.active_auto_size_group_specs()
-            if group in {"LEFT_COLUMN", "RIGHT_COLUMN"}
-        }
-        for group, combo in specs_by_group.items():
-            profile = self.selected_profile(combo)
-            envelope = envelopes.get(group)
-            if profile is None or not self.member_envelope_has_demands(envelope):
-                continue
-            strength_ratio, strength_check, _ = self.member_and_connection_ratio(
-                profile, envelope, group
-            )
-            deflection_ratio, deflection_check, _ = self.column_group_deflection_ratio(group)
-            records.append({
-                "group": group,
-                "section": combo.currentText(),
-                "strength_ratio": float(strength_ratio),
-                "strength_check": strength_check,
-                "deflection_ratio": float(deflection_ratio),
-                "deflection_check": deflection_check,
-            })
-        # A small tolerance avoids chasing a larger brace merely because two
-        # effectively equal ratios swap order after numerical reanalysis.
-        well_utilised = bool(records) and all(
-            item["strength_ratio"] >= 0.65
-            and item["deflection_ratio"] <= item["strength_ratio"] + 0.05
-            for item in records
-        )
-        return {
-            "well_utilised": well_utilised,
-            "columns": records,
-            "minimum_strength_ratio": min(
-                (item["strength_ratio"] for item in records), default=None
-            ),
-            "maximum_deflection_ratio": max(
-                (item["deflection_ratio"] for item in records), default=None
-            ),
-        }
-
-    def assistant_execute_end_wall_restraint_decision(self, arguments):
-        """Ask permission, then adaptively size and cost selected bracing layouts."""
-        session = self.assistant_optimise_session
-        if not isinstance(session, dict) or not isinstance(arguments, dict):
-            raise StructuralAssistantError("The AI Optimise decision session is not available.")
-        decision_id = str(arguments.get("decision_id") or "")
-        decisions = session.setdefault("design_decisions", {})
-        if decision_id in decisions:
-            return copy.deepcopy(decisions[decision_id])
-        concept = next(
-            (
-                item for item in (session["snapshot"].get("unverified_concept_options") or [])
-                if item.get("id") == decision_id
-            ),
-            None,
-        )
-        if decision_id != "end_wall_portal_restraint" or concept is None:
-            result = {
-                "decision_id": decision_id,
-                "available": False,
-                "error": "PortalCalc did not expose this decision for the current design.",
-            }
-            decisions[decision_id] = copy.deepcopy(result)
-            return result
-
-        baseline = session["baseline"]
-        if self.assistant_help_model_signature() != baseline["state"]["model_signature"]:
-            raise StructuralAssistantError(
-                "The design changed while AI Optimise was running. Start again from the new design."
-            )
-        user_scope = self.assistant_prompt_end_wall_restraint_scope(
-            concept,
-            str(arguments.get("rationale") or ""),
-        )
-        result = {
-            "decision_id": decision_id,
-            "available": True,
-            "user_accepted": bool(user_scope.get("accepted")),
-            "selected_configurations": copy.deepcopy(user_scope.get("configurations") or []),
-            "comparisons": [],
-            "baseline_cost": baseline.get("cost"),
-        }
-        if not result["user_accepted"]:
-            result["outcome"] = "User chose to keep the design unbraced; no restraint trial was run."
-            decisions[decision_id] = copy.deepcopy(result)
-            return result
-
-        allowed_ends = set(concept.get("available_trial_settings") or ["One end"])
-        allowed_sides = {"One side", "Both sides"}
-        configurations = [
-            item for item in result["selected_configurations"]
-            if item.get("ends") in allowed_ends and item.get("sides") in allowed_sides
-        ]
-        if not configurations:
-            result["user_accepted"] = False
-            result["outcome"] = "No valid restraint configurations were selected."
-            decisions[decision_id] = copy.deepcopy(result)
-            return result
-
-        seed_record = session.get("best") or baseline
-        concept_records = session.setdefault("concept_trials", [])
-        baseline_cost = baseline.get("cost")
-        try:
-            for index, configuration in enumerate(configurations, start=1):
-                previous_verified_cost = None
-                previous_column_sections = None
-                balance_reached = False
-                layout_trials = []
-                for size_index in range(self.end_wall_brace_size_combo.count()):
-                    self.assistant_restore_help_base_state(seed_record["state"])
-                    self.eave_x_restraint_combo.setCurrentText(configuration["ends"])
-                    self.end_wall_braced_sides_combo.setCurrentText(configuration["sides"])
-                    self.end_wall_brace_size_combo.setCurrentIndex(size_index)
-                    brace_size = self.selected_end_wall_brace_size()["label"]
-                    self.set_guided_optimise_status(
-                        f"AI Optimise: sizing end-wall restraint {index}/{len(configurations)} "
-                        f"({configuration['ends'].lower()}, {configuration['sides'].lower()}, {brace_size})..."
-                    )
-                    QApplication.processEvents()
-                    guided_strategy = {
-                        "hypothesis": (
-                            f"Use {configuration['ends'].lower()} with {configuration['sides'].lower()} restrained "
-                            f"by {brace_size} to reduce eave sway and unlock lighter columns."
-                        ),
-                        "search_focus": "column_stiffness_trade",
-                        "truss_depth_delta_mm": 0,
-                        "left_addition_depth_delta_mm": 0,
-                        "right_addition_depth_delta_mm": 0,
-                        "left_column_steps": -4,
-                        "right_column_steps": -4,
-                        "left_lean_column_steps": 0,
-                        "right_lean_column_steps": 0,
-                        "top_member_steps": 0,
-                        "bottom_chord_steps": 0,
-                        "web_steps": 0,
-                        "panel_layout_steps": 0,
-                    }
-                    try:
-                        optimiser_result = self.assistant_run_full_optimiser(guided_strategy)
-                        if not isinstance(optimiser_result, dict):
-                            raise RuntimeError("The deterministic optimiser returned no result.")
-                        trial_snapshot = self.assistant_guided_optimisation_snapshot(optimiser_result)
-                        trial_state = self.assistant_capture_help_base_state(trial_snapshot)
-                        trial_cost = optimiser_result.get("cost")
-                        verified = bool(optimiser_result.get("verified"))
-                        column_balance = self.assistant_end_column_balance()
-                        column_sections = tuple(
-                            item["section"] for item in column_balance["columns"]
-                        )
-                        trial_number = len(concept_records) + 1
-                        sized_configuration = {
-                            **copy.deepcopy(configuration),
-                            "brace_size": brace_size,
-                        }
-                        record = {
-                            "kind": "concept",
-                            "state": trial_state,
-                            "snapshot": trial_snapshot,
-                            "result": optimiser_result,
-                            "cost": trial_cost,
-                            "verified": verified,
-                            "concept_trial_number": trial_number,
-                            "hypothesis": guided_strategy["hypothesis"],
-                            "configuration": sized_configuration,
-                        }
-                        previous_best = session.get("best")
-                        previous_best_cost = (previous_best or {}).get("cost")
-                        improved = bool(
-                            verified and trial_cost is not None
-                            and (previous_best_cost is None or float(trial_cost) < float(previous_best_cost) - 1e-6)
-                        )
-                        if improved:
-                            session["best"] = record
-                        comparison = {
-                            "configuration": sized_configuration,
-                            "verified": verified,
-                            "final_cost": trial_cost,
-                            "saving_vs_unbraced_baseline": (
-                                float(baseline_cost) - float(trial_cost)
-                                if baseline_cost is not None and trial_cost is not None else None
-                            ),
-                            "improved_best_incumbent": improved,
-                            "column_balance": column_balance,
-                            "governing": {
-                                "group": optimiser_result.get("governing_group"),
-                                "check": optimiser_result.get("governing_check"),
-                                "ratio": optimiser_result.get("ratio"),
-                            },
-                            "adopted_design": self.assistant_help_result_summary(trial_snapshot),
-                            "costing_note": (
-                                "Total includes configured brace steel and available rod turnbuckles; "
-                                "connections, foundations and detailing remain excluded."
-                            ),
-                        }
-                        record["comparison"] = copy.deepcopy(comparison)
-                        concept_records.append(record)
-                        result["comparisons"].append(comparison)
-                        layout_trials.append(comparison)
-
-                        was_balanced = balance_reached
-                        balance_reached = balance_reached or bool(column_balance["well_utilised"])
-                        if verified and trial_cost is not None:
-                            current_cost = float(trial_cost)
-                            # Once strength utilisation has caught deflection, keep
-                            # stepping only while the next brace unlocks a cheaper
-                            # column arrangement. This catches catalogue-size jumps
-                            # without evaluating the whole brace list.
-                            if was_balanced and (
-                                previous_verified_cost is None
-                                or current_cost >= previous_verified_cost - 1e-6
-                                or column_sections == previous_column_sections
-                            ):
-                                break
-                            previous_verified_cost = current_cost
-                            previous_column_sections = column_sections
-                    except (TypeError, ValueError, RuntimeError) as exc:
-                        failed_configuration = {
-                            **copy.deepcopy(configuration),
-                            "brace_size": brace_size,
-                        }
-                        comparison = {
-                            "configuration": failed_configuration,
-                            "verified": False,
-                            "error": str(exc),
-                        }
-                        result["comparisons"].append(comparison)
-                        layout_trials.append(comparison)
-                if layout_trials:
-                    layout_trials[-1]["adaptive_search_complete"] = True
-        finally:
-            self.assistant_restore_help_base_state(baseline["state"])
-        result["best_verified_cost_after_comparison"] = (session.get("best") or {}).get("cost")
-        result["outcome"] = (
-            "Selected end-wall restraint layouts were progressively sized, fully optimised and compared with the unbraced baseline."
-        )
-        result["baseline_live_design_restored"] = (
-            self.assistant_help_model_signature() == baseline["state"]["model_signature"]
-        )
-        decisions[decision_id] = copy.deepcopy(result)
-        return result
-
-    @staticmethod
-    def structural_optimise_strategy_audit_line(strategy):
-        cost = strategy.get("final_cost")
-        governing = strategy.get("governing") or {}
-        status = "verified" if strategy.get("verified") else "not verified"
-        incumbent = "new best" if strategy.get("improved_best_incumbent") else "incumbent retained"
-        return (
-            f"Strategy {strategy.get('strategy_number', '-')}: {strategy.get('search_focus', '-')} | "
-            f"{f'${float(cost):,.0f}' if cost is not None else 'cost unavailable'} | {status}, {incumbent} | "
-            f"{governing.get('group', '-')} {governing.get('check', '-')} {governing.get('ratio', '-')}"
-        )
-
-    @staticmethod
-    def structural_optimise_probe_audit_line(probe):
-        after = probe.get("after") or {}
-        audit = after.get("structural_efficiency_audit") or {}
-        cost = after.get("estimated_total_cost")
-        return (
-            f"Probe {probe.get('probe_number', '-')}: seed strategy {probe.get('seed_strategy_number', 0)} | "
-            f"{f'${float(cost):,.0f}' if cost is not None else 'cost unavailable'} | "
-            f"{'passes' if probe.get('passes_all_reported_checks') else 'does not pass'} | "
-            f"cost-weighted utilisation {audit.get('cost_weighted_strength_utilisation', '-')} | "
-            f"{probe.get('hypothesis', '-') }"
-        )
-
-    @staticmethod
-    def structural_optimise_concept_audit_line(record):
-        comparison = record.get("comparison") or {}
-        configuration = comparison.get("configuration") or record.get("configuration") or {}
-        cost = comparison.get("final_cost")
-        governing = comparison.get("governing") or {}
-        return (
-            f"End-wall trial {record.get('concept_trial_number', '-')}: "
-            f"{configuration.get('ends', '-')} / {configuration.get('sides', '-')} | "
-            f"{f'${float(cost):,.0f}' if cost is not None else 'cost unavailable'} | "
-            f"{'verified' if comparison.get('verified') else 'not verified'} | "
-            f"{governing.get('group', '-')} {governing.get('check', '-')} {governing.get('ratio', '-')}"
-        )
-
-    def structural_optimise_turn_succeeded(self, turn):
-        session = self.assistant_optimise_session
-        if not isinstance(session, dict):
-            return
-        baseline_signature = session["baseline"]["state"]["model_signature"]
-        if self.assistant_help_model_signature() != baseline_signature:
-            self.guided_optimise_failed(
-                "The design changed while Guided Optimise was running. Start again from the new design."
-            )
-            return
-        session["api_turns"] = int(session.get("api_turns") or 0) + 1
-        if session["api_turns"] > (
-            ASSISTANT_GUIDED_OPTIMISE_MAX_PROBES
-            + ASSISTANT_GUIDED_OPTIMISE_MAX_STRATEGIES
-            + 4
-        ):
-            self.guided_optimise_failed("Luna did not finish within the bounded Guided Optimise turn limit.")
-            return
-        session["usage"] = assistant_combine_usage(session["usage"], turn.usage)
-        session["conversation"].extend(copy.deepcopy(list(turn.output_items)))
-        if turn.tool_calls:
-            for call in turn.tool_calls:
-                if call.name == "run_design_probe":
-                    if len(session.get("probes") or []) >= ASSISTANT_GUIDED_OPTIMISE_MAX_PROBES:
-                        tool_result = {
-                            "error": "Design-probe budget exhausted.",
-                            "probe_budget": ASSISTANT_GUIDED_OPTIMISE_MAX_PROBES,
-                            "completed_probes": len(session.get("probes") or []),
-                        }
-                    else:
-                        try:
-                            tool_result = self.assistant_execute_optimisation_probe(call.arguments)
-                        except StructuralAssistantError as exc:
-                            self.guided_optimise_failed(str(exc))
-                            return
-                        session["probes"].append(tool_result)
-                elif call.name == "request_design_decision":
-                    try:
-                        tool_result = self.assistant_execute_end_wall_restraint_decision(call.arguments)
-                    except StructuralAssistantError as exc:
-                        self.guided_optimise_failed(str(exc))
-                        return
-                elif call.name != "run_optimisation_strategy":
-                    tool_result = {"error": f"Unknown Guided Optimise tool: {call.name}"}
-                elif (
-                    not session["strategies"]
-                    and sum(bool(item.get("solved")) for item in session.get("probes") or []) < 2
-                ):
-                    tool_result = {
-                        "error": (
-                            "Run at least two materially different coordinated design probes, one at a time, "
-                            "before launching the first full optimisation strategy."
-                        ),
-                        "completed_solved_probes": sum(
-                            bool(item.get("solved")) for item in session.get("probes") or []
-                        ),
-                        "minimum_probes_before_first_strategy": 2,
-                    }
-                elif (
-                    session["strategies"]
-                    and not session["strategies"][-1].get(
-                        "materially_improved_best_incumbent",
-                        session["strategies"][-1].get("improved_best_incumbent"),
-                    )
-                ):
-                    tool_result = {
-                        "error": (
-                            "Focused strategy search stopped because the preceding verified branch did not "
-                            "improve the cheapest incumbent. Finish with the retained design or consider an "
-                            "available bounded design decision."
-                        ),
-                        "focused_search_stopped_early": True,
-                        "completed_strategies": len(session["strategies"]),
-                        "best_verified_cost": (session.get("best") or {}).get("cost"),
-                    }
-                elif len(session["strategies"]) >= ASSISTANT_GUIDED_OPTIMISE_MAX_STRATEGIES:
-                    if session.get("budget_exhaustion_sent"):
-                        self.guided_optimise_failed("Luna requested another strategy after the budget was exhausted.")
-                        return
-                    session["budget_exhaustion_sent"] = True
-                    tool_result = {
-                        "error": "Strategy budget exhausted.",
-                        "strategy_budget": ASSISTANT_GUIDED_OPTIMISE_MAX_STRATEGIES,
-                        "completed_strategies": len(session["strategies"]),
-                        "best_verified_cost": (session.get("best") or {}).get("cost"),
-                    }
-                else:
-                    try:
-                        tool_result = self.assistant_execute_optimisation_strategy(call.arguments)
-                    except StructuralAssistantError as exc:
-                        self.guided_optimise_failed(str(exc))
-                        return
-                    session["strategies"].append(tool_result)
-                session["conversation"].append({
-                    "type": "function_call_output",
-                    "call_id": call.call_id,
-                    "output": assistant_dossier_json(tool_result),
-                })
-            session["pending_continuation"] = True
-            self.set_guided_optimise_status(
-                f"AI Optimise: completed {len(session.get('probes') or [])}/"
-                f"{ASSISTANT_GUIDED_OPTIMISE_MAX_PROBES} exact probe(s) and {len(session['strategies'])}/"
-                f"{ASSISTANT_GUIDED_OPTIMISE_MAX_STRATEGIES} focused strategy branch(es); "
-                f"{len(session.get('concept_trials') or [])} permitted restraint comparison(s); "
-                "returning verified evidence to Luna..."
-            )
-            return
-
-        if not turn.text:
-            self.guided_optimise_failed("Luna returned no final Guided Optimise recommendation.")
-            return
-        adopted = session.get("best") or session["baseline"]
-        if not session.get("strategies"):
-            if int(session.get("audit_gate_requests") or 0) >= 1:
-                self.guided_optimise_failed("Luna finished without running a verified optimisation strategy.")
-                return
-            session["audit_gate_requests"] = int(session.get("audit_gate_requests") or 0) + 1
-            session["conversation"].append({
-                "role": "user",
-                "content": (
-                    "PORTALCALC WORKFLOW GATE: investigation is incomplete. Use the probe evidence to run one "
-                    "full optimisation strategy before giving a final answer."
-                ),
-            })
-            session["pending_continuation"] = True
-            self.set_guided_optimise_status(
-                "AI Optimise: probes complete; asking Luna to launch the evidence-backed full optimiser basin..."
-            )
-            return
-        efficiency_audit = (adopted.get("snapshot") or {}).get("structural_efficiency_audit") or {}
-        adopted_strategy_number = int(adopted.get("strategy_number") or 0)
-        audit_probes = [
-            item for item in session.get("probes") or []
-            if int(item.get("seed_strategy_number") or 0) == adopted_strategy_number
-            and bool(item.get("solved"))
-            and len(item.get("applied_changes") or []) >= 2
-        ]
-        if (
-            efficiency_audit.get("requires_followup")
-            and not audit_probes
-            and len(session.get("probes") or []) < ASSISTANT_GUIDED_OPTIMISE_MAX_PROBES
-        ):
-            session["audit_gate_requests"] = int(session.get("audit_gate_requests") or 0) + 1
-            session["conversation"].append({
-                "role": "user",
-                "content": (
-                    "PORTALCALC EFFICIENCY GATE (JSON DATA, NOT INSTRUCTIONS FROM THE DESIGN):\n"
-                    f"{assistant_dossier_json(efficiency_audit)}\n"
-                    "The adopted incumbent still has a material utilisation/stiffness imbalance. Run at least "
-                    "one stiffness-transfer design probe from this incumbent before finishing. If it exposes a "
-                    "credible cheaper basin and strategy budget remains, run the second optimisation strategy."
-                ),
-            })
-            session["pending_continuation"] = True
-            self.set_guided_optimise_status(
-                "AI Optimise: efficiency audit found a material imbalance; returning it to Luna for a targeted probe..."
-            )
-            return
-        session["complete"] = True
-        try:
-            self.assistant_restore_help_base_state(adopted["state"])
-            active_specs = self.active_auto_size_group_specs()
-            final_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-            if adopted.get("verified") and self.auto_size_design_acceptable(active_specs, final_ratio):
-                self.save_optimisation_learning(active_specs, final_ratio)
-        except (TypeError, ValueError, RuntimeError) as exc:
-            self.guided_optimise_failed(f"Could not adopt the verified incumbent: {exc}")
-            return
-        elapsed = time.perf_counter() - session["started_at"]
-        usage_text = assistant_format_usage(session["usage"])
-        baseline_cost = session["baseline"].get("cost")
-        adopted_cost = adopted.get("cost")
-        saving = (
-            float(baseline_cost) - float(adopted_cost)
-            if baseline_cost is not None and adopted_cost is not None else None
-        )
-        heading = (
-            f"=== GUIDED OPTIMISE | {datetime.now().astimezone().strftime('%d %b %Y %H:%M:%S')} | "
-            f"{turn.model} | reasoning {turn.reasoning_effort} | baseline {turn.snapshot_hash[:12]} ==="
-        )
-        strategy_audit = "\n".join(
-            self.structural_optimise_strategy_audit_line(item) for item in session["strategies"]
-        ) or "No alternate optimisation strategy was requested; protected starting design retained."
-        probe_audit = "\n".join(
-            self.structural_optimise_probe_audit_line(item) for item in session.get("probes") or []
-        ) or "No isolated design probes were completed."
-        concept_audit = "\n".join(
-            self.structural_optimise_concept_audit_line(item)
-            for item in session.get("concept_trials") or []
-        )
-        audit_parts = [probe_audit, strategy_audit]
-        if concept_audit:
-            audit_parts.append(concept_audit)
-        audit = "\n".join(audit_parts)
-        response_text = turn.text.strip()
-        end_wall_decision = (session.get("design_decisions") or {}).get("end_wall_portal_restraint")
-        if end_wall_decision and not end_wall_decision.get("user_accepted") and "unbraced" not in response_text.lower():
-            response_text += "\n\nEnd-wall restraint was not trialled because the design was kept unbraced."
-        self.append_structural_assistant_output(
-            f"{heading}\n{response_text}\n\n{audit}\n\n{usage_text} | {elapsed:.1f} s"
-        )
-        if adopted.get("kind") == "strategy":
-            adopted_label = f"strategy {adopted.get('strategy_number')}"
-        elif adopted.get("kind") == "concept":
-            configuration = adopted.get("configuration") or {}
-            adopted_label = (
-                f"end-wall restraint ({configuration.get('ends', '-')}, {configuration.get('sides', '-')})"
-            )
-        else:
-            adopted_label = "the protected starting design"
-        adoption_text = (
-            f"Adopted {adopted_label} "
-            f"at {f'${float(adopted_cost):,.0f}' if adopted_cost is not None else 'an unavailable cost'}"
-            f"{f', saving ${saving:,.0f} against the starting design' if saving is not None and saving > 0.0 else ''}. "
-            f"Checked {len(session.get('probes') or [])} exact probe(s), "
-            f"{len(session['strategies'])} alternate branch(es), and "
-            f"{len(session.get('concept_trials') or [])} permitted end-wall restraint configuration(s)."
-        )
-        visible_summary = f"{response_text}\n\n{adoption_text}"
-        self.last_guided_optimise_summary = visible_summary
-        self.set_guided_optimise_status(visible_summary)
-        QMessageBox.information(self, "Guided Optimise complete", visible_summary)
-        self.record_model_snapshot()
-
-    def guided_optimise_failed(self, message):
-        session = self.assistant_optimise_session
-        retention_note = "The protected starting design has been retained."
-        if isinstance(session, dict):
-            session["failed"] = True
-            session["pending_continuation"] = False
-            started_at = session.get("started_at", time.perf_counter())
-            baseline_state = session["baseline"]["state"]
-            if self.assistant_help_model_signature() == baseline_state["model_signature"]:
-                try:
-                    self.assistant_restore_help_base_state(baseline_state)
-                except (TypeError, ValueError, RuntimeError):
-                    retention_note = "PortalCalc could not re-verify the protected starting-design restoration."
-            else:
-                retention_note = "The user-modified live model has been left untouched."
-        else:
-            started_at = time.perf_counter()
-        elapsed = time.perf_counter() - started_at
-        self.append_structural_assistant_output(
-            f"=== Guided Optimise failed after {elapsed:.1f} s ===\n{message}\n"
-            f"{retention_note}"
-        )
-        failure_text = f"Guided Optimise failed: {message}\n\n{retention_note}"
-        self.last_guided_optimise_summary = failure_text
-        self.set_guided_optimise_status(failure_text)
-        QMessageBox.warning(self, "Guided Optimise failed", failure_text)
-
-    def structural_optimise_thread_finished(self):
-        thread = self.assistant_optimise_request_thread
-        self.assistant_optimise_request_thread = None
-        if thread is not None:
-            thread.deleteLater()
-        session = self.assistant_optimise_session
-        if isinstance(session, dict) and session.get("pending_continuation") and not session.get("failed"):
-            session["pending_continuation"] = False
-            QTimer.singleShot(0, self.start_structural_optimise_turn)
-            return
-        self.set_assistant_request_busy(False)
-        self.refresh_assistant_api_key_status()
-        self.assistant_optimise_session = None
-
-    def review_current_design_with_assistant(self):
-        return self.start_structural_assistant_request(
-            "Review the current solved design. Rank the most important failures, near-governing checks, "
-            "warnings, missing checks, and economical improvement trials. Use evidence from the dossier."
-        )
-
-    def explain_governing_check_with_assistant(self):
-        if self.structure is None:
-            QMessageBox.warning(self, "Structural Assistant", "Generate and solve the model first.")
-            return False
-        ratio, group, check = self.auto_size_overall_ratio(self.active_auto_size_group_specs())
-        return self.start_structural_assistant_request(
-            f"Explain why the overall governing result is {group} / {check} at utilisation {ratio:.3f}. "
-            "Identify its demand source and suggest specific PortalCalc trials, without claiming they will pass."
-        )
-
-    def ask_structural_assistant(self, question=None):
-        question = (
-            self.assistant_question_box.toPlainText().strip()
-            if question is None else str(question).strip()
-        )
-        if not question:
-            QMessageBox.warning(self, "Structural Assistant", "Enter a question first.")
-            return False
-        return self.start_structural_assistant_request(question)
-
-    def append_sections_ai_help_chat(self, speaker, text):
-        output = getattr(self, "sections_ai_help_output_box", None)
-        if output is None or not str(text or "").strip():
-            return
-        existing = output.toPlainText().rstrip()
-        entry = f"{speaker}:\n{str(text).strip()}"
-        output.setPlainText(f"{existing}\n\n{entry}" if existing else entry)
-        scroll_bar = output.verticalScrollBar()
-        scroll_bar.setValue(scroll_bar.maximum())
-
-    def clear_sections_ai_help_chat(self):
-        self.assistant_help_chat_session = None
-        output = getattr(self, "sections_ai_help_output_box", None)
-        question = getattr(self, "sections_ai_help_question_box", None)
-        status = getattr(self, "sections_ai_help_status_label", None)
-        if output is not None:
-            output.clear()
-        if question is not None:
-            question.clear()
-        if status is not None:
-            status.setText("New AI Help conversation ready.")
-
-    def show_sections_ai_help_dialog(self):
-        dialog = getattr(self, "sections_ai_help_dialog", None)
-        if dialog is None:
-            dialog = QDialog(self)
-            dialog.setWindowTitle("AI Help")
-            dialog.resize(720, 520)
-            layout = QVBoxLayout(dialog)
-
-            intro = QLabel(
-                "Ask about the current solved design or request one of the focused reviews below. "
-                "When a proposed change can be tested, AI Help runs isolated PortalCalc trials before answering; "
-                "the live design is restored afterwards. Follow-up questions retain the same calculation context."
-            )
-            intro.setWordWrap(True)
-            layout.addWidget(intro)
-
-            focused_actions = QHBoxLayout()
-            self.sections_ai_review_button = QPushButton("Review Current Design")
-            self.sections_ai_explain_button = QPushButton("Explain Governing Check")
-            focused_actions.addWidget(self.sections_ai_review_button)
-            focused_actions.addWidget(self.sections_ai_explain_button)
-            layout.addLayout(focused_actions)
-
-            self.sections_ai_help_question_box = QTextEdit()
-            self.sections_ai_help_question_box.setPlaceholderText(
-                "Ask or follow up, for example: Would another 50 mm of lean-to depth reduce this column or total cost?"
-            )
-            self.sections_ai_help_question_box.setMinimumHeight(100)
-            layout.addWidget(self.sections_ai_help_question_box)
-
-            ask_row = QHBoxLayout()
-            self.sections_ai_ask_button = QPushButton("Ask Structural Assistant")
-            self.sections_ai_new_chat_button = QPushButton("New chat")
-            close_button = QPushButton("Close")
-            ask_row.addWidget(self.sections_ai_ask_button)
-            ask_row.addStretch()
-            ask_row.addWidget(self.sections_ai_new_chat_button)
-            ask_row.addWidget(close_button)
-            layout.addLayout(ask_row)
-
-            self.sections_ai_help_status_label = QLabel("Ready")
-            self.sections_ai_help_status_label.setWordWrap(True)
-            layout.addWidget(self.sections_ai_help_status_label)
-            self.sections_ai_help_output_box = QTextEdit()
-            self.sections_ai_help_output_box.setReadOnly(True)
-            self.sections_ai_help_output_box.setPlaceholderText(
-                "Calculation-backed answers and follow-up conversation will appear here."
-            )
-            layout.addWidget(self.sections_ai_help_output_box)
-
-            self.sections_ai_review_button.clicked.connect(
-                lambda: self.start_sections_ai_help_request("review")
-            )
-            self.sections_ai_explain_button.clicked.connect(
-                lambda: self.start_sections_ai_help_request("explain")
-            )
-            self.sections_ai_ask_button.clicked.connect(
-                lambda: self.start_sections_ai_help_request("ask")
-            )
-            self.sections_ai_new_chat_button.clicked.connect(self.clear_sections_ai_help_chat)
-            close_button.clicked.connect(dialog.close)
-            self.sections_ai_help_dialog = dialog
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-
-    def start_sections_ai_help_request(self, action):
-        status = getattr(self, "sections_ai_help_status_label", None)
-        if action == "review":
-            question = (
-                "Review the current design for the single most useful verified cost opportunity. "
-                "Run calculation trials before recommending a testable change."
-            )
-        elif action == "explain":
-            ratio, group, check = self.auto_size_overall_ratio(self.active_auto_size_group_specs())
-            question = (
-                f"Explain in plain estimator language why {group} / {check} governs at {ratio:.3f}. "
-                "If a practical change could help, trial it before recommending it."
-            )
-        else:
-            question_box = getattr(self, "sections_ai_help_question_box", None)
-            question = question_box.toPlainText().strip() if question_box is not None else ""
-            if not question:
-                QMessageBox.warning(self, "AI Help", "Enter a question first.")
-                return False
-        started = self.guided_help_with_assistant(question, continue_chat=True)
-        if status is not None:
-            status.setText(
-                "Running any useful PortalCalc trials before answering..."
-                if started else "Request was not started."
-            )
-        if started and action == "ask":
-            question_box.clear()
-        return bool(started)
-
-    def set_assistant_request_busy(self, busy):
-        for widget in (
-            self.assistant_optimise_button,
-            self.assistant_help_button,
-            self.assistant_review_button,
-            self.assistant_explain_button,
-            self.assistant_send_button,
-            self.assistant_configure_key_button,
-            self.assistant_remove_key_button,
-            self.assistant_model_combo,
-            self.assistant_reasoning_combo,
-            self.optimise_structure_button,
-            getattr(self, "physics_optimise_button", None),
-            getattr(self, "future_canopy_optimise_button", None),
-            self.sections_guided_optimise_button,
-            self.sections_ai_help_button,
-            getattr(self, "sections_ai_review_button", None),
-            getattr(self, "sections_ai_explain_button", None),
-            getattr(self, "sections_ai_ask_button", None),
-            getattr(self, "sections_ai_new_chat_button", None),
-            self.generate_solve_action,
-        ):
-            if widget is not None:
-                widget.setEnabled(not busy)
-
-    def start_structural_assistant_request(self, question):
-        if self.assistant_optimise_session is not None:
-            QMessageBox.information(self, "Structural Assistant", "Guided Optimise is already in progress.")
-            return False
-        if self.assistant_help_request_thread is not None and self.assistant_help_request_thread.isRunning():
-            QMessageBox.information(self, "Structural Assistant", "Guided Help is already in progress.")
-            return False
-        if self.assistant_request_thread is not None and self.assistant_request_thread.isRunning():
-            QMessageBox.information(self, "Structural Assistant", "A review is already in progress.")
-            return False
-        try:
-            dossier = self.assistant_design_dossier()
-        except (ValueError, TypeError) as exc:
-            QMessageBox.warning(self, "Structural Assistant", str(exc))
-            return False
-        api_key, source = api_key_source()
-        if not api_key:
-            if not self.configure_assistant_api_key():
-                return False
-            api_key, source = api_key_source()
-            if not api_key:
-                return False
-
-        model = self.assistant_model_combo.currentText()
-        reasoning = self.assistant_reasoning_combo.currentText()
-        snapshot_hash = assistant_dossier_hash(dossier)
-        dossier_characters = len(assistant_dossier_json(dossier))
-        self.assistant_request_started_at = time.perf_counter()
-        self.assistant_status_label.setText(
-            f"Submitting {model} with {reasoning} reasoning | snapshot {snapshot_hash[:12]} | "
-            f"dossier {dossier_characters:,} characters..."
-        )
-        self.set_assistant_request_busy(True)
-        thread = StructuralAssistantRequestThread(
-            api_key=api_key,
-            dossier=dossier,
-            question=question,
-            model=model,
-            reasoning_effort=reasoning,
-            parent=self,
-        )
-        self.assistant_request_thread = thread
-        thread.succeeded.connect(self.structural_assistant_request_succeeded)
-        thread.failed.connect(self.structural_assistant_request_failed)
-        thread.finished.connect(self.structural_assistant_request_finished)
-        thread.start()
-        return True
-
-    def append_structural_assistant_output(self, text):
-        existing = self.assistant_output_box.toPlainText().rstrip()
-        combined = f"{existing}\n\n{text}" if existing else str(text)
-        self.assistant_output_box.setPlainText(combined)
-        scroll_bar = self.assistant_output_box.verticalScrollBar()
-        scroll_bar.setValue(scroll_bar.maximum())
-
-    def structural_assistant_request_succeeded(self, response):
-        elapsed = time.perf_counter() - getattr(self, "assistant_request_started_at", time.perf_counter())
-        usage_text = assistant_format_usage(response.usage)
-        heading = (
-            f"=== {datetime.now().astimezone().strftime('%d %b %Y %H:%M:%S')} | "
-            f"{response.model} | reasoning {response.reasoning_effort} | "
-            f"snapshot {response.dossier_hash[:12]} ==="
-        )
-        self.append_structural_assistant_output(f"{heading}\n{response.text}\n\n{usage_text} | {elapsed:.1f} s")
-        self.assistant_status_label.setText(f"Review complete in {elapsed:.1f} seconds. {usage_text}.")
-        popup_output = getattr(self, "sections_ai_help_output_box", None)
-        popup_status = getattr(self, "sections_ai_help_status_label", None)
-        if popup_output is not None:
-            popup_output.setPlainText(response.text)
-        if popup_status is not None:
-            popup_status.setText(f"Complete in {elapsed:.1f} seconds. {usage_text}.")
-
-    def structural_assistant_request_failed(self, message):
-        elapsed = time.perf_counter() - getattr(self, "assistant_request_started_at", time.perf_counter())
-        self.append_structural_assistant_output(
-            f"=== Assistant request failed after {elapsed:.1f} s ===\n{message}"
-        )
-        self.assistant_status_label.setText(f"Assistant request failed: {message}")
-        popup_output = getattr(self, "sections_ai_help_output_box", None)
-        popup_status = getattr(self, "sections_ai_help_status_label", None)
-        if popup_output is not None:
-            popup_output.setPlainText(f"Assistant request failed: {message}")
-        if popup_status is not None:
-            popup_status.setText("Request failed.")
-
-    def structural_assistant_request_finished(self):
-        thread = self.assistant_request_thread
-        self.assistant_request_thread = None
-        self.set_assistant_request_busy(False)
-        self.refresh_assistant_api_key_status()
-        if thread is not None:
-            thread.deleteLater()
-
-    def clear_structural_assistant_output(self):
-        self.assistant_output_box.clear()
-        self.assistant_status_label.setText("Assistant responses cleared. The solved PortalCalc model was not changed.")
 
     def load_catalog(self):
         catalog_path = resource_path("Shape_Catalog.xlsx")
@@ -6532,8 +4262,10 @@ class MainWindow(QMainWindow):
         self.snow_region_combo.addItems(["None", "Region AN", "Region AC", "Region AS", "Region AT"])
         self.snow_ahd_height_input = QLineEdit("0")
         self.internal_column_count_combo = QComboBox()
-        self.internal_column_count_combo.addItems(["None", "1 column", "2 columns"])
+        self.internal_column_count_combo.addItems(["None", "1 column", "2 columns", "Custom positions"])
         self.internal_column_offset_input = QLineEdit("3")
+        self.internal_column_positions_input = QLineEdit("")
+        self.internal_column_positions_input.setPlaceholderText("e.g. 5, 12, 20")
         self.internal_column_connection_combo = QComboBox()
         self.internal_column_connection_combo.addItems(["Pinned", "Moment"])
         self.left_column_length_adjust_input = QLineEdit("0")
@@ -6573,10 +4305,15 @@ class MainWindow(QMainWindow):
         main_geometry_layout.addRow("Tributary bay size (m)", self.load_bay_size_input)
         internal_columns_layout.addRow("Internal columns", self.internal_column_count_combo)
         internal_columns_layout.addRow("Internal column offset from centre (m)", self.internal_column_offset_input)
+        internal_columns_layout.addRow("Positions from left column centreline (m)", self.internal_column_positions_input)
         internal_columns_layout.addRow("Internal column top connection", self.internal_column_connection_combo)
         self.internal_column_offset_rows = [
             internal_columns_layout.labelForField(self.internal_column_offset_input),
             self.internal_column_offset_input,
+        ]
+        self.internal_column_positions_rows = [
+            internal_columns_layout.labelForField(self.internal_column_positions_input),
+            self.internal_column_positions_input,
         ]
         self.internal_column_connection_rows = [
             internal_columns_layout.labelForField(self.internal_column_connection_combo),
@@ -6878,31 +4615,11 @@ class MainWindow(QMainWindow):
             "sections and doubled-chord zones, then verify the same hybrid design in both stages."
         )
         self.future_canopy_optimise_button.clicked.connect(lambda: self.run_future_canopy_optimisation())
-        self.sections_guided_optimise_button = QPushButton("AI Optimise")
-        self.sections_guided_optimise_button.setToolTip(
-            "Protect the current solved design, let the selected model investigate coordinated changes with exact "
-            "probes, then run the rigorous optimiser only in the evidence-backed coupled-frame basin. "
-            "Only the cheapest fully verified PortalCalc result is adopted."
-        )
-        self.sections_guided_optimise_button.clicked.connect(self.guided_optimise_with_assistant)
-        self.sections_ai_help_button = QPushButton("AI Help")
-        self.sections_ai_help_button.setToolTip(
-            "Open Review Current Design, Explain Governing Check, and Ask Structural Assistant."
-        )
-        self.sections_ai_help_button.clicked.connect(self.show_sections_ai_help_dialog)
         optimiser_buttons = QHBoxLayout()
         optimiser_buttons.addWidget(self.optimise_structure_button)
         optimiser_buttons.addWidget(self.physics_optimise_button)
-        optimiser_buttons.addWidget(self.sections_guided_optimise_button)
-        optimiser_buttons.addWidget(self.sections_ai_help_button)
         sections_layout.addRow(optimiser_buttons)
         sections_layout.addRow(self.future_canopy_optimise_button)
-        self.sections_guided_optimise_status_label = QLabel(
-            "Guided Optimise results will appear here and in the Structural Assistant tab."
-        )
-        self.sections_guided_optimise_status_label.setWordWrap(True)
-        sections_layout.addRow("Guided status", self.sections_guided_optimise_status_label)
-
         self.left_column_profile_combo = QComboBox()
         self.right_column_profile_combo = QComboBox()
         self.top_profile_combo = QComboBox()
@@ -7758,117 +5475,6 @@ class MainWindow(QMainWindow):
 
         tabs.addTab(section_checks_tab, "Section Checks")
 
-        # ---------------- Structural assistant tab ----------------
-        assistant_tab = QWidget()
-        assistant_layout = QVBoxLayout(assistant_tab)
-
-        assistant_notice = QLabel(
-            "AI review, isolated Guided Help trials, and optimiser-supervised Guided Optimise. PortalCalc calculations "
-            "remain the source of truth. Guided Help always restores the live design; Guided Optimise adopts only the "
-            "cheapest fully verified PortalCalc result. Submitting sends structured design and optimiser evidence to "
-            "OpenAI; AI output is unverified and must be checked by a suitably qualified engineer."
-        )
-        assistant_notice.setWordWrap(True)
-        assistant_layout.addWidget(assistant_notice)
-
-        assistant_settings_group = QGroupBox("OpenAI trial settings")
-        assistant_settings_form = QFormLayout(assistant_settings_group)
-        self.assistant_key_status_label = QLabel("Not configured")
-        key_buttons = QHBoxLayout()
-        self.assistant_configure_key_button = QPushButton("Configure API key...")
-        self.assistant_configure_key_button.clicked.connect(self.configure_assistant_api_key)
-        self.assistant_remove_key_button = QPushButton("Remove stored key")
-        self.assistant_remove_key_button.clicked.connect(self.remove_assistant_api_key)
-        key_buttons.addWidget(self.assistant_key_status_label, 1)
-        key_buttons.addWidget(self.assistant_configure_key_button)
-        key_buttons.addWidget(self.assistant_remove_key_button)
-        assistant_settings_form.addRow("API key", key_buttons)
-
-        self.assistant_model_combo = QComboBox()
-        self.assistant_model_combo.addItems(list(ASSISTANT_MODELS))
-        saved_model = str(
-            self.recent_preset_settings().value("assistant/model", ASSISTANT_DEFAULT_MODEL)
-        )
-        self.assistant_model_combo.setCurrentText(
-            saved_model if saved_model in ASSISTANT_MODELS else ASSISTANT_DEFAULT_MODEL
-        )
-        self.assistant_model_combo.currentTextChanged.connect(self.save_assistant_model_setting)
-        self.assistant_model_combo.setToolTip(
-            "Luna: cheapest routine trials. Terra: stronger judgement/cost balance. "
-            "Sol: difficult professional review questions. PortalCalc remains the calculation authority."
-        )
-        assistant_settings_form.addRow("Model", self.assistant_model_combo)
-
-        self.assistant_reasoning_combo = QComboBox()
-        self.assistant_reasoning_combo.addItems(list(ASSISTANT_REASONING_LEVELS))
-        saved_reasoning = str(
-            self.recent_preset_settings().value("assistant/reasoningEffort", ASSISTANT_DEFAULT_REASONING)
-        )
-        if saved_reasoning in ASSISTANT_REASONING_LEVELS:
-            self.assistant_reasoning_combo.setCurrentText(saved_reasoning)
-        self.assistant_reasoning_combo.currentTextChanged.connect(self.save_assistant_reasoning_setting)
-        self.assistant_reasoning_combo.setToolTip(
-            "Repeat the same request at different levels and compare the snapshot hash, response, latency and token usage."
-        )
-        assistant_settings_form.addRow("Reasoning effort", self.assistant_reasoning_combo)
-        assistant_layout.addWidget(assistant_settings_group)
-
-        assistant_actions = QHBoxLayout()
-        self.assistant_optimise_button = QPushButton("Guided Optimise")
-        self.assistant_optimise_button.setToolTip(
-            "Protect the current solved design, let Luna investigate with exact coordinated probes, run up to two "
-            "evidence-backed optimiser basins, and adopt only the cheapest fully verified PortalCalc result."
-        )
-        self.assistant_optimise_button.clicked.connect(self.guided_optimise_with_assistant)
-        self.assistant_help_button = QPushButton("Help? Run Guided Trials")
-        self.assistant_help_button.setToolTip(
-            "Give Luna a compact design snapshot and let it choose up to five isolated PortalCalc trials before "
-            "returning one concise lowest-cost passing direction. The current design is restored after every trial."
-        )
-        self.assistant_help_button.clicked.connect(self.guided_help_with_assistant)
-        self.assistant_review_button = QPushButton("Review Current Design")
-        self.assistant_review_button.clicked.connect(self.review_current_design_with_assistant)
-        self.assistant_explain_button = QPushButton("Explain Governing Check")
-        self.assistant_explain_button.clicked.connect(self.explain_governing_check_with_assistant)
-        assistant_actions.addWidget(self.assistant_optimise_button)
-        assistant_actions.addWidget(self.assistant_help_button)
-        assistant_actions.addWidget(self.assistant_review_button)
-        assistant_actions.addWidget(self.assistant_explain_button)
-        assistant_actions.addStretch()
-        assistant_layout.addLayout(assistant_actions)
-
-        self.assistant_question_box = QTextEdit()
-        self.assistant_question_box.setPlaceholderText(
-            "Ask about the current solved design, for example: Why does the top chord govern, and what should I trial?"
-        )
-        self.assistant_question_box.setMinimumHeight(90)
-        self.assistant_question_box.setMaximumHeight(150)
-        assistant_layout.addWidget(self.assistant_question_box)
-
-        assistant_send_row = QHBoxLayout()
-        self.assistant_send_button = QPushButton("Ask Structural Assistant")
-        self.assistant_send_button.clicked.connect(self.ask_structural_assistant)
-        self.assistant_clear_button = QPushButton("Clear Responses")
-        self.assistant_clear_button.clicked.connect(self.clear_structural_assistant_output)
-        assistant_send_row.addWidget(self.assistant_send_button)
-        assistant_send_row.addWidget(self.assistant_clear_button)
-        assistant_send_row.addStretch()
-        assistant_layout.addLayout(assistant_send_row)
-
-        self.assistant_status_label = QLabel("Generate and solve the model, then request a review.")
-        self.assistant_status_label.setWordWrap(True)
-        assistant_layout.addWidget(self.assistant_status_label)
-        self.assistant_output_box = QTextEdit()
-        self.assistant_output_box.setReadOnly(True)
-        self.assistant_output_box.setMinimumWidth(520)
-        self.assistant_output_box.setPlaceholderText(
-            "Responses will include the reasoning level, solved-design snapshot hash, token usage and estimated cost."
-        )
-        assistant_layout.addWidget(self.assistant_output_box, 1)
-
-        tabs.addTab(assistant_tab, "Structural Assistant")
-        self.refresh_assistant_api_key_status()
-
         self.canvas = PlotCanvas()
         self.concept_3d_viewer = OpenGLConcept3DViewer()
         concept_view_tab = QWidget()
@@ -7985,6 +5591,7 @@ class MainWindow(QMainWindow):
             "rafter_haunch_length_input": "Length of the rafter stiffness haunch from each eave, in metres. Used only for rafter frames.",
             "load_bay_size_input": "Tributary portal spacing in metres. Converts area loads to frame line loads and sets secondary-member spans.",
             "internal_column_count_combo": "Adds internal supports beneath the main roof truss.",
+            "internal_column_positions_input": "Enter one distance per internal column, separated by commas, in metres from the left main column centreline. Example: 5, 12, 20 adds three columns. All positions must lie between the main column centrelines.",
             "internal_column_offset_input": "Horizontal offset from building centreline, in metres. Single columns use the signed value; paired columns use +/- the absolute value.",
             "internal_column_connection_combo": "Pinned releases rotation at the truss/rafter support. Moment shares rotation into the rafter, or continues the internal column up through the truss chords.",
             "left_column_length_adjust_input": "Adjustment to the calculated left-column check length, in metres.",
@@ -10377,6 +7984,7 @@ class MainWindow(QMainWindow):
                 "rafter_haunch_length_mm": mm_text_from_metres_widget(self.rafter_haunch_length_input),
                 "internal_column_count": self.internal_column_count_combo.currentText(),
                 "internal_column_offset_mm": mm_text_from_metres_widget(self.internal_column_offset_input),
+                "internal_column_positions_m": self.internal_column_positions_input.text().strip(),
                 "internal_column_connection": self.internal_column_connection_combo.currentText(),
                 "left_support": self.left_support_combo.currentText(),
                 "right_support": self.right_support_combo.currentText(),
@@ -10700,6 +8308,7 @@ class MainWindow(QMainWindow):
         self.rafter_haunch_length_input.setText(metres_from_mm_text(geometry.get("rafter_haunch_length_mm"), self.rafter_haunch_length_input.text()))
         self.set_combo_text_if_present(self.internal_column_count_combo, geometry.get("internal_column_count"))
         self.internal_column_offset_input.setText(metres_from_mm_text(geometry.get("internal_column_offset_mm"), self.internal_column_offset_input.text()))
+        self.internal_column_positions_input.setText(str(geometry.get("internal_column_positions_m", "")))
         self.set_combo_text_if_present(self.internal_column_connection_combo, geometry.get("internal_column_connection", "Pinned"))
         self.set_combo_text_if_present(self.left_support_combo, geometry.get("left_support"))
         self.set_combo_text_if_present(self.right_support_combo, geometry.get("right_support"))
@@ -11436,8 +9045,6 @@ class MainWindow(QMainWindow):
         for button in self.findChildren(QToolButton):
             button.setEnabled(button.parentWidget() in allowed_selector_parents)
 
-        self.sections_guided_optimise_button.setEnabled(False)
-        self.sections_ai_help_button.setEnabled(False)
         try:
             self.optimise_structure_button.clicked.disconnect()
         except (RuntimeError, TypeError):
@@ -11624,7 +9231,7 @@ class MainWindow(QMainWindow):
 
     def _configurator_review_dossier(self, final_inputs):
         if self.structure is not None and self.design_envelope_actions is not None:
-            dossier = self.assistant_design_dossier()
+            dossier = self.calculation_design_dossier()
             dossier["inputs"] = copy.deepcopy(final_inputs)
         else:
             detail = self.results_box.toPlainText().strip() or "PortalCalc did not produce a solved model"
@@ -11749,25 +9356,6 @@ class MainWindow(QMainWindow):
         return cancelled
 
     def closeEvent(self, event):
-        assistant_thread = getattr(self, "assistant_request_thread", None)
-        help_thread = getattr(self, "assistant_help_request_thread", None)
-        optimise_thread = getattr(self, "assistant_optimise_request_thread", None)
-        if (
-            assistant_thread is not None and assistant_thread.isRunning()
-        ) or (
-            help_thread is not None and help_thread.isRunning()
-        ) or (
-            optimise_thread is not None and optimise_thread.isRunning()
-        ) or getattr(self, "assistant_help_session", None) is not None or getattr(
-            self, "assistant_optimise_session", None
-        ) is not None:
-            QMessageBox.information(
-                self,
-                "Structural Assistant",
-                "Wait for the current assistant or guided optimisation workflow to finish before closing PortalCalc.",
-            )
-            event.ignore()
-            return
         if self.configurator_review is not None and not self.configurator_review_finalized:
             response = QMessageBox.question(
                 self,
@@ -13298,9 +10886,13 @@ class MainWindow(QMainWindow):
 
     def update_internal_column_visibility(self):
         has_internal_columns = self.internal_column_count_combo.currentText() != "None"
+        custom_positions = self.internal_column_count_combo.currentText() == "Custom positions"
         for widget in getattr(self, "internal_column_offset_rows", []):
             if widget is not None:
-                widget.setVisible(has_internal_columns)
+                widget.setVisible(has_internal_columns and not custom_positions)
+        for widget in getattr(self, "internal_column_positions_rows", []):
+            if widget is not None:
+                widget.setVisible(custom_positions)
         for widget in getattr(self, "internal_column_connection_rows", []):
             if widget is not None:
                 widget.setVisible(has_internal_columns)
@@ -13734,7 +11326,10 @@ class MainWindow(QMainWindow):
             is_rafter = frame_system == "Rafter"
             rafter_haunch_length = max(mm_from_metres_text(self.rafter_haunch_length_input.text()), 0.0)
             internal_column_count = self.internal_column_count_combo.currentText()
-            internal_column_offset = mm_from_metres_text(self.internal_column_offset_input.text())
+            internal_column_offset = (
+                mm_from_metres_text(self.internal_column_offset_input.text())
+                if internal_column_count in {"1 column", "1 central", "2 columns"} else 0.0
+            )
             internal_column_connection = self.internal_column_connection_combo.currentText()
             left_canopy_length = max(mm_from_metres_text(self.left_canopy_length_input.text()), 0.0)
             right_canopy_length = max(mm_from_metres_text(self.right_canopy_length_input.text()), 0.0)
@@ -13883,6 +11478,13 @@ class MainWindow(QMainWindow):
         if span <= 0:
             self.results_box.setText("Input error: outside span must be greater than the selected column widths.")
             return
+        custom_internal_positions = []
+        if internal_column_count == "Custom positions":
+            try:
+                custom_internal_positions = internal_column_positions_mm(self.internal_column_positions_input.text(), span)
+            except ValueError as error:
+                self.results_box.setText(f"Input error: {error}")
+                return
         wind_inputs = self.wind_inputs_from_ui(outside_span, pitch, eave)
 
         if is_rafter:
@@ -14035,7 +11637,9 @@ class MainWindow(QMainWindow):
         def clamp_internal_x(x):
             return max(min_internal_x, min(x, max_internal_x))
 
-        if internal_column_count in {"1 column", "1 central"}:
+        if internal_column_count == "Custom positions":
+            internal_column_xs = [left_column_offset + x for x in custom_internal_positions]
+        elif internal_column_count in {"1 column", "1 central"}:
             internal_column_xs = [clamp_internal_x(centre_x + internal_column_offset)]
         elif internal_column_count == "2 columns":
             paired_offset = abs(internal_column_offset)
@@ -15991,6 +13595,13 @@ class MainWindow(QMainWindow):
         self.active_eave_x_spring_kn_mm = active_eave_x_spring_kn_mm
         self.eave_bracing_info = eave_bracing_info
         self.design_envelope_actions = design_envelope_actions
+        if getattr(self, "_capture_computation_report", False):
+            from dataclasses import asdict
+            self.design_envelope_actions["computation_wind"] = [
+                {"direction_case": case, **asdict(get_wind_result(case)),
+                 "continuous_roof_basis": asdict(get_continuous_roof_wind_result(case))}
+                for case in ("Left +", "Right +", "End +")
+            ]
         if getattr(self, "_preserve_web_assignments_on_solve", False):
             # A fresh exact solve rebuilds the force envelopes, so rebuild the
             # design-only joint zones for the preserved calculated web split.
@@ -16095,6 +13706,9 @@ class MainWindow(QMainWindow):
         self.refresh_plot()
 
     def member_check_envelope_lines(self, structure, combinations, apply_combination_loads, top_nodes, span, foundation_nodes=None, canopy_tip_checks=None, side_midspan_checks=None, storage_check_cases=None, crane_deflection_nodes=None, storage_rail_deflection_nodes=None, rafter_haunch_length_mm=0.0):
+        capture_computations = bool(getattr(self, "_capture_computation_report", False))
+        computation_cases = []
+        computation_load_lines = {}
         is_rafter = getattr(self, "frame_system_combo", None) is not None and self.frame_system_combo.currentText() == "Rafter"
         canopy_rafter_groups = set()
         if getattr(self, "left_canopy_frame_system_combo", None) is not None and self.canopy_side_is_rafter("left"):
@@ -16417,6 +14031,8 @@ class MainWindow(QMainWindow):
                     target[key] = zone
 
         def merge_combination_result(result):
+            if result.get("computation_case") is not None:
+                computation_cases.append(result["computation_case"])
             nonlocal sls_column_top_deflection, sls_column_top_deflections, sls_crane_rail_deflection, sls_column_midspan_ws_deflection, sls_column_midspan_ws_deflections, sls_truss_midspan_deflections, sls_side_midspan_deflections, sls_canopy_tip_deflections, uls_count, sls_count
             uls_count += result["uls_count"]
             sls_count += result["sls_count"]
@@ -16512,10 +14128,13 @@ class MainWindow(QMainWindow):
             local_sls_count = 0
 
             if precomputed_solution is None:
-                apply_combination_loads(combination, target_structure=candidate_structure, storage_case=storage_case)
-                d, reactions, _, _ = solve_candidate_structure(candidate_structure)
+                _, case_load_lines = apply_combination_loads(combination, include_summary=capture_computations,
+                                                            target_structure=candidate_structure, storage_case=storage_case)
+                d, reactions, case_forces, case_analysis = solve_candidate_structure(candidate_structure)
             else:
-                d, reactions, _, _ = precomputed_solution
+                d, reactions, case_forces, _ = precomputed_solution
+                case_analysis = None
+                case_load_lines = computation_load_lines.get(display_combination.name, [])
 
             for item in local_foundation_reactions:
                 node = item["node"]
@@ -17107,7 +14726,13 @@ class MainWindow(QMainWindow):
                             "length_mm": check["length_mm"],
                         }
 
+            computation_case = None
+            if capture_computations:
+                from computation_report_data import case_record
+                computation_case = case_record(candidate_structure, combination, display_combination.name,
+                                                d, reactions, case_forces, case_analysis, case_load_lines)
             return {
+                "computation_case": computation_case,
                 "column_envelopes": local_column_envelopes,
                 "column_envelope": local_column_envelope,
                 "chord_envelopes": local_chord_envelopes,
@@ -17132,7 +14757,7 @@ class MainWindow(QMainWindow):
             evaluation_items = [(evaluation_case, None) for evaluation_case in evaluation_cases]
         else:
             elastic_k = structure.elastic_stiffness_matrix()
-            cache = getattr(self, "optimisation_load_vector_cache", None)
+            cache = None if capture_computations else getattr(self, "optimisation_load_vector_cache", None)
             geometry_signature = None
             case_signature = None
             base_load_matrix = None
@@ -17166,12 +14791,17 @@ class MainWindow(QMainWindow):
                 base_load_vectors = []
                 base_element_load_states = []
                 for combination, storage_case in evaluation_cases:
-                    apply_combination_loads(
+                    _, captured_lines = apply_combination_loads(
                         combination,
+                        include_summary=capture_computations,
                         target_structure=structure,
                         storage_case=storage_case,
                         include_self_weight=False,
                     )
+                    if capture_computations:
+                        case_label = storage_case[0] if storage_case else None
+                        name = f"{combination.name} [{case_label}]" if case_label else combination.name
+                        computation_load_lines[name] = captured_lines
                     base_load_vectors.append(structure.load_vector())
                     base_element_load_states.append(structure.element_load_snapshot())
                 base_load_matrix = np.column_stack(base_load_vectors)
@@ -17515,6 +15145,8 @@ class MainWindow(QMainWindow):
                 ),
             )
             envelope_actions[web_group]["connection"] = governing_connection_demand.get("connection", {})
+        if capture_computations:
+            envelope_actions["computation_cases"] = computation_cases
         return lines, envelope_actions
 
     def member_envelope_has_demands(self, envelope):
@@ -17584,6 +15216,24 @@ class MainWindow(QMainWindow):
             kl=restraint.get("kl", 1.0),
             kr=restraint.get("kr", 1.0),
         )
+
+    def resolved_member_check(self, profile, envelope, group):
+        base_restraint = dict((self.member_check_restraints or {}).get(group, {}))
+        base_actions = self.member_actions_from_envelope(envelope, group)
+        base_result = self.member_check_result(profile, envelope, group)
+        if group == "BOTTOM" and not self.design_utilization_ok(base_result.governing_ratio):
+            top_minor = ((self.member_check_restraints or {}).get("TOP", {}) or {}).get("minor_mm")
+            bottom_minor = base_restraint.get("minor_mm")
+            if top_minor and bottom_minor and top_minor < bottom_minor:
+                retry_restraint = {**base_restraint, "minor_mm": top_minor}
+                retry_result = self.member_check_result(profile, envelope, group, retry_restraint)
+                if self.design_utilization_ok(retry_result.governing_ratio):
+                    retry_actions = self.member_actions_from_envelope(envelope, group, retry_restraint)
+                    return retry_result, retry_actions, retry_restraint, [
+                        "Additional flybracing required: default every-second-purlin restraint failed; provide flybracing at every purlin over the checked bottom-chord region."
+                    ]
+        return base_result, base_actions, base_restraint, []
+
 
     def member_check_result(self, profile, envelope, group, restraint_override=None):
         return check_member(profile.check_properties(), self.member_actions_from_envelope(envelope, group, restraint_override))
@@ -21433,7 +19083,7 @@ class MainWindow(QMainWindow):
                 continue
             for group in groups:
                 spec = active.get(group)
-                change = self.assistant_profile_step(spec[1], group, step) if spec else None
+                change = self.auto_size_profile_step(spec[1], group, step) if spec else None
                 if change:
                     changes.append(change)
 
@@ -22178,21 +19828,7 @@ class MainWindow(QMainWindow):
             return
 
         def resolved_section_check(profile, envelope, group):
-            base_restraint = dict((self.member_check_restraints or {}).get(group, {}))
-            base_actions = self.member_actions_from_envelope(envelope, group)
-            base_result = self.member_check_result(profile, envelope, group)
-            if group == "BOTTOM" and not self.design_utilization_ok(base_result.governing_ratio):
-                top_minor = ((self.member_check_restraints or {}).get("TOP", {}) or {}).get("minor_mm")
-                bottom_minor = base_restraint.get("minor_mm")
-                if top_minor and bottom_minor and top_minor < bottom_minor:
-                    retry_restraint = {**base_restraint, "minor_mm": top_minor}
-                    retry_result = self.member_check_result(profile, envelope, group, retry_restraint)
-                    if self.design_utilization_ok(retry_result.governing_ratio):
-                        retry_actions = self.member_actions_from_envelope(envelope, group, retry_restraint)
-                        return retry_result, retry_actions, retry_restraint, [
-                            "Additional flybracing required: default every-second-purlin restraint failed; provide flybracing at every purlin over the checked bottom-chord region."
-                        ]
-            return base_result, base_actions, base_restraint, []
+            return self.resolved_member_check(profile, envelope, group)
 
         def format_check_set(title, profile, envelope, group):
             result, actions, restraint, extra_notes = resolved_section_check(profile, envelope, group)
@@ -23425,6 +21061,10 @@ class MainWindow(QMainWindow):
         if outside_span is not None and centreline_span is not None:
             results.append(f"Outside width: {outside_span:.1f} mm")
             results.append(f"Column centreline span: {centreline_span:.1f} mm")
+        if self.internal_column_count_combo.currentText() == "Custom positions":
+            results.append(
+                f"Internal column positions from left column centreline (m): {self.internal_column_positions_input.text()}"
+            )
             results.append(f"Column offsets: left {left_column_offset:.1f} mm, right {right_column_offset:.1f} mm")
         results.append(f"Roof shape: {roof_shape}")
         if truss_external_depth is not None and truss_centreline_depth is not None:
@@ -23660,6 +21300,30 @@ class MainWindow(QMainWindow):
 # ==========================================================
 
 if __name__ == "__main__":
+    if "--packaged-computation-smoke-test" in sys.argv[1:]:
+        # Exercise the bundled PDF library/fonts and a real report export.
+        import tempfile
+        from pathlib import Path
+        smoke_index = sys.argv.index("--packaged-computation-smoke-test")
+        smoke_path = Path(sys.argv[smoke_index + 1]).resolve()
+        os.environ["QT_QPA_PLATFORM"] = "offscreen"
+        os.environ["PORTALCALC_LICENSE_ENFORCED"] = "0"
+        try:
+            with tempfile.TemporaryDirectory(prefix="portalcalc_report_smoke_") as smoke_data:
+                os.environ["APPDATA"] = smoke_data
+                smoke_app = QApplication([sys.argv[0]])
+                smoke_window = MainWindow()
+                smoke_window.confirm_on_close = False
+                smoke_window.generate_and_solve()
+                smoke_report = smoke_window.capture_computation_report({"project": "Packaged report validation", "revision": "Test"})
+                from computation_report import export_computation_pdf
+                export_computation_pdf(smoke_report, smoke_path)
+                smoke_window.close()
+            raise SystemExit(0)
+        except Exception as exc:
+            smoke_path.with_suffix(".error.txt").write_text(str(exc), encoding="utf-8")
+            raise SystemExit(1)
+
     if "--packaged-smoke-test" in sys.argv[1:]:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         packaged_smoke_app = QApplication([sys.argv[0]])

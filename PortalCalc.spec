@@ -15,6 +15,7 @@ datas = [
     ("assets", "assets"),
 ]
 datas += collect_data_files("certifi")
+datas += collect_data_files("reportlab", includes=["fonts/*.ttf"])
 
 a = Analysis(
     ["main.py"],

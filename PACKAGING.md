@@ -29,6 +29,18 @@ offscreen smoke-test mode. Packaging stops before creating the release archive
 if either application cannot load its bundled Qt runtime or if incompatible
 ICU 78 DLLs have been collected.
 
+Full computation reports also require ReportLab from `requirements-desktop.txt`.
+`PortalCalc.spec` collects its fallback fonts. The build script also runs a real
+report export and stops if it fails. To exercise this check separately:
+
+```powershell
+dist\PortalCalc\PortalCalc.exe --packaged-computation-smoke-test C:\path\to\test-report.pdf
+```
+
+This offscreen validation analyses the packaged defaults, exports a real report
+and returns exit code zero on success. Errors are written beside the requested
+output as `test-report.error.txt`.
+
 Before building a customer release, update `APP_VERSION` and `APP_RELEASE_DATE`
 in `app_metadata.py`, then add the release notes to `CHANGELOG.md`. This keeps
 the package filename, About panel, and release history aligned.

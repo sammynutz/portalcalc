@@ -14,6 +14,9 @@ def geometry_basis(window):
             window.depth_input.text(), window.roof_shape_combo.currentText(),
             window.frame_system_combo.currentText(), window.internal_column_count_combo.currentText(),
             window.max_truss_depth_input.text()]
+    for name in ("internal_column_offset_input", "internal_column_positions_input", "internal_column_connection_combo"):
+        field = getattr(window, name, None)
+        basis.append((field.currentText() if hasattr(field, "currentText") else field.text()) if field is not None else "")
     for side in ("left", "right"):
         for suffix in ("canopy_length_input", "canopy_pitch_input", "canopy_shallow_depth_input"):
             field = getattr(window, f"{side}_{suffix}", None)

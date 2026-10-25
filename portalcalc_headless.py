@@ -62,7 +62,7 @@ class HeadlessPortalCalcBackend:
             if request.mode is CalculationMode.AUTO_SIZE:
                 optimiser = self.optimise_window(window)
                 self._raise_if_unsolved(window)
-            dossier = window.assistant_design_dossier()
+            dossier = window.calculation_design_dossier()
             from future_canopy_design import secondary_checks
             dossier["secondary_steel_checks"] = secondary_checks(window)
             from wind import calculate_wind
