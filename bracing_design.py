@@ -1,0 +1,296 @@
+"""Scoped member checks and cost-ranked sizing of the fixed 3D brace layout.
+
+Uses the application's existing preliminary AS 4100-style member engine.
+Connection acceptance, geometric stability and production portal sizing remain
+separate. Catalogue search is grouped/iterative, not a global layout optimum.
+"""
+from dataclasses import asdict, dataclass, replace
+import hashlib
+import json
+import math
+import re
+
+from bracing_analysis import AnalysisError
+from bracing_analysis_desktop import analyse_context
+from costing import END_WALL_ROD_TURNBUCKLES, UB_STOCK_LENGTHS_M, section_cost_bucket
+from member_checks import (MemberActions, SectionCheckProperties, check_member,
+                           tension_capacity_kn)
+
+
+GROUPS = {"strut": "longitudinal_strut", "end_post": "end_post",
+          "roof_brace": "roof_brace", "wall_brace": "wall_brace", "end_brace": "end_brace"}
+
+
+@dataclass(frozen=True)
+class DesignCriteria:
+    brace_fy_mpa: float = 250.
+    brace_fu_mpa: float = 410.
+    net_area_factor: float = .70
+    tension_distribution_factor: float = .85
+    strut_ke: float = 1.
+    post_ke: float = 1.
+    sls_divisor: float = 150.
+
+    def validate(self):
+        for name, value in asdict(self).items():
+            if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+                raise AnalysisError(f"Invalid section-check criterion: {name}")
+        if self.net_area_factor > 1 or self.tension_distribution_factor > 1:
+            raise AnalysisError("Net area and force distribution factors must not exceed 1")
+        if self.brace_fu_mpa < self.brace_fy_mpa:
+            raise AnalysisError("Brace ultimate stress must be at least its yield stress")
+
+
+def candidate_name(candidate):
+    return candidate["label"] if isinstance(candidate, dict) else candidate.name
+
+
+def candidate_area(candidate):
+    return float(candidate["area_mm2"] if isinstance(candidate, dict) else candidate.A)
+
+
+def selected_key(selections):
+    return tuple(candidate_name(selections[group]) for group in GROUPS)
+
+
+def group_members(result, group):
+    return [member for member in result["cases"][0]["members"] if member["kind"] == GROUPS[group]]
+
+
+def section_properties(candidate, criteria):
+    # Legacy tension_capacity_kn omits the separate 0.85 fracture multiplier.
+    # Apply it through effective kt here. If that helper is corrected globally,
+    # remove this adapter factor as well; the independent capacity test guards it.
+    if isinstance(candidate, dict):
+        area = candidate_area(candidate)
+        return SectionCheckProperties(candidate_name(candidate), "TENSION BRACE", "",
+                                      area, 0., 1., 1., fy_mpa=criteria.brace_fy_mpa,
+                                      fu_mpa=criteria.brace_fu_mpa, net_area_mm2=area*criteria.net_area_factor,
+                                      kt=.85*criteria.tension_distribution_factor)
+    return replace(candidate.check_properties(), net_area_mm2=candidate.A*criteria.net_area_factor,
+                   kt=.85*criteria.tension_distribution_factor)
+
+
+def member_assessment(result, member_index, candidate, criteria):
+    """Candidate screening uses a frozen demand envelope; final adoption re-solves."""
+    criteria.validate()
+    member = result["cases"][0]["members"][member_index]
+    section = section_properties(candidate, criteria)
+    length = member["length_mm"]
+    group = member["kind"]
+    is_brace = member["tension_only"]
+    local_weight = candidate_area(candidate) * 7.85e-6 * 9.80665  # N/mm
+    if not is_brace and (min(section.iy_mm4, section.iz_mm4) <= 0 or not section.analysis_s_mm3):
+        return {"id": member["id"], "section": candidate_name(candidate), "ratio": None,
+                "mode": "Missing section properties", "case": "-", "case_checks": [], "passes": False}
+    rows = []
+    for case in result["cases"]:
+        force = case["members"][member_index]["axial_n"] / 1000.
+        name = case["case"]["name"]
+        if is_brace:
+            if case["case"]["level"] != "ULS":
+                continue
+            capacity = tension_capacity_kn(section)
+            ratio = max(force, 0.) / capacity if capacity > 0 else math.inf
+            rows.append({"case": name, "mode": "Tension (gross yield / configured net fracture)",
+                         "ratio": ratio, "tension_kn": max(force, 0.), "capacity_kn": capacity,
+                         "gross_yield_kn": .9*section.area_mm2*section.fy_mpa/1000,
+                         "fracture_factor": .85, "configured_kt": criteria.tension_distribution_factor,
+                         "net_fracture_kn": .9*section.kt*section.design_net_area_mm2*section.fu_mpa/1000})
+            continue
+        pressure_load = 0.
+        if group == "end_post":
+            a = result["nodes"][member["start"]]["point_mm"]
+            stations = result["analysis_layout"]["geometry"]["end_wall_stations_mm"]
+            index = min(range(len(stations)), key=lambda i: abs(stations[i]-a[0]))
+            tributary = (stations[index+1]-stations[index-1]) / 2
+            pressure = case["case"]["front_kpa"] if abs(a[1]) < 1e-5 else case["case"]["back_kpa"]
+            pressure_load = abs(pressure) / 1000 * tributary  # N/mm
+        line_load = local_weight if group == "longitudinal_strut" else pressure_load
+        if case["case"]["level"] == "ULS":
+            # Strut gravity is a separate local simply-supported beam check.
+            # Post self-weight is conservatively added to compression without
+            # taking beneficial gravity credit against wind tension.
+            moment = line_load*length**2/8/1e6 * (1.2 if group == "longitudinal_strut" else 1.)
+            shear = line_load*length/2/1000 * (1.2 if group == "longitudinal_strut" else 1.)
+            gravity_n = 1.2*local_weight*length if group == "end_post" else 0.
+            ke = criteria.strut_ke if group == "longitudinal_strut" else criteria.post_ke
+            actions = MemberActions(compression_kn=max(-force, 0.)+gravity_n/1000,
+                                    tension_kn=max(force, 0.), moment_knm=moment, shear_kn=shear,
+                                    effective_length_y_mm=length*ke, effective_length_z_mm=length*ke)
+            checked = check_member(section, actions)
+            governing = max(checked.checks.values(), key=lambda item: item.ratio)
+            rows.append({"case": name, "mode": governing.label, "ratio": governing.ratio,
+                         "actions": asdict(actions), "checks": {key: asdict(value) for key, value in checked.checks.items()}})
+        else:
+            deflection = 5*line_load*length**4/(384*200000*section.analysis_i_mm4)
+            limit = length/criteria.sls_divisor
+            rows.append({"case": name, "mode": "Local simply-supported deflection",
+                         "ratio": deflection/limit, "deflection_mm": deflection, "limit_mm": limit})
+    governing = max(rows, key=lambda item: item["ratio"])
+    finite = math.isfinite(governing["ratio"])
+    # JSON must never silently encode non-finite engineering results.
+    for row in rows:
+        if not math.isfinite(row["ratio"]):
+            row["ratio"] = None
+        for check in row.get("checks", {}).values():
+            if not math.isfinite(check["ratio"]):
+                check["ratio"] = None
+    return {"id": member["id"], "section": candidate_name(candidate),
+            "ratio": governing["ratio"] if finite else None, "mode": governing["mode"],
+            "case": governing["case"], "case_checks": rows,
+            "passes": finite and governing["ratio"] <= 1.}
+
+
+def group_assessments(result, group, candidate, criteria):
+    return [member_assessment(result, i, candidate, criteria)
+            for i, member in enumerate(result["cases"][0]["members"]) if member["kind"] == GROUPS[group]]
+
+
+def group_cost(result, group, candidate, rates):
+    members = group_members(result, group)
+    area = candidate_area(candidate)
+    if isinstance(candidate, dict):
+        bucket = "ub"
+    else:
+        bucket = section_cost_bucket(candidate)
+    rate = float(rates[bucket])
+    if not math.isfinite(rate) or rate < 0:
+        raise AnalysisError("Costing rates must be finite and non-negative")
+    length = sum(m["length_mm"] for m in members) / 1000
+    if isinstance(candidate, dict):
+        costed_length = length
+        allowance = "Exact brace length"
+    elif bucket == "shs":
+        costed_length = length*1.07
+        allowance = "7% hollow-section waste"
+    else:
+        cuts = [m["length_mm"]/1000 for m in members]
+        if any(cut > UB_STOCK_LENGTHS_M[-1]+1e-9 for cut in cuts):
+            raise AnalysisError("A rolled-section cut exceeds priced stock length; splice design/cost is unavailable")
+        costed_length = sum(next(stock for stock in UB_STOCK_LENGTHS_M if stock >= cut-1e-9) for cut in cuts)
+        allowance = "Individual cuts rounded to existing UB stock lengths"
+    installed_kg = area*length*.00785
+    purchased_kg = area*costed_length*.00785
+    fitting_cost = 0.
+    if isinstance(candidate, dict) and "ROD" in candidate_name(candidate).upper():
+        diameter = int(re.search(r"\d+", candidate_name(candidate))[0])
+        if diameter not in END_WALL_ROD_TURNBUCKLES:
+            raise AnalysisError(f"No turnbuckle price for {candidate_name(candidate)}")
+        fitting_cost = len(members)*END_WALL_ROD_TURNBUCKLES[diameter]["unit_cost"]
+    return {"group": group, "section": candidate_name(candidate), "member_count": len(members),
+            "installed_length_m": length, "purchased_length_m": costed_length,
+            "installed_kg": installed_kg, "purchased_kg": purchased_kg, "material_rate_per_kg": rate,
+            "material_cost": purchased_kg*rate, "listed_fittings_cost": fitting_cost,
+            "total": purchased_kg*rate+fitting_cost, "allowance": allowance}
+
+
+def attach_design(result, selections, criteria, rates):
+    criteria.validate()
+    checks = {}
+    costs = []
+    for group, candidate in selections.items():
+        checks.update((row["id"], row) for row in group_assessments(result, group, candidate, criteria))
+        costs.append(group_cost(result, group, candidate, rates))
+    movements = []
+    for case in result["cases"]:
+        if case["case"]["level"] != "SLS":
+            continue
+        for node, displacement in zip(result["nodes"], case["displacements_mm"]):
+            height = node["point_mm"][2]
+            if height > 0:
+                limit = height/criteria.sls_divisor
+                movements.append({"ratio": abs(displacement[1])/limit, "node": node["index"],
+                                  "case": case["case"]["name"], "movement_mm": abs(displacement[1]), "limit_mm": limit})
+    drift = max(movements, key=lambda row: row["ratio"])
+    stable = all(case["tangent_status"] == "positive_with_taut_rods" for case in result["cases"])
+    passes = all(row["passes"] for row in checks.values()) and drift["ratio"] <= 1 and stable
+    request = {"source_hash": result["source_hash"], "sections": {g: candidate_name(c) for g, c in selections.items()},
+               "section_properties": {g: asdict(section_properties(c, criteria)) for g, c in selections.items()},
+               "net_fracture_multiplier": .85, "criteria": asdict(criteria), "cost_rates": rates}
+    result["design_request"] = request
+    result["design_request_hash"] = hashlib.sha256(json.dumps(request, sort_keys=True, allow_nan=False).encode()).hexdigest()
+    result["section_checks"] = checks
+    result["design"] = {"passes": passes, "member_checks_pass": all(r["passes"] for r in checks.values()),
+                        "global_sls": drift, "taut_tangent_verified": stable,
+                        "estimated_cost": sum(row["total"] for row in costs), "cost_items": costs,
+                        "cost_model": {"stock_lengths_m": UB_STOCK_LENGTHS_M, "hollow_waste_factor": 1.07,
+                                       "rod_turnbuckle_prices": END_WALL_ROD_TURNBUCKLES},
+                        "basis": "Existing preliminary member engine with explicit 0.85 net-fracture multiplier; one section per strut/post/roof/side/end group. Configured net-area/kt and effective-length assumptions. Strong-axis bending orientation. Wind plus local member self-weight checks only; connections and full load combinations remain separate.",
+                        "cost_basis": "Current Costing rates, exact brace lengths, 7% hollow waste, rolled stock rounding, one listed turnbuckle per rod. Angle fittings, other connections, labour and supplier availability/quotes are not priced."}
+    result["limitations"] = [line for line in result["limitations"] if not line.startswith(("Forces are analysis demands only.", "Fixed pinned-panel layout;"))]
+    result["limitations"] += [result["design"]["basis"], result["design"]["cost_basis"]]
+    return result
+
+
+def solve_selection(context, selections, criteria, rates):
+    local = {**context, **{g: selections[g] for g in ("roof_brace", "wall_brace", "end_brace")}}
+    result = analyse_context(local, selections["strut"], selections["end_post"])
+    return attach_design(result, selections, criteria, rates)
+
+
+def auto_size(context, selections, candidates, criteria, rates, progress=None, max_solves=18):
+    """Cheapest candidates for successive demand envelopes; always reanalyse.
+
+    Returns the lowest-cost passing reanalysed candidate found. Stiffness floors
+    may rise to meet global SLS. No claim of exhaustive/global optimality.
+    """
+    current = dict(selections)
+    result = solve_selection(context, current, criteria, rates)
+    best = (result, dict(current)) if result["design"]["passes"] else None
+    trace, visited, floors = [], set(), {group: 0. for group in GROUPS}
+    screens = 0
+    for iteration in range(max_solves-1):
+        if progress:
+            progress(iteration, max_solves, f"Sizing round {iteration+1}; best verified cost: " + (f"${best[0]['design']['estimated_cost']:,.2f}" if best else "none yet"))
+        key = selected_key(current)
+        visited.add(key)
+        trace.append({"sections": dict(zip(GROUPS, key)), "passes": result["design"]["passes"],
+                      "estimated_cost": result["design"]["estimated_cost"], "global_sls_ratio": result["design"]["global_sls"]["ratio"]})
+        if result["design"]["passes"] and (best is None or result["design"]["estimated_cost"] < best[0]["design"]["estimated_cost"]):
+            best = (result, dict(current))
+        if not result["design"]["taut_tangent_verified"]:
+            raise AnalysisError("Auto-sizing requires verified taut-rod tangent stiffness for every case; review the layout/neutral rods")
+        if result["design"]["global_sls"]["ratio"] > 1:
+            factor = min(max(result["design"]["global_sls"]["ratio"], 1.12), 2.)
+            for group in GROUPS:
+                floors[group] = max(floors[group], candidate_area(current[group])*factor)
+        proposed = dict(current)
+        for group in GROUPS:
+            if not group_members(result, group):
+                continue
+            ranked = []
+            for candidate in candidates[group]:
+                if candidate_area(candidate) < floors[group]-1e-9:
+                    continue
+                screens += 1
+                if all(row["passes"] for row in group_assessments(result, group, candidate, criteria)):
+                    try:
+                        ranked.append((group_cost(result, group, candidate, rates)["total"], candidate_name(candidate), candidate))
+                    except AnalysisError:
+                        continue
+            if not ranked:
+                if best:
+                    break
+                raise AnalysisError(f"No priced catalogue candidate passes the current {group} demands and stiffness floor")
+            proposed[group] = min(ranked, key=lambda item: (item[0], item[1]))[2]
+        proposed_key = selected_key(proposed)
+        if proposed_key == key or proposed_key in visited:
+            if best:
+                break
+            raise AnalysisError("Sizing did not reach a verified candidate; demands cycle or the SLS constraint needs a different layout")
+        current = proposed
+        try:
+            result = solve_selection(context, current, criteria, rates)
+        except AnalysisError:
+            if best:
+                break
+            raise
+    if result["design"]["passes"] and (best is None or result["design"]["estimated_cost"] < best[0]["design"]["estimated_cost"]):
+        best = (result, dict(current))
+    if best is None:
+        raise AnalysisError("No verified member/SLS sizing found within the search limit")
+    best[0]["sizing_search"] = {"method": "Cost-ranked grouped demand-envelope iteration with exact reanalysis",
+                                "scope": "Lowest-cost passing candidate found; not a global catalogue/layout optimum",
+                                "candidate_screens": screens, "rounds": trace, "max_solves": max_solves}
+    return best

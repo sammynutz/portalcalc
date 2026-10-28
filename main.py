@@ -3073,6 +3073,8 @@ class MainWindow(QMainWindow):
         self._deflection_hover_active = False
         self.eave_bracing_info = None
         self.longitudinal_bracing_design = None
+        self.bracing_location_layout = None
+        self.bracing_3d_settings = None
         self.load_combinations = build_load_combinations(CPE_CASE_OPTIONS, CPI_CASE_OPTIONS)
         self.factory_default_data = None
         self.factory_defaults_loaded_path = ""
@@ -4546,6 +4548,18 @@ class MainWindow(QMainWindow):
         setup_layout.addRow("Side walls braced", self.longitudinal_wall_sides_combo)
         setup_layout.addRow("Braced bays per side", self.end_wall_braced_bay_count_input)
 
+        locations_layout = bracing_group("3D bracing locations")
+        self.bracing_layout_button = QPushButton("Open 3D bracing workspace...")
+        self.bracing_layout_button.clicked.connect(self.analyse_fixed_bracing_layout)
+        self.bracing_layout_summary_label = QLabel("No exclusions or pinned locations saved.")
+        self.bracing_layout_summary_label.setWordWrap(True)
+        locations_layout.addRow(self.bracing_layout_button)
+        self.bracing_analysis_button = self.bracing_layout_button
+        locations_layout.addRow(self.bracing_layout_summary_label)
+        layout_scope = QLabel("Mark blocked roof, side-wall and end-wall panels. Location planning is separate from the Phase 1 checks below.")
+        layout_scope.setWordWrap(True)
+        locations_layout.addRow(layout_scope)
+
         def add_brace_sizes(combo):
             for label, area_mm2, description in END_WALL_BRACING_SIZE_OPTIONS:
                 kg_m = area_mm2 * 1e-6 * 7850.0
@@ -5554,6 +5568,10 @@ class MainWindow(QMainWindow):
         self.roof_brace_size_combo.currentTextChanged.connect(lambda _: self.generate_and_solve())
         self.wall_brace_size_combo.currentTextChanged.connect(lambda _: self.generate_and_solve())
         self.end_wall_braced_bay_count_input.valueChanged.connect(lambda _: self.generate_and_solve())
+        for field in (self.span_input, self.building_length_input, self.eave_input, self.pitch_input,
+                      self.load_bay_size_input, self.end_wall_mullion_spacing_override_input):
+            field.editingFinished.connect(self.update_bracing_layout_summary)
+        self.roof_shape_combo.currentTextChanged.connect(lambda _: self.update_bracing_layout_summary())
         self.ui_theme_combo.currentTextChanged.connect(lambda _: self.apply_ui_theme())
         self.end_wall_mullion_spacing_override_input.editingFinished.connect(self.generate_and_solve)
         for widget in [self.left_canopy_length_input, self.right_canopy_length_input]:
@@ -8002,6 +8020,8 @@ class MainWindow(QMainWindow):
                 "braced_bays_per_side": self.end_wall_braced_bay_count_input.value(),
                 "roof_brace_size": self.selected_brace_size(self.roof_brace_size_combo)["label"],
                 "wall_brace_size": self.selected_brace_size(self.wall_brace_size_combo)["label"],
+                **({"layout": copy.deepcopy(self.bracing_location_layout)} if self.bracing_location_layout is not None else {}),
+                **({"analysis_3d": copy.deepcopy(self.bracing_3d_settings)} if self.bracing_3d_settings is not None else {}),
             },
             "canopies": {
                 "left_length_mm": mm_text_from_metres_widget(self.left_canopy_length_input),
@@ -8355,6 +8375,8 @@ class MainWindow(QMainWindow):
             except (TypeError, ValueError):
                 pass
         bracing = data.get("bracing", {})
+        self.bracing_location_layout = copy.deepcopy(bracing.get("layout"))
+        self.bracing_3d_settings = copy.deepcopy(bracing.get("analysis_3d"))
         self.longitudinal_bracing_enabled_checkbox.setChecked(bool(bracing.get("enabled", False)))
         self.set_combo_text_if_present(self.longitudinal_wall_sides_combo, bracing.get("wall_sides", "Both sides"))
         try:
@@ -8675,6 +8697,7 @@ class MainWindow(QMainWindow):
         self.update_internal_column_visibility()
         self.update_current_canopy_visibility()
         self.update_eave_restraint_visibility()
+        self.update_bracing_layout_summary()
         self.refresh_settings_menu_checks()
         if self.future_canopy_design:
             from portalcalc_service import calculation_web_selection_state
@@ -10205,6 +10228,78 @@ class MainWindow(QMainWindow):
                             governing[case_key] = f"{pressure_type.title()}: {cpe_case}, {cpi_case}, {surface_label}"
         return governing
 
+    def current_bracing_layout_geometry(self):
+        from bracing_layout import LayoutGeometry
+        geometry = LayoutGeometry.create(mm_from_metres_text(self.span_input.text()),
+                                         mm_from_metres_text(self.building_length_input.text()),
+                                         mm_from_metres_text(self.eave_input.text()), float(self.pitch_input.text()),
+                                         self.current_roof_shape(), bay_mm=mm_from_metres_text(self.load_bay_size_input.text()))
+        spacing = self.end_wall_spacing_override_mm()
+        if spacing is not None:
+            if not math.isfinite(spacing) or spacing <= 0:
+                raise ValueError("End-wall panel spacing must be finite and positive")
+            spaces = max(1, math.ceil(geometry.span_mm / spacing))
+            if spaces > 100:
+                raise ValueError("The layout editor supports up to 100 end-wall panels")
+            values = geometry.to_dict()
+            values["end_wall_stations_mm"] = [geometry.span_mm * i / spaces for i in range(spaces + 1)]
+            geometry = LayoutGeometry.from_dict(values)
+        return geometry
+
+    def update_bracing_layout_summary(self):
+        if not hasattr(self, "bracing_layout_summary_label"):
+            return
+        from bracing_layout import BracingLayout
+        if self.bracing_location_layout is None:
+            text = "No exclusions or pinned locations saved."
+        else:
+            try:
+                layout = BracingLayout.from_dict(self.bracing_location_layout)
+                text = f"{len(layout.blocked)} blocked panels; {len(layout.pinned)} pinned braces."
+                if layout.geometry != self.current_bracing_layout_geometry():
+                    text += " Dimensions changed - review the saved locations."
+            except (TypeError, ValueError, OverflowError) as error:
+                text = f"Saved locations need review: {error}"
+        self.bracing_layout_summary_label.setText(text)
+
+    def edit_bracing_locations(self):
+        try:
+            geometry = self.current_bracing_layout_geometry()
+        except (TypeError, ValueError, OverflowError) as error:
+            QMessageBox.warning(self, "Bracing locations", f"Check the building dimensions first:\n{error}")
+            return
+        from bracing_layout_ui import BracingLayoutDialog
+        read_only = self.configurator_review is not None
+        dialog = BracingLayoutDialog(geometry, saved=copy.deepcopy(self.bracing_location_layout),
+                                     parent=self, read_only=read_only)
+        if dialog.exec() == QDialog.Accepted and not read_only:
+            self.bracing_location_layout = dialog.snapshot()
+            self.update_bracing_layout_summary()
+            self.record_model_snapshot()
+
+    def analyse_fixed_bracing_layout(self):
+        from bracing_analysis_desktop import prepare_context
+        from bracing_analysis_ui import BracingAnalysisDialog
+        try:
+            # Rebuild once with current selected sections. The subsequent 3D
+            # solve/recovery operates on a private unloaded portal copy.
+            self.generate_and_solve()
+            context = prepare_context(self, allow_unconfigured=True)
+        except (ValueError, ArithmeticError) as error:
+            QMessageBox.warning(self, "3D bracing analysis", str(error))
+            return
+        read_only = self.configurator_review is not None
+        dialog = BracingAnalysisDialog(context, self.catalog, saved=copy.deepcopy(self.bracing_3d_settings),
+                                       parent=self, read_only=read_only)
+        if dialog.exec() == QDialog.Accepted and not read_only:
+            settings = dialog.snapshot()
+            location_layout = dialog.layout_snapshot()
+            if settings != self.bracing_3d_settings or location_layout != self.bracing_location_layout:
+                self.bracing_3d_settings = settings
+                self.bracing_location_layout = location_layout
+                self.update_bracing_layout_summary()
+                self.record_model_snapshot()
+
     def calculate_longitudinal_bracing_design(self, wind_inputs, span_mm, eave_height_mm, pitch_deg, roof_shape, bay_size_m):
         if not self.longitudinal_bracing_enabled_checkbox.isChecked():
             self.longitudinal_bracing_design = None
@@ -10309,7 +10404,7 @@ class MainWindow(QMainWindow):
         ))
         self.update_longitudinal_bracing_results()
 
-    def match_metroll_purlin(self, span_type, span_mm, outward_kn_m, inward_strength_kn_m, inward_service_kn_m):
+    def match_metroll_purlin(self, span_type, span_mm, outward_kn_m, inward_strength_kn_m, inward_service_kn_m, *, include_candidates=False):
         if not self.metroll_tables:
             return {"status": "NOT CHECKED", "message": "Metroll capacity table cache not found."}
         table_ids = {
@@ -10423,13 +10518,15 @@ class MainWindow(QMainWindow):
                 item for item in passing
                 if item["area_mm2"] <= lightest_area * 1.05
             ]
-            selected = min(near_lightest, key=lambda item: (-item["depth_mm"], item["area_mm2"], item["section"]))
+            selected = dict(min(near_lightest, key=lambda item: (-item["depth_mm"], item["area_mm2"], item["section"])))
             failed = [
                 item for item in candidates
                 if max(item["outward_ratio"], item["inward_strength_ratio"], item["inward_service_ratio"]) > 1.0
             ]
             failed.sort(key=lambda item: max(item["outward_ratio"], item["inward_strength_ratio"], item["inward_service_ratio"]))
             selected["near_misses"] = failed[:3]
+            if include_candidates:
+                selected["passing_candidates"] = passing
             return selected
         return {"status": "NOT OK", "message": "No listed Metroll section satisfies the calculated line loads."}
 
@@ -10455,7 +10552,7 @@ class MainWindow(QMainWindow):
         inward_strength_kn_m = max(inward_gravity_uls_kpa, inward_wind_uls_kpa) * spacing_m
         inward_service_kpa = max(wind_service_upward_kpa, wind_service_downward_kpa)
         inward_service_kn_m = inward_service_kpa * spacing_m
-        match = self.match_metroll_purlin(span_type, span_mm, outward_kn_m, inward_strength_kn_m, inward_service_kn_m)
+        match = self.match_metroll_purlin(span_type, span_mm, outward_kn_m, inward_strength_kn_m, inward_service_kn_m, include_candidates=True)
         local_wind_upward_kpa, local_wind_downward_kpa, local_pressure_info = self.purlin_design_pressures(
             wind_inputs,
             tributary_area_m2=local_area_m2,
@@ -10473,7 +10570,18 @@ class MainWindow(QMainWindow):
         local_inward_strength_kn_m = max(inward_gravity_uls_kpa, local_inward_wind_uls_kpa) * spacing_m
         local_inward_service_kpa = max(local_wind_service_upward_kpa, local_wind_service_downward_kpa)
         local_inward_service_kn_m = local_inward_service_kpa * spacing_m
-        local_match = self.match_metroll_purlin(span_type, span_mm, local_outward_kn_m, local_inward_strength_kn_m, local_inward_service_kn_m)
+        local_match = self.match_metroll_purlin(span_type, span_mm, local_outward_kn_m, local_inward_strength_kn_m, local_inward_service_kn_m, include_candidates=True)
+        from purlin_selection import select_roof_purlin_pair
+        edge_rows_total = min(len(purlin_layout.points), 2 * edge_rows)
+        general_rows = max(len(purlin_layout.points) - edge_rows_total, 0)
+        pair = select_roof_purlin_pair(match.pop("passing_candidates", []), local_match.pop("passing_candidates", []),
+                                      general_rows, edge_rows_total)
+        selection = {}
+        if pair is not None:
+            match, local_match, selection = pair
+        elif match.get("status") == "OK" and local_match.get("status") == "OK":
+            match = {"status": "NOT OK", "message": "No common Metroll profile satisfies both roof zones, even with different thicknesses."}
+            local_match = dict(match)
         return {
             "span_type": span_type,
             "spacing_mm": purlin_layout.max_spacing_mm,
@@ -10505,6 +10613,7 @@ class MainWindow(QMainWindow):
             "local_dimension_a_m": local_pressure_info["local_dimension_a_m"],
             "local_inward_wind_uls_kpa": local_inward_wind_uls_kpa,
             "local_match": local_match,
+            "profile_selection": selection,
         }
 
     def wall_girt_check_from_inputs(self, wind_inputs, bay_size_m, eave_height_mm, span_type):
@@ -20801,7 +20910,7 @@ class MainWindow(QMainWindow):
                     f"General matched section: {self.metroll_section_display(match['section'], purlin_check['span_type'])} "
                     f"from Metroll tables {match['tables']}",
                     f"Table bridging basis: outward {self.bridging_label_text(match.get('outward_bridging'))}, inward {self.bridging_label_text(match.get('inward_bridging'))}",
-                    f"Selection basis: deepest section within 5% of the lightest passing area; selected area {match.get('area_mm2', 0.0):.0f} mm2.",
+                    f"Selection basis: {purlin_check.get('profile_selection', {}).get('basis', 'No compatible roof-zone pair selected')} General area {match.get('area_mm2', 0.0):.0f} mm2; edge area {local_match.get('area_mm2', 0.0):.0f} mm2.",
                     f"Capacities: outward {match['outward_capacity_kn_m']:.3f} kN/m, inward strength {match['inward_strength_capacity_kn_m']:.3f} kN/m, inward L/150 {match['inward_service_capacity_kn_m']:.3f} kN/m",
                 ])
                 if match.get("capped_by_double_span"):

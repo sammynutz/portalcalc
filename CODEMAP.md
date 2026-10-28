@@ -16,6 +16,8 @@ packaging output.
 
 ## Start Here
 
+Release packaging is performed only when the user explicitly asks. Routine changes should remain source changes with appropriate checks.
+
 - `main.py`: customer desktop app entry point and main window.
 - `smoke_checks.py`: fastest broad regression check before packaging.
 - `PACKAGING.md`: release/build process.
@@ -34,10 +36,21 @@ packaging output.
 | `configurator_review_regression.py` | Offscreen interactive regression for request loading, UI locking, section adjustment, final exact checking, failed-result return, cancellation and atomic output. |
 | `concept_3d.py` | 3D concept data assembly, HTML preview output and Collada `.dae` export helpers. |
 | `costing.py` | Frame, purlin/girt, crane runway and storage costing summary calculations/report text. |
+| `purlin_selection.py` | Joint general/edge roof-purlin selection: shared profile with independent thicknesses, ranked by installed material weight. |
 | `loads.py` | Basic load dataclasses, load combinations, non-wind roof/wall/self-weight load application. |
 | `wind.py` | Wind input dataclasses, AS/NZS 1170.2-style wind calculation helpers, Cpe/Cpi logic, wind load application to roof and columns. |
 | `member_checks.py` | Steel member capacity checks and governing utilisation result objects. |
 | `end_wall.py` | UI-independent end-wall mullion layout, pinned-member strength selection and H/150 deflection checks. |
+| `bracing_layout.py` | Qt-free versioned bracing geometry and blocked/pinned panel constraints for desktop/BOLT; no structural analysis. See `BRACING_LAYOUT.md`. |
+| `bracing_layout_ui.py` | Interactive Qt-painted 3D location editor, face filters, local undo/redo and geometry review. |
+| `bracing_layout_regression.py` | Geometry/constraint validation, real canvas clicks, preset persistence, read-only review and no structural-credit regressions. |
+| `bracing_analysis.py` | Axial 3D network, tension-only rod equilibrium, portal interface condensation/recovery, building assembly, integrated end-wall loads and reaction balance. |
+| `bracing_analysis_desktop.py` | Actual portal/section adapter, eight directional end-wind cases, frozen result evidence and readable report. See `BRACING_ANALYSIS.md`. |
+| `bracing_analysis_ui.py` | Compatibility import for the combined bracing workspace. |
+| `bracing_workspace_ui.py` | One-window selector, section/criterion inputs, visual results, cost sizing, member inspection and TXT/JSON export. |
+| `bracing_design.py` | Scoped tension/buckling/interaction and local deflection checks; material/fitting cost and reanalysed grouped catalogue sizing. See `BRACING_DESIGN.md`. |
+| `bracing_design_regression.py` | Independent capacity/cost workings, tiny exhaustive sizing comparison, real orbit/member picking and transactional workspace save/sizing. |
+| `bracing_analysis_regression.py` | Closed-form mechanics, unreduced/reduced comparison, load/moment integration, missing-path failures and real offscreen desktop/export checks. |
 | `crane_beam.py` | Crane runway beam input/result dataclasses and section checks. |
 | `storage_loads.py` | Stored-material pressure/load calculations, storage panel design, storage load application and summary text. |
 | `elevation_drawings.py` | PDF elevation/plan/section drawing export using Qt painting. |

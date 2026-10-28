@@ -2,6 +2,14 @@
 
 All notable Portal Calc desktop releases should be recorded here.
 
+## Unreleased
+
+- Replaced the combined bracing orbit reversal with independent left/right and up/down inversion controls. Default directions now have opposite signs; legacy preferences retain horizontal direction and correct the coupled vertical direction. Both settings persist with the workspace.
+- Combined bracing selection, analysis, scoped section checks and cost-ranked automatic section sizing in one 3D workspace. Added force, governing-utilisation and exaggerated-displacement views with member picking and demand/capacity details. Sizing reanalyses catalogue candidates using current material rates, waste/stock allowances and listed turnbuckles; the bounded search is not a global optimum or complete installed quotation. Added explicit net-fracture, buckling, self-weight and end-post bending checks with editable assumptions and saved per-axis orbit controls. Connections, full combinations, automatic layout selection and production portal-restraint feedback remain separate. Source only.
+- Added on-demand fixed-layout 3D bracing analysis for pinned panels, with selected dedicated strut/end-post sections, tension-only X rods and repeated portal stiffness reduced from the current 2D frame. Solves simultaneous end-wall wind pressures in both directions for ULS/SLS and both Cpi branches; reports member forces, movements, recovered portal actions, reactions and equilibrium evidence, with readable TXT/full JSON exports. Rejects missing load paths and flags neutral-rod stability as unverified. This is first-order, wind-only demand analysis: no automatic layout selection, section/connection acceptance, cost update or portal spring coupling. Source only.
+- Added a lightweight 3D bracing-location editor on the Bracing tab. Mark blocked roof, wall and end-wall panels, optionally pin braces, filter faces and undo edits. Locations save with presets using a versioned geometry/constraint payload intended for BOLT. Changed dimensions require review. Main-building location planning and analysis leave existing Phase 1 calculations and portal springs unaffected. Drag-to-orbit direction is reversed on both axes.
+- Roof purlins now select the general and edge zones together using one common profile/depth, with independent thicknesses. The pair minimises combined material weight over the installed zone rows and passes each zone's existing strength, serviceability and bridging checks.
+
 ## 1.6.4 - 2026-10-25
 
 - Added File > Export Full Computations (PDF), with project/job/revision details, a linked contents page, bookmarks, numbered sections and page headers/footers.
