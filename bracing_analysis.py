@@ -335,7 +335,7 @@ class PortalReduction:
 
 def build_braced_building(layout, portal, strut_area_mm2, roof_brace_area_mm2,
                          wall_brace_area_mm2, end_brace_area_mm2, end_post_area_mm2,
-                         end_post_faces=("front_end", "back_end")):
+                         end_post_faces=("front_end", "back_end"), strut_overrides=None, brace_moduli=None):
     if not layout.pinned:
         raise AnalysisError("Pin the brace panels to analyse in the 3D location editor first. Available panels are not installed braces.")
     if np.max(np.abs(portal.equivalent_load), initial=0) > 1e-8:
@@ -365,8 +365,11 @@ def build_braced_building(layout, portal, strut_area_mm2, roof_brace_area_mm2,
         portal_dofs.append(dofs)
     for i, (y0, y1) in enumerate(zip(g.bay_stations_mm, g.bay_stations_mm[1:])):
         for j, x in enumerate(g.roof_stations):
-            model.add_member(AxialMember(f"strut/bay/{i}/line/{j}", roof_grid[i][j], roof_grid[i+1][j],
-                                        positive(strut_area_mm2, "Strut area"), kind="longitudinal_strut"))
+            identifier = f"strut/bay/{i}/line/{j}"
+            properties = (strut_overrides or {}).get(identifier, {})
+            model.add_member(AxialMember(identifier, roof_grid[i][j], roof_grid[i+1][j],
+                                        positive(properties.get("area_mm2", strut_area_mm2), "Strut area"),
+                                        modulus_mpa=positive(properties.get("modulus_mpa", 200000.), "Strut modulus"), kind="longitudinal_strut"))
     # Intermediate end-wall posts are axial-only in this first model. Their
     # out-of-plane end-pressure bending is represented by the roof/base split.
     for face, y in (("front_end", 0.), ("back_end", g.length_mm)):
@@ -386,6 +389,7 @@ def build_braced_building(layout, portal, strut_area_mm2, roof_brace_area_mm2,
             end = node(b, f"{identifier}, base", abs(b[2]) < 1e-6)
             model.add_member(AxialMember(f"brace/{identifier}/{j}", start, end,
                                         positive(area, "Brace area"), tension_only=True,
+                                        modulus_mpa=positive((brace_moduli or {}).get("roof_brace" if is_roof else "end_brace" if is_end else "wall_brace", 200000.), "Brace modulus"),
                                         kind="roof_brace" if is_roof else "end_brace" if is_end else "wall_brace",
                                         panel_id=identifier))
     return model, roof_grid, portal_dofs, point_nodes

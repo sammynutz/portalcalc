@@ -15,6 +15,9 @@ from bracing_analysis_desktop import analyse_context
 from costing import END_WALL_ROD_TURNBUCKLES, UB_STOCK_LENGTHS_M, section_cost_bucket
 from member_checks import (MemberActions, SectionCheckProperties, check_member,
                            tension_capacity_kn)
+from bracing_components import (StrutAssembly, StrutPlan, assembly_assessment,
+                                assembly_properties, wire_check, wire_price)
+from bracing_schedule import rod_check
 
 
 GROUPS = {"strut": "longitudinal_strut", "end_post": "end_post",
@@ -49,6 +52,32 @@ def candidate_area(candidate):
     return float(candidate["area_mm2"] if isinstance(candidate, dict) else candidate.A)
 
 
+def candidate_stiffness(candidate):
+    if isinstance(candidate, dict) and candidate.get("component_type") == "wire_rope":
+        try:
+            return float(candidate.get("rating", {}).get("ea_kn", 0))*1000
+        except (TypeError, ValueError):
+            return 0.
+    return 200000*candidate_area(candidate)
+
+
+def candidate_properties(candidate, criteria):
+    if isinstance(candidate, dict) and candidate.get("component_type") == "scheduled_rod":
+        return dict(candidate)
+    if isinstance(candidate, StrutPlan):
+        return {"type": "strut_plan", "members": {key: candidate_properties(value, criteria) for key, value in candidate.members.items()}}
+    if isinstance(candidate, StrutAssembly):
+        props = assembly_properties(candidate)
+        for record, component in zip(props["components"], candidate.components):
+            if component["type"] == "steel":
+                record["section_properties"] = asdict(section_properties(component["profile"], criteria))
+        return props
+    if isinstance(candidate, dict) and candidate.get("component_type") == "wire_rope":
+        return {"type": "wire_rope", "diameter_mm": candidate["diameter_mm"], "rating": candidate.get("rating", {}),
+                "reference_area_mm2": candidate["area_mm2"], "area_basis": "Reference for equivalent E only, not solid steel or strength area"}
+    return asdict(section_properties(candidate, criteria))
+
+
 def selected_key(selections):
     return tuple(candidate_name(selections[group]) for group in GROUPS)
 
@@ -74,7 +103,18 @@ def section_properties(candidate, criteria):
 def member_assessment(result, member_index, candidate, criteria):
     """Candidate screening uses a frozen demand envelope; final adoption re-solves."""
     criteria.validate()
+    if isinstance(candidate, StrutAssembly):
+        return assembly_assessment(result, member_index, candidate, criteria, member_assessment)
     member = result["cases"][0]["members"][member_index]
+    if isinstance(candidate, dict) and candidate.get("component_type") in {"wire_rope", "scheduled_rod"}:
+        check = wire_check if candidate["component_type"] == "wire_rope" else rod_check
+        rows = [check(candidate, case["members"][member_index]["axial_n"]/1000, case["case"]["name"])
+                for case in result["cases"] if case["case"]["level"] == "ULS"]
+        governing = next((r for r in rows if r["ratio"] is None), None) or max(rows, key=lambda row: row["ratio"])
+        ratio = governing["ratio"]
+        return {"id": member["id"], "section": candidate_name(candidate), "ratio": ratio,
+                "mode": governing["mode"], "case": governing["case"], "case_checks": rows,
+                "passes": ratio is not None and ratio <= 1}
     section = section_properties(candidate, criteria)
     length = member["length_mm"]
     group = member["kind"]
@@ -143,12 +183,47 @@ def member_assessment(result, member_index, candidate, criteria):
 
 
 def group_assessments(result, group, candidate, criteria):
-    return [member_assessment(result, i, candidate, criteria)
+    return [member_assessment(result, i, candidate.members[member["id"]] if isinstance(candidate, StrutPlan) else candidate, criteria)
             for i, member in enumerate(result["cases"][0]["members"]) if member["kind"] == GROUPS[group]]
 
 
 def group_cost(result, group, candidate, rates):
     members = group_members(result, group)
+    if isinstance(candidate, StrutPlan):
+        items = []
+        for member in members:
+            option = candidate.members[member["id"]]
+            single = {**result, "cases": [{**result["cases"][0], "members": [member]}]}
+            length = member["length_mm"]/1000
+            if not isinstance(option, StrutAssembly):
+                items.append(group_cost(single, group, option, rates))
+                continue
+            for component in option.components:
+                if component["type"] == "steel":
+                    items.append({**group_cost(single, group, component["profile"], rates), "member": member["id"]})
+                else:
+                    area = component["data"]["area_mm2"]
+                    kg = area*length*.00785
+                    purchased = 0. if component["existing"] else kg*1.07
+                    rate = float(rates.get("purlin", rates["ub"]))
+                    if not math.isfinite(rate) or rate < 0:
+                        raise AnalysisError("Purlin cost rate must be finite and non-negative")
+                    items.append({"member": member["id"], "section": component["data"]["section"],
+                                  "existing": component["existing"], "installed_kg": kg, "purchased_kg": purchased,
+                                  "installed_length_m": length, "purchased_length_m": 0. if component["existing"] else length*1.07,
+                                  "material_cost": purchased*rate, "listed_fittings_cost": 0., "total": purchased*rate})
+        return {"group": group, "section": candidate.name, "member_count": len(members),
+                **{key: sum(item.get(key, 0) for item in items) for key in ("installed_kg", "purchased_kg", "installed_length_m", "purchased_length_m", "material_cost", "listed_fittings_cost", "total")},
+                "material_rate_per_kg": 0., "allowance": "Incremental additions only; existing roof purlins already costed in the building",
+                "component_costs": items, "incremental_only": True}
+    if isinstance(candidate, StrutAssembly):
+        return group_cost(result, group, StrutPlan({m["id"]: candidate for m in members}, candidate), rates)
+    if isinstance(candidate, dict) and candidate.get("component_type") == "wire_rope":
+        length = sum(m["length_mm"] for m in members)/1000
+        priced = wire_price(candidate, length, len(members)) if members else {"material_cost": 0., "listed_fittings_cost": 0., "total": 0., "allowance": "Not installed"}
+        return {"group": group, "section": candidate_name(candidate), "member_count": len(members),
+                "installed_length_m": length, "purchased_length_m": length, "installed_kg": 0., "purchased_kg": 0.,
+                "material_rate_per_kg": 0., **priced, "mass_basis": "Not inferred from nominal diameter"}
     area = candidate_area(candidate)
     if isinstance(candidate, dict):
         bucket = "ub"
@@ -173,7 +248,13 @@ def group_cost(result, group, candidate, rates):
     installed_kg = area*length*.00785
     purchased_kg = area*costed_length*.00785
     fitting_cost = 0.
-    if isinstance(candidate, dict) and "ROD" in candidate_name(candidate).upper():
+    if isinstance(candidate, dict) and candidate.get("component_type") == "scheduled_rod" and members:
+        price = candidate.get("fitting_unit_cost")
+        if price is None or not math.isfinite(float(price)) or float(price) < 0:
+            raise AnalysisError(f"Enter a fitting price for {candidate['forged_turnbuckle']} on {candidate_name(candidate)}")
+        fitting_cost = len(members)*float(price)
+        allowance += f"; one {candidate['forged_turnbuckle']} forged-rated turnbuckle per diagonal (connection capacity unchecked)"
+    elif isinstance(candidate, dict) and candidate.get("component_type") != "scheduled_rod" and "ROD" in candidate_name(candidate).upper():
         diameter = int(re.search(r"\d+", candidate_name(candidate))[0])
         if diameter not in END_WALL_ROD_TURNBUCKLES:
             raise AnalysisError(f"No turnbuckle price for {candidate_name(candidate)}")
@@ -187,6 +268,9 @@ def group_cost(result, group, candidate, rates):
 
 def attach_design(result, selections, criteria, rates):
     criteria.validate()
+    if isinstance(selections["strut"], StrutPlan):
+        from purlin_beam_design import with_beam_demands
+        result = with_beam_demands(result, selections["strut"])
     checks = {}
     costs = []
     for group, candidate in selections.items():
@@ -206,7 +290,7 @@ def attach_design(result, selections, criteria, rates):
     stable = all(case["tangent_status"] == "positive_with_taut_rods" for case in result["cases"])
     passes = all(row["passes"] for row in checks.values()) and drift["ratio"] <= 1 and stable
     request = {"source_hash": result["source_hash"], "sections": {g: candidate_name(c) for g, c in selections.items()},
-               "section_properties": {g: asdict(section_properties(c, criteria)) for g, c in selections.items()},
+               "section_properties": {g: candidate_properties(c, criteria) for g, c in selections.items()},
                "net_fracture_multiplier": .85, "criteria": asdict(criteria), "cost_rates": rates}
     result["design_request"] = request
     result["design_request_hash"] = hashlib.sha256(json.dumps(request, sort_keys=True, allow_nan=False).encode()).hexdigest()
@@ -215,11 +299,22 @@ def attach_design(result, selections, criteria, rates):
                         "global_sls": drift, "taut_tangent_verified": stable,
                         "estimated_cost": sum(row["total"] for row in costs), "cost_items": costs,
                         "cost_model": {"stock_lengths_m": UB_STOCK_LENGTHS_M, "hollow_waste_factor": 1.07,
-                                       "rod_turnbuckle_prices": END_WALL_ROD_TURNBUCKLES},
-                        "basis": "Existing preliminary member engine with explicit 0.85 net-fracture multiplier; one section per strut/post/roof/side/end group. Configured net-area/kt and effective-length assumptions. Strong-axis bending orientation. Wind plus local member self-weight checks only; connections and full load combinations remain separate.",
+                                       "legacy_fitting_price_catalogue": END_WALL_ROD_TURNBUCKLES,
+                                       "selected_scheduled_fittings": {g: {key: c.get(key) for key in
+                                           ("forged_turnbuckle", "grade_s_turnbuckle", "fitting_unit_cost")}
+                                           for g, c in selections.items() if isinstance(c, dict) and c.get("component_type") == "scheduled_rod"}},
+                        "basis": "Project-schedule rods/ropes use supplied factored brace strengths directly. Other members use the preliminary member engine with explicit 0.85 net-fracture multiplier and configured net-area/kt/effective lengths. One section per steel strut/post/brace group. Strong-axis bending orientation. Wind plus local member self-weight checks only; connections and full load combinations remain separate.",
                         "cost_basis": "Current Costing rates, exact brace lengths, 7% hollow waste, rolled stock rounding, one listed turnbuckle per rod. Angle fittings, other connections, labour and supplier availability/quotes are not priced."}
     result["limitations"] = [line for line in result["limitations"] if not line.startswith(("Forces are analysis demands only.", "Fixed pinned-panel layout;"))]
     result["limitations"] += [result["design"]["basis"], result["design"]["cost_basis"]]
+    if isinstance(selections["strut"], StrutPlan):
+        old_basis, old_cost = result["design"]["basis"], result["design"]["cost_basis"]
+        result["design"]["basis"] = "Per-location common-end purlin/added-member assemblies. Installed compression uses the project-adopted Lysaght May 1999 p20 simplified method with Metroll 2023 p7 Ag/web-axis radius, or declared Nc/Nex ratings as selected. Tension uses separate declared Nt. Independent bending/axial envelopes. Added cold-formed plies use separate residual ratings. Back-to-back roof sharing only when declared. Common-end/collector force transfer is assumed; its connection capacity is unchecked. No composite bending I."
+        result["design"]["cost_basis"] = "Incremental added struts/purlins only; existing roof purlins already costed. New purlins use 7% waste at the captured purlin rate. Other connections/labour excluded."
+        result["limitations"] = [line for line in result["limitations"] if not line.startswith("Dedicated axial struts") and line not in (old_basis, old_cost)]
+        result["limitations"] += [result["design"]["basis"], result["design"]["cost_basis"]]
+        if result.get("purlin_beams", {}).get("runs"):
+            result["limitations"].append("Sheeted additions use a separate first-order roof-run beam model with entered finite cladding/fastener stiffness and independent single-span rotations. No global diaphragm/portal bending credit. Redistributed M/V member ratings and cladding transfer connection capacities remain explicit; missing stiffness or member capacities cannot pass.")
     return result
 
 
@@ -235,6 +330,9 @@ def auto_size(context, selections, candidates, criteria, rates, progress=None, m
     Returns the lowest-cost passing reanalysed candidate found. Stiffness floors
     may rise to meet global SLS. No claim of exhaustive/global optimality.
     """
+    if isinstance(selections["strut"], StrutPlan):
+        from bracing_mixed_sizing import auto_size_mixed
+        return auto_size_mixed(context, selections, candidates, criteria, rates, progress, max_solves)
     current = dict(selections)
     result = solve_selection(context, current, criteria, rates)
     best = (result, dict(current)) if result["design"]["passes"] else None
@@ -254,14 +352,14 @@ def auto_size(context, selections, candidates, criteria, rates, progress=None, m
         if result["design"]["global_sls"]["ratio"] > 1:
             factor = min(max(result["design"]["global_sls"]["ratio"], 1.12), 2.)
             for group in GROUPS:
-                floors[group] = max(floors[group], candidate_area(current[group])*factor)
+                floors[group] = max(floors[group], candidate_stiffness(current[group])*factor)
         proposed = dict(current)
         for group in GROUPS:
             if not group_members(result, group):
                 continue
             ranked = []
             for candidate in candidates[group]:
-                if candidate_area(candidate) < floors[group]-1e-9:
+                if candidate_stiffness(candidate) < floors[group]-1e-9:
                     continue
                 screens += 1
                 if all(row["passes"] for row in group_assessments(result, group, candidate, criteria)):

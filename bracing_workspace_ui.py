@@ -16,6 +16,10 @@ from bracing_analysis_desktop import text_report
 from bracing_design import DesignCriteria, auto_size, candidate_name, solve_selection
 from bracing_layout import BracingLayout, LayoutGeometry
 from bracing_layout_ui import BracingLayoutDialog
+from bracing_component_ui import ComponentEditor
+from bracing_components import StrutPlan
+from purlin_beam_ui import PurlinBeamResults
+from bracing_sizing_diagnostics import SizingStopped, diagnostic_text
 
 
 class BracingAnalysisDialog(QDialog):
@@ -36,6 +40,10 @@ class BracingAnalysisDialog(QDialog):
         self.auto_button = QPushButton("Auto size for lowest checked cost")
         toolbar.addWidget(self.run_button)
         toolbar.addWidget(self.auto_button)
+        self.sizing_issue_button = QPushButton("Review sizing issue")
+        self.sizing_issue_button.hide()
+        self.sizing_issue_button.clicked.connect(self.review_sizing_issue)
+        toolbar.addWidget(self.sizing_issue_button)
         self.visual_mode = QComboBox()
         for label, value in (("Layout constraints", "layout"), ("Axial forces", "forces"), ("Governing utilisation", "utilisation"), ("Deformed shape", "deformed")):
             self.visual_mode.addItem(label, value)
@@ -82,11 +90,9 @@ class BracingAnalysisDialog(QDialog):
         middle.addWidget(self.panel_list_container)
         self.panel_list_container.hide()
         show_list.toggled.connect(self.panel_list_container.setVisible)
-        # Keep the old horizontal preference but correct its coupled vertical
-        # direction. Explicit per-axis preferences always take precedence.
-        legacy_horizontal = bool(saved.get("reverse_orbit", False))
-        editor.orbit_horizontal.setChecked(bool(saved.get("invert_orbit_horizontal", legacy_horizontal)))
-        editor.orbit_vertical.setChecked(bool(saved.get("invert_orbit_vertical", not legacy_horizontal)))
+        # User-selected fixed convention, independent of older saved preferences.
+        editor.orbit_horizontal.setChecked(True)
+        editor.orbit_vertical.setChecked(False)
         self.canvas = editor.canvas
         self.canvas.setMinimumHeight(280)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -103,12 +109,14 @@ class BracingAnalysisDialog(QDialog):
         self.strut_combo, self.post_combo = QComboBox(), QComboBox()
         self.populate(self.strut_combo, self.strut_profiles, saved.get("strut_section"), 1500)
         self.populate(self.post_combo, self.post_profiles, saved.get("end_post_section") or context.get("default_end_post"), 2500)
-        form.addRow("Longitudinal struts", self.strut_combo)
+        self.component_editor = ComponentEditor(context, self.strut_profiles,
+            catalog.profile_by_name.get(self.strut_combo.currentData(), self.strut_profiles[0]), saved, read_only)
+        form.addRow("Uniform steel (alternative model)", self.strut_combo)
         form.addRow("End-wall posts", self.post_combo)
         self.brace_combos = {}
         for group, label in (("roof_brace", "Roof X braces"), ("wall_brace", "Side-wall X braces"), ("end_brace", "End-wall X braces")):
             combo = QComboBox()
-            for brace in context["end_brace_options"]:
+            for brace in self.component_editor.brace_candidates():
                 combo.addItem(brace["label"], brace)
             name = saved.get(f"{group}_label") or context[group]["label"]
             index = combo.findText(name)
@@ -123,7 +131,7 @@ class BracingAnalysisDialog(QDialog):
         group = QGroupBox("Section-check assumptions")
         grid = QGridLayout(group)
         stored = saved.get("criteria", {}) if isinstance(saved.get("criteria"), dict) else {}
-        labels = ("Brace Fy (MPa)", "Brace Fu (MPa)", "Net / gross area", "Tension kt", "Strut effective K", "Post effective K", "SLS H/n or L/n")
+        labels = ("Angle/default Fy (MPa)", "Angle/default Fu (MPa)", "Net / gross area", "Tension kt", "Strut effective K", "Post effective K", "SLS H/n or L/n")
         self.criteria_inputs = {}
         for i, ((name, value), label) in enumerate(zip(asdict(DesignCriteria()).items(), labels)):
             box = QDoubleSpinBox()
@@ -137,7 +145,7 @@ class BracingAnalysisDialog(QDialog):
             grid.addWidget(box, i//2, 2*(i%2)+1)
             self.criteria_inputs[name] = box
         inputs.addWidget(group)
-        notes = QLabel("One section per strut/post/roof/side/end group. Struts include buckling and local self-weight bending. Posts include end-wind bending. Net-area/kt values are assumptions pending connection details; strong-axis bending orientation is assumed.\n\nCost basis: current Costing rates, waste/stock allowances and listed rod turnbuckles. Other fittings, labour and supplier stock are not priced. Bounded sizing reanalyses candidates; it is not a global layout optimum.")
+        notes = QLabel("Per-location roof-purlin reuse is the default: use Components / ratings for connected counts, additions and supplier ratings. Uncheck that mode for the uniform dedicated-steel approximation. The supplied schedule sets Grade 300 rod and Grade 1570 wire strengths. Wire sizes 8/10/12/14/16 mm still need rope EA/source and prices.\n\nPosts include end-wind bending. Net-area/kt applies to other steel members, not the schedule's already factored brace strengths. Sizing reanalyses candidates; it is not a global optimum. Connections, labour and supplier availability remain separate.")
         notes.setWordWrap(True)
         inputs.addWidget(notes)
         rates = context["cost_rates"]
@@ -163,6 +171,9 @@ class BracingAnalysisDialog(QDialog):
         self.report.setReadOnly(True)
         self.report.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.tabs.addTab(self.report, "Full results")
+        self.tabs.addTab(self.component_editor, "Components / ratings")
+        self.beam_results = PurlinBeamResults()
+        self.tabs.addTab(self.beam_results, "Purlin beam results")
         splitter.addWidget(self.tabs)
         splitter.setSizes([800, 600])
         layout.addWidget(splitter, 1)
@@ -188,6 +199,7 @@ class BracingAnalysisDialog(QDialog):
             box.setEnabled(not read_only)
             box.valueChanged.connect(self.invalidate)
         editor.layoutChanged.connect(self.invalidate)
+        self.component_editor.changed.connect(self.invalidate)
         self.visual_mode.currentIndexChanged.connect(self.change_visual_mode)
         self.case_combo.currentIndexChanged.connect(self.show_case)
         self.deformation_scale.valueChanged.connect(self.change_visual_mode)
@@ -215,7 +227,8 @@ class BracingAnalysisDialog(QDialog):
                 **{f"{g}_label": (c.currentData() or {}).get("label") for g, c in self.brace_combos.items()},
                 "criteria": asdict(self.criteria()),
                 "invert_orbit_horizontal": self.canvas.invert_orbit_horizontal,
-                "invert_orbit_vertical": self.canvas.invert_orbit_vertical}
+                "invert_orbit_vertical": self.canvas.invert_orbit_vertical,
+                **self.component_editor.snapshot()}
 
     def layout_snapshot(self):
         return self.layout_editor.snapshot()
@@ -225,9 +238,12 @@ class BracingAnalysisDialog(QDialog):
                 and all(c.currentData() is not None for c in self.brace_combos.values()))
 
     def selections(self):
-        return {"strut": self.catalog.profile_by_name[self.strut_combo.currentData()],
+        fallback = self.catalog.profile_by_name[self.strut_combo.currentData()]
+        wires = {option["label"]: option for option in self.component_editor.brace_candidates()}
+        strut = self.component_editor.plan(self.current_context(), fallback) if self.component_editor.mixed.isChecked() else fallback
+        return {"strut": strut,
                 "end_post": self.catalog.profile_by_name[self.post_combo.currentData()],
-                **{g: c.currentData() for g, c in self.brace_combos.items()}}
+                **{g: wires.get((c.currentData() or {}).get("label"), c.currentData()) for g, c in self.brace_combos.items()}}
 
     def current_context(self):
         editor = self.layout_editor
@@ -246,16 +262,20 @@ class BracingAnalysisDialog(QDialog):
         if self._running:
             return
         self.result, self.report_text = None, ""
+        self.sizing_issue_button.hide()
         self.layout_editor.save_button.hide()
+        self.component_editor.refresh_bracing(self.layout_editor.model.pinned)
         self.report.clear()
         self.case_combo.clear()
         self.member_table.setRowCount(0)
         self.canvas.set_result(None)
+        self.beam_results.set_result(None)
         self.visual_mode.setCurrentIndex(0)
         self.change_visual_mode()
         self.export_json_button.setEnabled(False)
         self.export_text_button.setEnabled(False)
         self.run_button.setEnabled(self.valid_settings())
+        self.strut_combo.setEnabled(not self.component_editor.mixed.isChecked() and not self.read_only)
         self.auto_button.setEnabled(self.valid_settings() and not self.read_only)
         self.member_detail.setText("Click a member in the view or table for its governing check.")
         self.status_label.setText(f"{len(self.layout_editor.model.pinned)} pinned X panels. Pin a fixed layout, then analyse/check or auto-size. Input changes clear previous results.")
@@ -264,6 +284,7 @@ class BracingAnalysisDialog(QDialog):
         self._running = busy
         self.layout_editor.setEnabled(not busy)
         self.input_page.setEnabled(not busy)
+        self.component_editor.setEnabled(not busy)
         self.run_button.setEnabled(not busy and self.valid_settings())
         self.auto_button.setEnabled(not busy and self.valid_settings() and not self.read_only)
         self.save_button.setEnabled(not busy)
@@ -299,9 +320,12 @@ class BracingAnalysisDialog(QDialog):
                     if progress.wasCanceled():
                         raise AnalysisError("Sizing cancelled; sections are unchanged")
                 candidates = {"strut": self.strut_profiles, "end_post": self.post_profiles,
-                              **{g: context["end_brace_options"] for g in self.brace_combos}}
+                              **{g: self.component_editor.brace_candidates() for g in self.brace_combos}}
                 result, chosen = auto_size(context, self.selections(), candidates, self.criteria(), context["cost_rates"], update)
                 for g, combo in (("strut", self.strut_combo), ("end_post", self.post_combo)):
+                    if g == "strut" and isinstance(chosen[g], StrutPlan):
+                        self.component_editor.adopt(chosen[g])
+                        continue
                     with QSignalBlocker(combo):
                         combo.setCurrentIndex(combo.findData(chosen[g].name))
                 for g, combo in self.brace_combos.items():
@@ -310,6 +334,16 @@ class BracingAnalysisDialog(QDialog):
             else:
                 result = solve_selection(context, self.selections(), self.criteria(), context["cost_rates"])
             self.display_result(result)
+        except SizingStopped as error:
+            self.display_result(error.result)
+            self.report_text = diagnostic_text(error.diagnostic)+"\n\n"+self.report_text
+            self.report.setPlainText(self.report_text)
+            self.sizing_issue_button.show()
+            case = self.case_combo.findText(error.diagnostic["case"])
+            if case >= 0:
+                self.case_combo.setCurrentIndex(case)
+            self.inspect_member(error.diagnostic["member"])
+            self.status_label.setText(f"Auto sizing stopped: {error}. Current selections retained; use Review sizing issue.")
         except (AnalysisError, ValueError, ArithmeticError) as error:
             self.status_label.setText(f"Analysis/sizing failed: {error}")
             self.report.setPlainText(str(error))
@@ -319,6 +353,11 @@ class BracingAnalysisDialog(QDialog):
             QApplication.restoreOverrideCursor()
             self.set_busy(False)
 
+    def review_sizing_issue(self):
+        if self.result and self.result.get("sizing_failure"):
+            self.tabs.setCurrentWidget(self.component_editor)
+            self.component_editor.focus_sizing_issue(self.result["sizing_failure"])
+
     def display_result(self, result):
         self.result = result
         d = result["design"]
@@ -326,7 +365,13 @@ class BracingAnalysisDialog(QDialog):
         rows = ["SCOPED SECTION CHECKS", state, f"Estimated materials + listed fittings: ${d['estimated_cost']:,.2f}",
                 f"Global SLS ratio: {d['global_sls']['ratio']:.3f}", d["basis"], d["cost_basis"], ""]
         rows += ["COST BREAKDOWN | Purchased kg | $/kg | Material | Listed fittings | Total"]
-        rows += [f"{r['group']}: {r['section']} | {r['purchased_kg']:.2f} | {r['material_rate_per_kg']:.2f} | ${r['material_cost']:.2f} | ${r['listed_fittings_cost']:.2f} | ${r['total']:.2f}" for r in d["cost_items"]]
+        for r in d["cost_items"]:
+            if "price_per_m" in r:
+                rows.append(f"{r['group']}: {r['section']} | {r['purchased_length_m']:.2f} m @ ${r['price_per_m']:.2f}/m | material ${r['material_cost']:.2f} | fittings ${r['listed_fittings_cost']:.2f} | total ${r['total']:.2f}")
+            elif r.get("incremental_only"):
+                rows.append(f"{r['group']}: per-location additions | purchased {r['purchased_kg']:.2f} kg | material ${r['material_cost']:.2f} | total ${r['total']:.2f}; existing purlins excluded from added cost; see component cost record")
+            else:
+                rows.append(f"{r['group']}: {r['section']} | {r['purchased_kg']:.2f} | {r['material_rate_per_kg']:.2f} | ${r['material_cost']:.2f} | ${r['listed_fittings_cost']:.2f} | ${r['total']:.2f}")
         rows += [""]
         if "sizing_search" in result:
             s = result["sizing_search"]
@@ -335,7 +380,34 @@ class BracingAnalysisDialog(QDialog):
         for c in result["section_checks"].values():
             uc = f"{c['ratio']:.3f}" if c["ratio"] is not None else "NOT CHECKED"
             rows.append(f"{c['id']} | {c['section']} | {uc} | {c['mode']} | {c['case']}")
+        rows += ["", "SIMPLIFIED PURLIN COMPRESSION / BENDING WORKINGS", "Lysaght Zeds & Cees, May 1999 p20; Metroll MEGASPAN 2023 p7 properties. Ns=903 Ag/(L/rx')^2; Nav=Ns(1-Wa/Ws); compression UC=N/Ns+Wa/Ws. No extra phi or Euler amplification."]
+        for c in result["section_checks"].values():
+            for r in c["case_checks"]:
+                if r.get("method") == "lysaght_1999" and "section_properties" in r:
+                    p = r["section_properties"]
+                    uc = "UNVERIFIED" if r["ratio"] is None else f"{r['ratio']:.4f}"
+                    rows.append(f"{c['id']} | {r['case']} | component {r['component']+1} | {p['shape']} | Ag {p['area_mm2']:.2f} mm2; rx' {p['web_rx_mm']:.2f} mm; L {r['span_mm']:.1f} mm; Ns {r['compression_capacity_kn']:.3f} kN; bending {r['bending_ratio']:.4f}; Nav {r['available_compression_kn']:.3f} kN; axial {r['axial_kn']:.3f} kN; UC {uc}; {r['mode']}")
+        for key, run in result.get("purlin_beams", {}).get("runs", {}).items():
+            rows += ["", f"SHEETED PURLIN BEAM | ROOF LINE {int(key)+1}"]
+            if run.get("error"):
+                rows.append("UNVERIFIED: "+run["error"])
+                continue
+            rows += [run["basis"], run["note"],
+                     f"Cladding coupling {run['coupling_kn_m_per_mm']:g} kN/m per mm; source: {run['coupling_source'] or 'MISSING - zero-sharing fallback, UNVERIFIED'}",
+                     f"Direct roof pickup to added member: {run['direct_roof_pickup_fraction']:.2%}; inputs defined: {run['coupling_defined']}",
+                     f"Existing spans: {run['span_type']}; lap ratio: {run['lap_ratio']}; roof releases after bays: {run['roof_releases_after_bays']}; added single-span bays: {[b+1 for b in run['added_bays']]}",
+                     "Member acceptance uses separately entered M+/M-/V capacities for redistributed diagrams. UDL table capacities are not reused.",
+                     "Roof load case | Bay | Role | M+ kNm | M- kNm | V kN | Deflection mm | Cladding transfer kN | Peak transfer kN/m"]
+            for case in run["cases"]:
+                rows.append(f"{case['name']}: applied {case['applied_load_n']:.3f} N; reaction {case['support_reaction_n']:.3f} N; balance error {case['vertical_balance_error_n']:.3g} N")
+                for i, bay in enumerate(case["bays"]):
+                    for role in ("roof", "added"):
+                        actions = bay[role]
+                        if not actions["samples"]:
+                            continue
+                        rows.append(f"{case['name']} | {i+1} | {role} | {actions['positive_moment_knm']:.4f} | {actions['negative_moment_knm']:.4f} | {actions['shear_kn']:.4f} | {actions['deflection_mm']:.4f} | {bay['transfer_kn']:.4f} | {bay['peak_transfer_kn_m']:.4f}")
         self.report_text = "\n".join(rows+["", text_report(result)])
+        self.beam_results.set_result(result)
         self.report.setPlainText(self.report_text)
         for case in result["cases"]:
             self.case_combo.addItem(case["case"]["name"])
@@ -407,8 +479,22 @@ class BracingAnalysisDialog(QDialog):
         text = self.canvas.member_description(identifier)
         check = self.result["section_checks"][identifier]
         row = next((r for r in check["case_checks"] if r["case"] == check["case"]), {})
-        if "capacity_kn" in row:
-            text += f"\nN* {row['tension_kn']:.3f} kN / phi Nt {row['capacity_kn']:.3f} kN (yield {row['gross_yield_kn']:.3f}, net fracture {row['net_fracture_kn']:.3f})"
+        if row.get("method") == "coupled_purlin_beam":
+            text += f"\n{row['beam_role'].title()} beam, bay {row['beam_bay']+1}; axial {row['axial_kn']:.3f} kN. {row['mode']}"
+            for d in row.get("beam_demands", []):
+                text += f"\n{d['case']}: M+ {d['positive_moment_knm']:.3f}, M- {d['negative_moment_knm']:.3f} kNm; V {d['shear_kn']:.3f} kN; deflection {d['deflection_mm']:.3f} mm"
+        elif "capacity_kn" in row:
+            text += f"\nN* {row['tension_kn']:.3f} kN / design capacity {row['capacity_kn']:.3f} kN"
+            if "gross_yield_kn" in row:
+                text += f" (yield {row['gross_yield_kn']:.3f}, net fracture {row['net_fracture_kn']:.3f})"
+        elif row.get("method") == "lysaght_1999" and "section_properties" in row:
+            p = row["section_properties"]
+            text += f"\nLysaght 1999 simplified: Ag {p['area_mm2']:.1f} mm2, rx' {p['web_rx_mm']:.2f} mm, L {row['span_mm']:.0f} mm. Ns {row['compression_capacity_kn']:.3f} kN; bending {row['bending_ratio']:.3f}; available compression {row['available_compression_kn']:.3f} kN."
+            text += f"\n{row['mode']}"
+        elif "compression_capacity_kn" in row:
+            text += f"\nPurlin N {row['axial_kn']:.3f} kN; Nc {row['compression_capacity_kn']:.3f}, Nt {row['tension_capacity_kn']:.3f} kN"
+            if "elastic_buckling_kn" in row:
+                text += f"; Nex {row['elastic_buckling_kn']:.3f} kN; bending ratio {row['bending_ratio']:.3f}"
         elif "checks" in row:
             for name in ("compression", "tension", "bending", "shear"):
                 item = row["checks"][name]

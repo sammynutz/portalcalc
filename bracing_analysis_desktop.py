@@ -101,6 +101,42 @@ def prepare_context(window, allow_unconfigured=False):
     cases = end_wind_cases(wind_inputs)
     source = copy.deepcopy(window.collect_preset_data())
     profile = (window.end_wall_mullion_design or {}).get("selected") or {}
+    installed = {}
+    purlin_check = window.purlin_check or {}
+    for line, x in enumerate(g.roof_stations):
+        points = (window.purlin_layout.points if window.purlin_layout else [])
+        if not points:
+            continue
+        px, pz = min(points, key=lambda p: abs(p[0]-(left.x+x)))
+        proximity = min(math.hypot(px-left.x, pz-left.y), math.hypot(px-right.x, pz-right.y))
+        edge = proximity < float(purlin_check.get("local_dimension_a_m", 0))*1000
+        match = purlin_check.get("local_match" if edge else "match", {})
+        if match.get("status") != "OK":
+            continue
+        prefix = "local_" if edge else ""
+        area = match["area_mm2"]
+        w = area*7.85e-6*9.80665
+        installed[str(line)] = {"section": match["section"], "area_mm2": area,
+            "bending_ratio": max(purlin_check[prefix+"outward_kn_m"]/match["outward_capacity_kn_m"],
+                                 purlin_check[prefix+"inward_strength_kn_m"]/match["inward_strength_capacity_kn_m"]),
+            "service_ratio": purlin_check[prefix+"inward_service_kn_m"]/match["inward_service_capacity_kn_m"],
+            "added_bending_ratio": 1.2*w/match["inward_strength_capacity_kn_m"],
+            "added_service_ratio": w/match["inward_service_capacity_kn_m"],
+            "basis_key": f"{match['section']}|{purlin_check['span_type']}|{match.get('tables')}|{match.get('outward_bridging')}|{match.get('inward_bridging')}",
+            "zone": "edge" if edge else "general", "nearest_installed_x_mm": px-left.x,
+            "node_offset_mm": px-left.x-x, "bending_snapshot": copy.deepcopy(match),
+            "source": "Existing Metroll bending-table check; axial ratings must be supplied separately"}
+        installed[str(line)]["bending_span_mm"] = purlin_check["span_mm"]
+        installed[str(line)]["beam_inputs"] = {"span_type": purlin_check["span_type"],
+            "outward_kn_m": purlin_check[prefix+"outward_kn_m"],
+            "inward_strength_kn_m": purlin_check[prefix+"inward_strength_kn_m"],
+            "service_kn_m": purlin_check[prefix+"inward_service_kn_m"],
+            "permanent_kn_m": purlin_check["permanent_kpa"]*purlin_check["spacing_mm"]/1000,
+            "gravity_service_kn_m": (purlin_check["permanent_kpa"]+purlin_check["live_kpa"])*purlin_check["spacing_mm"]/1000}
+        installed[str(line)]["bending_key"] = hashlib.sha256(json.dumps({
+            key: installed[str(line)][key] for key in ("section", "area_mm2", "bending_ratio", "service_ratio",
+                "added_bending_ratio", "added_service_ratio", "basis_key", "bending_span_mm", "bending_snapshot", "beam_inputs")
+        }, sort_keys=True).encode()).hexdigest()
     return {
         "layout": layout, "nominal_layout": saved.to_dict(), "nominal_geometry": nominal, "portal": portal, "cases": cases,
         "roof_brace": copy.deepcopy(window.selected_brace_size(window.roof_brace_size_combo)),
@@ -114,7 +150,9 @@ def prepare_context(window, allow_unconfigured=False):
         "front_clad": wind_inputs.front_wall_clad, "back_clad": wind_inputs.back_wall_clad,
         "cost_rates": {"shs": window.costing_rate_from_input(window.shs_cost_input, "shs_rate_per_kg"),
                        "ub": window.costing_rate_from_input(window.ub_cost_input, "ub_rate_per_kg"),
-                       "wb": window.costing_rate_from_input(window.wb_cost_input, "wb_rate_per_kg")},
+                       "wb": window.costing_rate_from_input(window.wb_cost_input, "wb_rate_per_kg"),
+                       "purlin": window.costing_rate_from_input(window.purlin_cost_input, "purlin_rate_per_kg")},
+        "installed_purlins": installed,
     }
 
 
@@ -137,10 +175,21 @@ def analyse_context(context, strut_profile, end_post_profile):
     layout, portal = context["layout"], context["portal"]
     post_faces = {face for face, clad in (("front_end", context["front_clad"]), ("back_end", context["back_clad"]))
                   if clad or any(layout.panels[p].face == face for p in layout.pinned)}
+    from bracing_components import StrutPlan, assembly_properties, wire_modulus
+    if isinstance(strut_profile, StrutPlan):
+        expected = {f"strut/bay/{i}/line/{j}" for i in range(len(layout.geometry.bay_stations_mm)-1)
+                    for j in range(len(layout.geometry.roof_stations))}
+        if set(strut_profile.members) != expected:
+            raise AnalysisError("Strut plan must specify every current bay and roof line exactly once")
+    used = {"roof_brace" if layout.panels[p].face.startswith("roof") else "end_brace" if layout.panels[p].face in {"front_end", "back_end"} else "wall_brace" for p in layout.pinned}
+    moduli = {group: wire_modulus(context[group]) if group in used and context[group].get("component_type") == "wire_rope" else 200000.
+              for group in ("roof_brace", "wall_brace", "end_brace")}
     model, roof_grid, portal_dofs, point_nodes = build_braced_building(
         layout, portal, strut_profile.A, context["roof_brace"]["area_mm2"],
         context["wall_brace"]["area_mm2"], context["end_brace"]["area_mm2"], end_post_profile.A,
-        end_post_faces=post_faces)
+        end_post_faces=post_faces,
+        strut_overrides=strut_profile.overrides() if isinstance(strut_profile, StrutPlan) else None,
+        brace_moduli=moduli)
     cases = []
     for case in context["cases"]:
         try:
@@ -160,12 +209,16 @@ def analyse_context(context, strut_profile, end_post_profile):
            for case in cases if case["case"]["level"] == "SLS"
            for i, displacement in enumerate(case["displacements_mm"]) if i in roof_nodes]
     governing = max(sls, key=lambda item: item[0])
+    strut_record = {"section": strut_profile.name, "area_mm2": strut_profile.A}
+    if isinstance(strut_profile, StrutPlan):
+        strut_record.pop("area_mm2")
+        strut_record["per_member"] = {key: assembly_properties(value) for key, value in strut_profile.members.items()}
     return {
         "schema": "portalcalc.fixed-bracing-analysis.v1", "status": "SOLVED_DEMANDS_ONLY",
         "created_utc": datetime.now(timezone.utc).isoformat(), "elapsed_seconds": time.perf_counter()-start,
         "source_hash": context["source_hash"], "source_preset": context["source_preset"],
         "nominal_layout": context["nominal_layout"], "analysis_layout": layout.to_dict(),
-        "sections": {"strut": {"section": strut_profile.name, "area_mm2": strut_profile.A},
+        "sections": {"strut": strut_record,
                      "end_post": {"section": end_post_profile.name, "area_mm2": end_post_profile.A},
                      **{kind: context[kind] for kind in ("roof_brace", "wall_brace", "end_brace")}},
         "nodes": [{"index": i, "label": model.node_labels[i], "point_mm": p} for i, p in enumerate(model.nodes)],
@@ -187,7 +240,14 @@ def text_report(result):
              f"Nodes: {len(result['nodes'])}; free DOFs: {result['cases'][0]['free_dofs']}; each portal reduced {result['portal_full_dofs']} -> {result['portal_interface_dofs']} DOFs",
              f"Analysis time: {result['elapsed_seconds']:.3f} s", ""]
     for kind, section in result["sections"].items():
-        lines.append(f"{kind.replace('_', ' ').title()}: {section.get('section', section.get('label', '-'))}; A = {section['area_mm2']:.1f} mm2; E = 200000 MPa")
+        if "per_member" in section:
+            lines.append(f"{kind.title()}: per-location arrangements ({len(section['per_member'])} paths); see frozen component properties")
+        elif section.get("component_type") == "wire_rope":
+            lines.append(f"{kind}: {section['label']}; declared rope EA / design capacity: {section.get('rating', {})}")
+        elif section.get("component_type") == "scheduled_rod":
+            lines.append(f"{kind}: {section['label']}; Grade {section['grade_mpa']:g}; supplied factored tension {section['design_tension_kn']:g} kN; forged-rated {section['forged_turnbuckle']} / Grade S {section['grade_s_turnbuckle']}; {section['capacity_source']}")
+        else:
+            lines.append(f"{kind.replace('_', ' ').title()}: {section.get('section', section.get('label', '-'))}; A = {section['area_mm2']:.1f} mm2; E = 200000 MPa")
     lines += ["", "SCOPE AND ASSUMPTIONS"] + [f"- {item}" for item in result["limitations"]]
     lines += ["", "ULS MEMBER DEMAND ENVELOPES (positive magnitudes, kN)", "Member | Type | Tension | Compression | Governing source"]
     for item in result["member_envelopes"]:

@@ -50,6 +50,13 @@ Release packaging is performed only when the user explicitly asks. Routine chang
 | `bracing_workspace_ui.py` | One-window selector, section/criterion inputs, visual results, cost sizing, member inspection and TXT/JSON export. |
 | `bracing_design.py` | Scoped tension/buckling/interaction and local deflection checks; material/fitting cost and reanalysed grouped catalogue sizing. See `BRACING_DESIGN.md`. |
 | `bracing_design_regression.py` | Independent capacity/cost workings, tiny exhaustive sizing comparison, real orbit/member picking and transactional workspace save/sizing. |
+| `bracing_components.py`, `bracing_component_ui.py` | Per-location installed/added purlin and steel assemblies, axial/bending ratings, common-end force sharing and rope EA/price input. |
+| `purlin_combined.py` | Adopted Lysaght May 1999 simplified compression/bending calculation; verified Metroll 2023 C/Z web-axis properties, source evidence and worked output. |
+| `purlin_beam.py`, `purlin_beam_design.py` | Roof-run Euler-Bernoulli model, finite distributed cladding coupling, direct load pickup, single-span additions, demand evidence and gated M/V/axial checks. |
+| `purlin_beam_ui.py`, `purlin_beam_regression.py` | Native moment/shear/deflection/transfer plots; independent beam and load-sharing benchmarks, whole-run sizing and workspace persistence tests. |
+| `bracing_schedule.py` | Supplied Grade 300 rod and Grade 1570 rope factored capacities, exact turnbuckle sizes and source image evidence. |
+| `bracing_mixed_sizing.py`, `bracing_components_regression.py` | Bounded per-location incremental-cost sizing with exact reanalysis; sharing, missing/stale ratings, schedule capacities and saved UI regression. |
+| `bracing_sizing_diagnostics.py` | Specific sizing-stop reasons and rejected alternatives; retains unchanged-input analysis and directs the workspace to the relevant rating row. |
 | `bracing_analysis_regression.py` | Closed-form mechanics, unreduced/reduced comparison, load/moment integration, missing-path failures and real offscreen desktop/export checks. |
 | `crane_beam.py` | Crane runway beam input/result dataclasses and section checks. |
 | `storage_loads.py` | Stored-material pressure/load calculations, storage panel design, storage load application and summary text. |

@@ -157,7 +157,8 @@ class WorkspaceTests(unittest.TestCase):
 
     def dialog(self):
         from bracing_analysis_ui import BracingAnalysisDialog
-        dialog = BracingAnalysisDialog(prepare_context(self.window, allow_unconfigured=True), self.window.catalog)
+        dialog = BracingAnalysisDialog(prepare_context(self.window, allow_unconfigured=True), self.window.catalog,
+                                      saved={"mixed_struts": False})
         for p in dialog.layout_editor.model.panels.values():
             if "/bay/0" in p.id and ("wall" in p.face or p.face.startswith("roof")):
                 dialog.layout_editor.model.toggle(p.id, "pinned")
@@ -198,36 +199,40 @@ class WorkspaceTests(unittest.TestCase):
         finally:
             dialog.reject()
 
-    def test_drag_axes_are_independent_in_all_four_combinations(self):
+    def test_requested_orbit_convention_is_locked_and_saved(self):
         from PySide6.QtCore import QEvent, QPointF, Qt
         from PySide6.QtGui import QMouseEvent
         dialog = self.dialog()
         canvas = dialog.canvas
         before = dialog.layout_snapshot()
         try:
-            self.assertFalse(canvas.invert_orbit_horizontal)
-            self.assertTrue(canvas.invert_orbit_vertical)
-            for horizontal, vertical in itertools.product((False, True), repeat=2):
-                dialog.layout_editor.orbit_horizontal.setChecked(horizontal)
-                dialog.layout_editor.orbit_vertical.setChecked(vertical)
+            self.assertTrue(canvas.invert_orbit_horizontal)
+            self.assertFalse(canvas.invert_orbit_vertical)
+            self.assertFalse(dialog.layout_editor.orbit_horizontal.isEnabled())
+            self.assertFalse(dialog.layout_editor.orbit_vertical.isEnabled())
+            for unused in range(2):
+                from PySide6.QtTest import QTest
+                QTest.mouseClick(dialog.layout_editor.orbit_horizontal, Qt.LeftButton)
+                QTest.mouseClick(dialog.layout_editor.orbit_vertical, Qt.LeftButton)
                 start, end = QPointF(100, 100), QPointF(140, 120)
                 azimuth, elevation = canvas.azimuth, canvas.elevation
                 self.app.sendEvent(canvas, QMouseEvent(QEvent.MouseButtonPress, start, start, Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
                 self.app.sendEvent(canvas, QMouseEvent(QEvent.MouseMove, end, end, Qt.NoButton, Qt.LeftButton, Qt.NoModifier))
                 self.app.sendEvent(canvas, QMouseEvent(QEvent.MouseButtonRelease, end, end, Qt.LeftButton, Qt.NoButton, Qt.NoModifier))
-                self.assertEqual(canvas.azimuth > azimuth, not horizontal)
-                self.assertEqual(canvas.elevation > elevation, not vertical)
+                self.assertLess(canvas.azimuth, azimuth)
+                self.assertGreater(canvas.elevation, elevation)
                 self.assertEqual(dialog.layout_snapshot(), before)
             self.assertTrue(dialog.snapshot()["invert_orbit_horizontal"])
-            self.assertTrue(dialog.snapshot()["invert_orbit_vertical"])
+            self.assertFalse(dialog.snapshot()["invert_orbit_vertical"])
             from bracing_analysis_ui import BracingAnalysisDialog
             for legacy in (False, True):
-                migrated = BracingAnalysisDialog(dialog.context, self.window.catalog, {"reverse_orbit": legacy})
-                self.assertEqual(migrated.canvas.invert_orbit_horizontal, legacy)
-                self.assertEqual(migrated.canvas.invert_orbit_vertical, not legacy)
+                migrated = BracingAnalysisDialog(dialog.context, self.window.catalog, {"reverse_orbit": legacy,
+                                                                                       "invert_orbit_horizontal": False, "invert_orbit_vertical": True})
+                self.assertTrue(migrated.canvas.invert_orbit_horizontal)
+                self.assertFalse(migrated.canvas.invert_orbit_vertical)
                 restored = BracingAnalysisDialog(dialog.context, self.window.catalog, migrated.snapshot())
-                self.assertEqual(restored.canvas.invert_orbit_horizontal, legacy)
-                self.assertEqual(restored.canvas.invert_orbit_vertical, not legacy)
+                self.assertTrue(restored.canvas.invert_orbit_horizontal)
+                self.assertFalse(restored.canvas.invert_orbit_vertical)
                 migrated.reject()
                 restored.reject()
         finally:

@@ -23,8 +23,8 @@ class BracingLayoutCanvas(QWidget):
         self.azimuth, self.elevation = -135.0, 28.0
         self.selected = None
         self.read_only = False
-        self.invert_orbit_horizontal = False
-        self.invert_orbit_vertical = True
+        self.invert_orbit_horizontal = True
+        self.invert_orbit_vertical = False
         self.result = None
         self.case_index = 0
         self.result_mode = "layout"
@@ -299,7 +299,9 @@ class BracingLayoutDialog(QDialog):
         from PySide6.QtWidgets import QCheckBox
         self.orbit_horizontal = QCheckBox("Invert left/right")
         self.orbit_vertical = QCheckBox("Invert up/down")
-        self.orbit_vertical.setChecked(True)
+        self.orbit_horizontal.setChecked(True)
+        self.orbit_horizontal.setEnabled(False)
+        self.orbit_vertical.setEnabled(False)
         controls.addWidget(self.orbit_horizontal)
         controls.addWidget(self.orbit_vertical)
         layout.addLayout(controls)
