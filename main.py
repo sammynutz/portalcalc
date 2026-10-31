@@ -20915,6 +20915,14 @@ class MainWindow(QMainWindow):
                 ])
                 if match.get("capped_by_double_span"):
                     lines.append("Single-span capacities capped at corresponding double-span values where extracted table values were higher.")
+                alternatives = purlin_check.get('profile_selection', {}).get('profile_alternatives', [])
+                if alternatives:
+                    lines.append("Passing common-profile comparison (general / edge; total roof-row weight per metre of building, before common lap factor):")
+                    for option in alternatives:
+                        general_name = self.metroll_section_display(option['general_section'], purlin_check['span_type'])
+                        edge_name = self.metroll_section_display(option['edge_section'], purlin_check['span_type'])
+                        label = "selected" if option['profile'] == purlin_check['profile_selection']['common_profile'] else f"+{option['extra_material_percent']:.1f}% material"
+                        lines.append(f"- {general_name} / {edge_name}: {option['weight_kg_per_m_building']:.2f} kg/m ({label})")
                 if match.get("near_misses"):
                     lines.append("Nearest failing sections:")
                     for miss in match["near_misses"]:

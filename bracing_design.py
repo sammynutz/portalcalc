@@ -295,7 +295,9 @@ def attach_design(result, selections, criteria, rates):
     result["design_request"] = request
     result["design_request_hash"] = hashlib.sha256(json.dumps(request, sort_keys=True, allow_nan=False).encode()).hexdigest()
     result["section_checks"] = checks
-    result["design"] = {"passes": passes, "member_checks_pass": all(r["passes"] for r in checks.values()),
+    preliminary = any(c.get('preliminary') for check in checks.values() for c in check.get('case_checks', []))
+    result["design"] = {"passes": passes, 'preliminary_reference_checks': preliminary,
+                        "member_checks_pass": all(r["passes"] for r in checks.values()),
                         "global_sls": drift, "taut_tangent_verified": stable,
                         "estimated_cost": sum(row["total"] for row in costs), "cost_items": costs,
                         "cost_model": {"stock_lengths_m": UB_STOCK_LENGTHS_M, "hollow_waste_factor": 1.07,
@@ -309,12 +311,16 @@ def attach_design(result, selections, criteria, rates):
     result["limitations"] += [result["design"]["basis"], result["design"]["cost_basis"]]
     if isinstance(selections["strut"], StrutPlan):
         old_basis, old_cost = result["design"]["basis"], result["design"]["cost_basis"]
-        result["design"]["basis"] = "Per-location common-end purlin/added-member assemblies. Installed compression uses the project-adopted Lysaght May 1999 p20 simplified method with Metroll 2023 p7 Ag/web-axis radius, or declared Nc/Nex ratings as selected. Tension uses separate declared Nt. Independent bending/axial envelopes. Added cold-formed plies use separate residual ratings. Back-to-back roof sharing only when declared. Common-end/collector force transfer is assumed; its connection capacity is unchecked. No composite bending I."
+        result["design"]["basis"] = "Per-location common-end purlin/added-member assemblies. Installed compression uses the project-adopted Lysaght May 1999 p20 simplified method with Metroll 2023 p7 Ag/web-axis radius, or declared Nc/Nex ratings as selected. Purlin member tension uses 0.9 min(Ag fy, 0.85 kt An fu), G450 lower-bound fy450/fu480 and configured net-area/kt assumptions, or declared Nt/source as selected. Independent bending/axial envelopes. Added unsheeted cold-formed plies use separate residual ratings. Back-to-back roof sharing only when declared. Common-end/collector force transfer is assumed; its connection capacity is unchecked. No composite bending I."
         result["design"]["cost_basis"] = "Incremental added struts/purlins only; existing roof purlins already costed. New purlins use 7% waste at the captured purlin rate. Other connections/labour excluded."
         result["limitations"] = [line for line in result["limitations"] if not line.startswith("Dedicated axial struts") and line not in (old_basis, old_cost)]
         result["limitations"] += [result["design"]["basis"], result["design"]["cost_basis"]]
-        if result.get("purlin_beams", {}).get("runs"):
+        if any(not run.get('preliminary') for run in result.get('purlin_beams', {}).get('runs', {}).values()):
             result["limitations"].append("Sheeted additions use a separate first-order roof-run beam model with entered finite cladding/fastener stiffness and independent single-span rotations. No global diaphragm/portal bending credit. Redistributed M/V member ratings and cladding transfer connection capacities remain explicit; missing stiffness or member capacities cannot pass.")
+        if preliminary:
+            from purlin_shared_design import BASIS
+            result['design']['basis'] += ' '+BASIS
+            result['limitations'].append(BASIS)
     return result
 
 

@@ -51,7 +51,7 @@ def stop_for_strut(initial_result, current_result, assembly, failures, floor_rej
     if "tension rating required" in reason.lower():
         target, column = "purlin", 3
         title = "purlin tensile capacity Nt / source is missing or does not match"
-        action = "Components / ratings > Purlin axial ratings: enter Declared Nt kN and its rating source. The adopted compression formula does not supply Nt."
+        action = "Components / ratings > Purlin axial ratings: select Calculated member capacity, or enter valid Declared Nt kN and its source for the current basis."
     elif primary.get("method") == "coupled_purlin_beam":
         target, column = "beam", 1 if not primary.get("coupling_defined") else 3
         title = reason

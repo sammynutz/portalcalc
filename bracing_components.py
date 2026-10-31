@@ -120,14 +120,14 @@ def component_area(component):
     return component["data"]["area_mm2"] if component["type"] == "purlin" else component["profile"].A
 
 
-def purlin_check(component, force_kn, case_name, level, sls_divisor=150.):
+def purlin_check(component, force_kn, case_name, level, sls_divisor=150., criteria=None):
     data = component["data"]
     rating = data.get("axial_rating", {})
     if abs(data.get("bending_span_mm", data.get("analysis_span_mm", 0))-data.get("analysis_span_mm", 0)) > 1e-3:
         return {"case": case_name, "mode": "Installed bending check does not match this bay span", "ratio": None, "passes": False}
     existing = component["existing"]
     if existing and method(rating) == METHOD:
-        return installed_check(component, force_kn, case_name, level, sls_divisor)
+        return installed_check(component, force_kn, case_name, level, sls_divisor, criteria)
     if not existing:
         prefix = component.get("rating_prefix", "extra")
         try:
@@ -153,7 +153,9 @@ def purlin_check(component, force_kn, case_name, level, sls_divisor=150.):
                 "basis": "Entered residual design capacity after this added member's applicable bending, restraints and connections; no installed-purlin bending-table substitution"}
     try:
         nc = positive_rating(rating, "compression_kn")
-        nt = positive_rating(rating, "tension_kn")
+        from purlin_combined import tension_capacity
+        tensile_result = tension_capacity(data, criteria)
+        nt = tensile_result["tension_capacity_kn"]
         ne = positive_rating(rating, "elastic_buckling_kn")
         if rating.get("basis_key") != data["basis_key"] or not str(rating.get("source", "")).strip():
             raise AnalysisError("Supplier axial rating must match this purlin/span/restraint basis")
@@ -176,6 +178,7 @@ def purlin_check(component, force_kn, case_name, level, sls_divisor=150.):
     ratio = (compression/nc + bending/alpha) if alpha > 0 else None
     ratio = max(ratio, tension/nt+bending) if ratio is not None else None
     return {"case": case_name, "mode": "Purlin axial + bending envelope interaction",
+            **tensile_result,
             "ratio": ratio, "section": data["section"], "axial_kn": force_kn,
             "compression_capacity_kn": nc, "tension_capacity_kn": nt, "elastic_buckling_kn": ne,
             "bending_ratio": bending, "amplification_denominator": alpha,
@@ -203,12 +206,12 @@ def assembly_assessment(result, index, assembly, criteria, steel_assessor):
             for case in result["cases"]:
                 identifier = assembly.location["id"]
                 row = beam_check(result, identifier, component, case["members"][index]["axial_n"]*share/1000,
-                                 case["case"]["name"], case["case"]["level"], criteria.sls_divisor) if component["existing"] or component.get("sheeted_beam") else None
-                if row is None and assembly.arrangement == ARRANGEMENT:
+                                 case["case"]["name"], case["case"]["level"], criteria.sls_divisor, criteria) if component["existing"] or component.get("sheeted_beam") or component.get('shared_beam') else None
+                if row is None and assembly.arrangement in {ARRANGEMENT, 'shared_purlin'}:
                     row = {"case": case["case"]["name"], "mode": "Coupled roof-run beam analysis required", "ratio": None, "passes": False}
                 if row is None:
                     row = purlin_check(component, case["members"][index]["axial_n"]*share/1000,
-                                       case["case"]["name"], case["case"]["level"], criteria.sls_divisor)
+                                       case["case"]["name"], case["case"]["level"], criteria.sls_divisor, criteria)
                 rows.append({**row, "component": part_index, "load_share": share,
                              "existing": component["existing"]})
     unknown = next((row for row in rows if row["ratio"] is None), None)
@@ -223,9 +226,9 @@ def assembly_assessment(result, index, assembly, criteria, steel_assessor):
 
 def assembly_properties(assembly):
     return {"type": "strut_assembly", "name": assembly.name, "arrangement": assembly.arrangement,
-            "area_mm2": assembly.A, "modulus_mpa": assembly.E, "location": assembly.location,
+            "area_mm2": assembly.A, "modulus_mpa": assembly.E, "location": {k:v for k,v in assembly.location.items() if k != 'added_purlins'},
             "components": [{"type": c["type"], "existing": c["existing"],
-                            **({"purlin": c["data"], "sheeted_beam": c.get("sheeted_beam", False), "rating_prefix": c.get("rating_prefix"), "roof_bending_share": c.get("roof_bending_share", 1. if c["existing"] else 0.)} if c["type"] == "purlin" else
+                            **({"purlin": c["data"], 'shared_beam': c.get('shared_beam', False), "sheeted_beam": c.get("sheeted_beam", False), "rating_prefix": c.get("rating_prefix"), "roof_bending_share": c.get("roof_bending_share", 1. if c["existing"] else 0.)} if c["type"] == "purlin" else
                                {"section": c["profile"].name, "area_mm2": c["profile"].A})}
                            for c in assembly.components]}
 
@@ -256,9 +259,11 @@ def strut_locations(context, ratings=None, counts=None):
             if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 8:
                 raise AnalysisError("Connected existing purlins must be an integer from 1 to 8")
             is_braced = any(("/bay/"+str(bay)+"/") in (p+"/") for p in context["layout"].pinned)
+            from purlin_shared_design import location_data
+            references, added = location_data(context, data, b-a)
             locations.append({"id": identifier, "bay": bay, "line": line, "x_mm": x,
                               "length_mm": b-a, "purlin": data, "existing_count": count,
-                              "braced_bay": is_braced})
+                              "braced_bay": is_braced, 'shared_reference_caps': references, 'added_purlins': added})
     return locations
 
 
@@ -267,6 +272,10 @@ def location_options(location, steel_profiles):
     existing = tuple({"type": "purlin", "existing": True, "data": data} for _ in range(n))
     prefix = f"{n} existing {data['section']}"
     options = [StrutAssembly(prefix, existing, "existing_purlins", location)]
+    for added in location.get('added_purlins', []):
+        display = added['section'].replace('C/Z ', 'C ')
+        options.append(StrutAssembly(prefix+' + '+display+' (50/50 roof load)',
+            existing+({'type': 'purlin', 'existing': False, 'data': added, 'shared_beam': True},), 'shared_purlin', location))
     extra = {"type": "purlin", "existing": False, "data": data, "rating_prefix": "extra"}
     options.append(StrutAssembly(prefix+" + sheeted single-span purlin", existing+({**extra, "sheeted_beam": True},), "sheeted_purlin", location))
     options.append(StrutAssembly(prefix+" + extra purlin", existing+(extra,), "additional_purlin", location))

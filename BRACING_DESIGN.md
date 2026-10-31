@@ -60,12 +60,26 @@ or network is required at runtime. The inconsistent published Z15024 Ag/I/r row
 is rejected without silently correcting it; C15024 has a separate valid row.
 
 Existing explicitly rated presets retain their declared Nc/Nex method. Selecting
-that alternative uses `N/Nc + bending/(1-N/Nex)`. **Axial tension still uses
-separately declared Nt/source with N/Nt + bending**; the 1999 compression formula
-does not establish net-section tensile or connection capacity. Blank tensile data
-only blocks cases with positive tension, not compression or SLS calculations.
+that alternative uses `N/Nc + bending/(1-N/Nex)`. **Member tension now defaults
+to calculated `phi Nt = 0.9 min(Ag fy, 0.85 kt An fu)`**, using G450 lower-bound
+material fy450/fu480 MPa for the manufacturer's G450/G500/G550 range. The
+Sections / criteria net-area factor and kt apply (defaults 0.70 and 0.85);
+these are explicit project assumptions, not verified holes/connection details.
+No cold-work enhancement is credited. The additive `N/phiNt + bending` screen
+takes no beneficial tension effect. UI, TXT and JSON show the inputs, yield and
+fracture capacities, reference and governing value. Supplier Nt/source remains
+an explicit alternative; existing entered capacities retain declared mode.
+Invalid or stale declared capacities do not silently fall back to calculation.
+Sheeted beam additions may use the same calculated member tensile check when
+their separate Nt is blank; their cladding and M/V data are still required.
+Unsheeted added-ply residual ratings remain separate. The compression formula
+does not provide Nt; the tension calculation is a separate member check.
 The adopted historic method is a scoped compression screen, not a claim that
 Metroll published the Lysaght formula or a complete current AS/NZS 4600 design.
+
+Tension formula: [Hancock, Design of Cold-Formed Steel Structures, 4th ed,
+p170](https://www.steel.org.au/getattachment/09a22a15-030c-4d27-b341-7959aa5fd49b/Cold-formed-members-in-combined-axial-tensile-load-and-bending_bk150.pdf).
+Material minima: [BlueScope GALVASPAN G450 datasheet](https://metaltex.com.au/downloads/GALVASPAN_G450.pdf).
 
 Added cold-formed plies require separate residual capacities
 after their applicable bending and restraints, plus SLS deflection. Back-to-back
@@ -81,7 +95,66 @@ Only added material is costed for these strut alternatives; existing roof purlin
 are already in the building cost. Added purlins use the captured purlin rate and
 7% waste. Each candidate is reanalysed with its actual per-path EA before adoption.
 
-## Sheeted single-span additions and roof-load sharing
+## Automatic 50/50 purlin additions - preliminary reference checks
+
+The user-adopted automatic option is **Sheeted purlin: 50/50 load
+(preliminary)**. In a bay containing an addition, half the total original roof
+line load goes to the existing purlin line and half to the single added member.
+For multiple linked originals the total original line load is count times the
+load per original purlin. Remaining bays retain their full applied load. This is
+an explicit load-allocation assumption, not sharing derived from a fastener
+stiffness or equal bending moments. Added self-weight is separately included in
+downward cases; favourable self-weight is not credited against uplift.
+
+The existing run is solved with its actual continuity and the changed bay loads;
+every adjoining bay is checked. Each added purlin is independently single span.
+Axial forces share by EA across all physical components, without composite
+bending stiffness. SLS uses separate wind directions, G plus inward service
+wind and G+Q. No spring transfer is calculated under this assigned-load option.
+
+**Strength acceptance remains PRELIMINARY.** Unit-load elastic reference
+analyses are scaled to the current manufacturer's UDL capacity for the relevant
+single, double or five-span lapped arrangement and bridging level. Reference
+moment is the largest absolute per-ply moment over the rated span group;
+reference shear is its largest per-ply shear. Actual M/V envelopes are divided
+by those reference actions. The scoped ratio is axial interaction plus the
+larger normalised M/V envelope. These are **reference actions, not independent
+member resistances**; the approximation does not establish full cold-formed
+buckling, bearing or moment/shear interaction for the changed diagram.
+
+SLS retains both the gross-EI calculated deflection and the deflection adjusted
+to the manufacturer's L/150 table-rated reference response, using the larger
+ratio. Source rows, spans, bridging, interpolated columns, cache SHA256,
+reference actions, actual diagrams, comparisons and assumptions are frozen in
+TXT/JSON. The overall workspace explicitly says **PRELIMINARY PASS** when it
+uses any of these reference checks. Missing data cannot produce acceptance.
+
+The reference option supports equal single spans, equal double-span pairs
+(final odd bay assessed as single) and exactly five Z spans with 15% laps for
+tables 5A/5B. Nonstandard releases, unequal spans or other lap configurations
+require the declared-capacity beam option. Single-span tables 1A/1B remain
+separate from the installed roof tables. The catalogue C purlins with verified
+properties and span/bridging rows compete on added material cost with SHS/RHS.
+No section type or location is forced. The chosen added section saves with each
+location and participates in the final exact 3D axial reanalysis.
+
+Under **50/50 strut assumptions**, confirm flange screw fixing to cladding and
+the installed bridging count. Manufacturer rotational-restraint requirements
+still apply; the adopted split does not verify fastener, cleat, collector or
+cladding capacities. Bridging must actually connect to the added member. New
+connection/bridging labour and fittings are not priced. Unchecking the fixing
+assumption, removing required bridging or losing table coverage prevents these
+arrangements from passing. The original roof profile selection is unchanged.
+
+The supplied example selects two C20012 additions with this preliminary screen,
+reuses the existing roof purlins at the other 23 analytical paths and leaves
+the eaves without additions. This is the lowest checked material/fitting cost
+found by the bounded search, not an exhaustive global optimum.
+
+Primary source: [Metroll MEGASPAN October 2025 manual, design assumptions p5
+and tables 1A/1B, 2A/2B, 5A/5B](https://www.metroll.com.au/wp-content/uploads/metroll_MEGASPAN_Purlin_Design_Manual_25.pdf).
+
+## Optional finite-coupling beam model and declared capacities
 
 Choose **Sheeted single-span purlin (beam model)** at a strut location. This is
 separate from the existing unsheeted and declared back-to-back alternatives.
@@ -202,6 +275,22 @@ workings. The low-level solver still returns demands; the workspace attaches
 the checking layer.
 
 ## Cost-ranked sizing
+
+**Analyse and check** evaluates the current selections and may show failures.
+**Auto size for lowest checked cost** screens alternatives, recalculates their
+loads and adopts a selection only after all scoped member and SLS checks pass.
+Retained failed inputs after a stopped search are explicitly labelled as such.
+Default Metroll roof purlins no longer require manually entered Nt to run this
+search; their calculated member tension uses the displayed project assumptions.
+
+The roof purlin report also compares the minimum-weight compatible pair for
+every passing common profile, preserving independent general/edge thicknesses.
+For the 8 m double-span default, C25015/C25019 uses 83.13 kg per metre of
+building across 9 general/6 edge rows, versus 92.76 kg/m for C20019/C20024
+(11.6% more material). C20015 general and C20019 edge fail uplift at 1.319/1.835
+kN/m against 1.230/1.790 kN/m capacities. Roof material ranking uses the common
+purlin $/kg rate; bridging/connection labour and supplier-specific profile
+prices are not included. No fixed C200 or C250 preference is imposed.
 
 Pools include per-location purlin/addition arrangements, the existing SHS/RHS
 strut catalogue, end-post catalogue and scheduled rod/wire plus angle braces.

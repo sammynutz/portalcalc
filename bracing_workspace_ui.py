@@ -145,7 +145,13 @@ class BracingAnalysisDialog(QDialog):
             grid.addWidget(box, i//2, 2*(i%2)+1)
             self.criteria_inputs[name] = box
         inputs.addWidget(group)
-        notes = QLabel("Per-location roof-purlin reuse is the default: use Components / ratings for connected counts, additions and supplier ratings. Uncheck that mode for the uniform dedicated-steel approximation. The supplied schedule sets Grade 300 rod and Grade 1570 wire strengths. Wire sizes 8/10/12/14/16 mm still need rope EA/source and prices.\n\nPosts include end-wind bending. Net-area/kt applies to other steel members, not the schedule's already factored brace strengths. Sizing reanalyses candidates; it is not a global optimum. Connections, labour and supplier availability remain separate.")
+        def refresh_tension(*_args):
+            self.component_editor.refresh_tension_preview(self.criteria_inputs['net_area_factor'].value(),
+                self.criteria_inputs['tension_distribution_factor'].value())
+        refresh_tension()
+        for field in ('net_area_factor', 'tension_distribution_factor'):
+            self.criteria_inputs[field].valueChanged.connect(refresh_tension)
+        notes = QLabel("Per-location roof-purlin reuse is the default: use Components / ratings for connected counts, additions and supplier ratings. Uncheck that mode for the uniform dedicated-steel approximation. The supplied schedule sets Grade 300 rod and Grade 1570 wire strengths. Wire sizes 8/10/12/14/16 mm still need rope EA/source and prices.\n\nPosts include end-wind bending. Net-area/kt applies to calculated steel and purlin member tension, not the schedule's already factored brace strengths. Purlins use G450 minima, independent of Angle/default Fy/Fu. Net area and kt are project assumptions; connections remain separate. Sizing reanalyses candidates; it is not a global optimum. Connections, labour and supplier availability remain separate.")
         notes.setWordWrap(True)
         inputs.addWidget(notes)
         rates = context["cost_rates"]
@@ -362,6 +368,12 @@ class BracingAnalysisDialog(QDialog):
         self.result = result
         d = result["design"]
         state = "PASS on scoped member/SLS checks" if d["passes"] else "FAIL / UNVERIFIED on scoped member/SLS checks"
+        if d.get('preliminary_reference_checks'):
+            state = 'PRELIMINARY '+state
+        if not d['passes']:
+            failed = sum(c['ratio'] is not None and c['ratio'] > 1 for c in result['section_checks'].values())
+            unverified = sum(c['ratio'] is None for c in result['section_checks'].values())
+            state += f" ({failed} over capacity; {unverified} missing checks)"
         rows = ["SCOPED SECTION CHECKS", state, f"Estimated materials + listed fittings: ${d['estimated_cost']:,.2f}",
                 f"Global SLS ratio: {d['global_sls']['ratio']:.3f}", d["basis"], d["cost_basis"], ""]
         rows += ["COST BREAKDOWN | Purchased kg | $/kg | Material | Listed fittings | Total"]
@@ -387,6 +399,11 @@ class BracingAnalysisDialog(QDialog):
                     p = r["section_properties"]
                     uc = "UNVERIFIED" if r["ratio"] is None else f"{r['ratio']:.4f}"
                     rows.append(f"{c['id']} | {r['case']} | component {r['component']+1} | {p['shape']} | Ag {p['area_mm2']:.2f} mm2; rx' {p['web_rx_mm']:.2f} mm; L {r['span_mm']:.1f} mm; Ns {r['compression_capacity_kn']:.3f} kN; bending {r['bending_ratio']:.4f}; Nav {r['available_compression_kn']:.3f} kN; axial {r['axial_kn']:.3f} kN; UC {uc}; {r['mode']}")
+        rows += ["", "PURLIN MEMBER TENSION WORKINGS", "Net area and kt are configured member assumptions; bolt/tearout/block-shear/anchor checks remain separate."]
+        for c in result["section_checks"].values():
+            for r in c['case_checks']:
+                if r.get('tension_method') == 'calculated':
+                    rows.append(f"{c['id']} | {r['case']} | component {r['component']+1} | Ag {r['tension_gross_area_mm2']:.2f} mm2; An {r['tension_net_area_mm2']:.2f} mm2 (factor {r['tension_net_area_factor']:.3f}); kt {r['tension_kt']:.3f}; fy {r['tension_fy_mpa']:g}, fu {r['tension_fu_mpa']:g} MPa; phi {r['tension_phi']:g}; yield {r['tension_gross_yield_kn']:.3f}, fracture {r['tension_net_fracture_kn']:.3f}; design tension {r['tension_capacity_kn']:.3f} kN. {r['tension_basis']} {r['tension_source_url']}")
         for key, run in result.get("purlin_beams", {}).get("runs", {}).items():
             rows += ["", f"SHEETED PURLIN BEAM | ROOF LINE {int(key)+1}"]
             if run.get("error"):
@@ -396,7 +413,7 @@ class BracingAnalysisDialog(QDialog):
                      f"Cladding coupling {run['coupling_kn_m_per_mm']:g} kN/m per mm; source: {run['coupling_source'] or 'MISSING - zero-sharing fallback, UNVERIFIED'}",
                      f"Direct roof pickup to added member: {run['direct_roof_pickup_fraction']:.2%}; inputs defined: {run['coupling_defined']}",
                      f"Existing spans: {run['span_type']}; lap ratio: {run['lap_ratio']}; roof releases after bays: {run['roof_releases_after_bays']}; added single-span bays: {[b+1 for b in run['added_bays']]}",
-                     "Member acceptance uses separately entered M+/M-/V capacities for redistributed diagrams. UDL table capacities are not reused.",
+                     ("PRELIMINARY table-reference actions are used for this 50/50 allocation; they are not verified general M/V resistances." if run.get('preliminary') else "Member acceptance uses separately entered M+/M-/V capacities for redistributed diagrams. UDL table capacities are not reused."),
                      "Roof load case | Bay | Role | M+ kNm | M- kNm | V kN | Deflection mm | Cladding transfer kN | Peak transfer kN/m"]
             for case in run["cases"]:
                 rows.append(f"{case['name']}: applied {case['applied_load_n']:.3f} N; reaction {case['support_reaction_n']:.3f} N; balance error {case['vertical_balance_error_n']:.3g} N")
@@ -406,6 +423,18 @@ class BracingAnalysisDialog(QDialog):
                         if not actions["samples"]:
                             continue
                         rows.append(f"{case['name']} | {i+1} | {role} | {actions['positive_moment_knm']:.4f} | {actions['negative_moment_knm']:.4f} | {actions['shear_kn']:.4f} | {actions['deflection_mm']:.4f} | {bay['transfer_kn']:.4f} | {bay['peak_transfer_kn_m']:.4f}")
+        rows += ['', 'PRELIMINARY PURLIN TABLE-REFERENCE WORKINGS']
+        for checked in result['section_checks'].values():
+            for r in checked['case_checks']:
+                if r.get('preliminary'):
+                    rows.append(f"{checked['id']} | {r['case']} | {r['beam_role']} | {r['mode']} | UC {r['ratio']} | axial {r['axial_kn']:.4f} kN")
+                    for comparison in r.get('reference_comparisons', []):
+                        rows.append(f"  {comparison['case']}: rated UDL {comparison['reference_line_load_kn_m']:.4f} kN/m; reference M {comparison['reference_moment_knm']:.4f} kNm, V {comparison['reference_shear_kn']:.4f} kN; M ratio {comparison['moment_ratio']:.4f}, V ratio {comparison['shear_ratio']:.4f}")
+                    if 'table_reference' in r:
+                        cap = r['table_reference']['capacity']
+                        rows.append(f"  {cap['source']} | {cap['tables']} | {cap['span_type']} | {cap['span_mm']:g} mm | {cap['bridging_rows']} bridging rows | cache snapshot {cap['source_sha256']}")
+                    if 'table_adjusted_deflection_mm' in r:
+                        rows.append(f"  Elastic deflection {r['elastic_deflection_mm']:.4f} mm; table-adjusted {r['table_adjusted_deflection_mm']:.4f} mm; limit {r['limit_mm']:.4f} mm")
         self.report_text = "\n".join(rows+["", text_report(result)])
         self.beam_results.set_result(result)
         self.report.setPlainText(self.report_text)
@@ -417,7 +446,8 @@ class BracingAnalysisDialog(QDialog):
         self.tabs.setCurrentIndex(1)
         self.export_json_button.setEnabled(True)
         self.export_text_button.setEnabled(True)
-        self.status_label.setText(f"{state} | estimated materials + fittings ${d['estimated_cost']:,.2f} | SLS {d['global_sls']['ratio']:.3f}. Connections, full combinations and production portal restraint remain separate.")
+        hint = "" if d['passes'] or 'sizing_search' in result else " Analyse and check evaluates current selections; use Auto size to select suitable members."
+        self.status_label.setText(f"{state} | estimated materials + fittings ${d['estimated_cost']:,.2f} | SLS {d['global_sls']['ratio']:.3f}.{hint} Connections, full combinations and production portal restraint remain separate.")
 
     def show_case(self):
         if self.result is None or self.case_combo.currentIndex() < 0:
@@ -479,7 +509,7 @@ class BracingAnalysisDialog(QDialog):
         text = self.canvas.member_description(identifier)
         check = self.result["section_checks"][identifier]
         row = next((r for r in check["case_checks"] if r["case"] == check["case"]), {})
-        if row.get("method") == "coupled_purlin_beam":
+        if row.get("method") in {"coupled_purlin_beam", 'assigned_half_reference'}:
             text += f"\n{row['beam_role'].title()} beam, bay {row['beam_bay']+1}; axial {row['axial_kn']:.3f} kN. {row['mode']}"
             for d in row.get("beam_demands", []):
                 text += f"\n{d['case']}: M+ {d['positive_moment_knm']:.3f}, M- {d['negative_moment_knm']:.3f} kNm; V {d['shear_kn']:.3f} kN; deflection {d['deflection_mm']:.3f} mm"

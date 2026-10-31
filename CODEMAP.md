@@ -36,7 +36,7 @@ Release packaging is performed only when the user explicitly asks. Routine chang
 | `configurator_review_regression.py` | Offscreen interactive regression for request loading, UI locking, section adjustment, final exact checking, failed-result return, cancellation and atomic output. |
 | `concept_3d.py` | 3D concept data assembly, HTML preview output and Collada `.dae` export helpers. |
 | `costing.py` | Frame, purlin/girt, crane runway and storage costing summary calculations/report text. |
-| `purlin_selection.py` | Joint general/edge roof-purlin selection: shared profile with independent thicknesses, ranked by installed material weight. |
+| `purlin_selection.py` | Joint general/edge roof-purlin selection: shared profile with independent thicknesses, ranked by installed material weight; exports passing profile comparisons. |
 | `loads.py` | Basic load dataclasses, load combinations, non-wind roof/wall/self-weight load application. |
 | `wind.py` | Wind input dataclasses, AS/NZS 1170.2-style wind calculation helpers, Cpe/Cpi logic, wind load application to roof and columns. |
 | `member_checks.py` | Steel member capacity checks and governing utilisation result objects. |
@@ -51,7 +51,10 @@ Release packaging is performed only when the user explicitly asks. Routine chang
 | `bracing_design.py` | Scoped tension/buckling/interaction and local deflection checks; material/fitting cost and reanalysed grouped catalogue sizing. See `BRACING_DESIGN.md`. |
 | `bracing_design_regression.py` | Independent capacity/cost workings, tiny exhaustive sizing comparison, real orbit/member picking and transactional workspace save/sizing. |
 | `bracing_components.py`, `bracing_component_ui.py` | Per-location installed/added purlin and steel assemblies, axial/bending ratings, common-end force sharing and rope EA/price input. |
-| `purlin_combined.py` | Adopted Lysaght May 1999 simplified compression/bending calculation; verified Metroll 2023 C/Z web-axis properties, source evidence and worked output. |
+| `purlin_combined.py` | Adopted Lysaght May 1999 simplified compression/bending calculation; Metroll C/Z web-axis properties; calculated member tension using G450 minima and explicit net-area/kt assumptions, or preserved declared Nt; source evidence and worked output. |
+| `purlin_shared_design.py` | User-adopted 50/50 applied roof-load allocation, existing-run/added single-span beam demands and explicitly preliminary table-reference checks; catalogue candidates and cached reference solves. |
+| `purlin_strut_tables.py` | In-range manufacturer UDL-table interpolation with stated bridging and frozen source rows; separate single/double/five-span reference arrangements. |
+| `purlin_strut_regression.py` | Independent asymmetric two-span statics, single-span responses, load conservation/self-weight, table/reference limits, sizing, UI invalidation and persistence. |
 | `purlin_beam.py`, `purlin_beam_design.py` | Roof-run Euler-Bernoulli model, finite distributed cladding coupling, direct load pickup, single-span additions, demand evidence and gated M/V/axial checks. |
 | `purlin_beam_ui.py`, `purlin_beam_regression.py` | Native moment/shear/deflection/transfer plots; independent beam and load-sharing benchmarks, whole-run sizing and workspace persistence tests. |
 | `bracing_schedule.py` | Supplied Grade 300 rod and Grade 1570 rope factored capacities, exact turnbuckle sizes and source image evidence. |

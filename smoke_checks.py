@@ -34,7 +34,7 @@ def compile_sources(root: Path) -> None:
         py_compile.compile(str(root / name), doraise=True)
     for name in ("bracing_design.py", "bracing_design_regression.py", "bracing_workspace_ui.py"):
         py_compile.compile(str(root / name), doraise=True)
-    for name in ("bracing_components.py", "bracing_component_ui.py", "bracing_mixed_sizing.py", "bracing_sizing_diagnostics.py", "bracing_components_regression.py", "bracing_schedule.py", "purlin_combined.py", "purlin_beam.py", "purlin_beam_design.py", "purlin_beam_ui.py", "purlin_beam_regression.py"):
+    for name in ("bracing_components.py", "bracing_component_ui.py", "bracing_mixed_sizing.py", "bracing_sizing_diagnostics.py", "bracing_components_regression.py", "bracing_schedule.py", "purlin_combined.py", "purlin_beam.py", "purlin_beam_design.py", "purlin_beam_ui.py", "purlin_beam_regression.py", 'purlin_shared_design.py', 'purlin_strut_tables.py', 'purlin_strut_regression.py'):
         py_compile.compile(str(root / name), doraise=True)
     for name in ["app_metadata.py", "main.py", "purlin_selection.py", "purlin_selection_regression.py", "computation_report.py", "computation_report_data.py", "computation_report_regression.py", "portalcalc_service.py", "portalcalc_headless.py", "configurator_review.py", "calculation_service_regression.py", "configurator_review_regression.py", "physics_optimiser_regression.py", "concept_3d.py", "costing.py", "elevation_drawings.py", "finishes.py", "member_checks.py", "loads.py", "wind.py", "end_wall.py", "bracing.py", "licensing.py", "reduced_optimizer.py", "license_server.py", "license_generator_app.py", "crane_beam.py", "storage_loads.py"]:
         py_compile.compile(str(root / name), doraise=True)
@@ -2775,6 +2775,11 @@ def main() -> None:
         suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(test) for test in (BeamMechanicsTests, BeamWorkspaceTests))
         result = unittest.TextTestRunner(verbosity=1).run(suite)
         assert result.wasSuccessful(), "Sheeted-purlin beam regression failed"
+    with timed_step('50/50 purlin strut reference and sizing checks'):
+        import unittest
+        import purlin_strut_regression
+        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromModule(purlin_strut_regression))
+        assert result.wasSuccessful(), '50/50 purlin strut regression failed'
     with timed_step("internal column layout checks"):
         import unittest
         from internal_columns_regression import InternalColumnsRegression

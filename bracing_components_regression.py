@@ -14,7 +14,7 @@ from bracing_components import (StrutPlan, assembly_assessment, location_options
                                 wire_check, wire_modulus, wire_options, wire_price)
 from bracing_design import DesignCriteria, group_cost, member_assessment, solve_selection, auto_size
 from bracing_schedule import rod_options, SOURCE
-from purlin_combined import properties, compression_capacity, METHOD
+from purlin_combined import properties, compression_capacity, tension_capacity, METHOD
 
 
 def location(sharing=False):
@@ -38,6 +38,27 @@ def fixture(force=-20000.):
 
 
 class RatedComponentTests(unittest.TestCase):
+    def test_calculated_tension_independent_workings_and_declared_override(self):
+        data = {'section': 'C/Z 250 19', 'area_mm2': 808., 'basis_key': 'TEST', 'axial_rating': {}}
+        t = tension_capacity(data, DesignCriteria())
+        self.assertAlmostEqual(t['tension_gross_yield_kn'], .9*808*450/1000)
+        self.assertAlmostEqual(t['tension_net_fracture_kn'], .9*.85*.85*(.7*808)*480/1000)
+        self.assertEqual(t['tension_capacity_kn'], min(t['tension_gross_yield_kn'], t['tension_net_fracture_kn']))
+        self.assertEqual(t, tension_capacity(data, DesignCriteria(brace_fy_mpa=100., brace_fu_mpa=200.)))
+        self.assertLess(tension_capacity(data, DesignCriteria(net_area_factor=.5))['tension_capacity_kn'], t['tension_capacity_kn'])
+        data['axial_rating'] = {'tension_kn': 90., 'source': 'SYNTHETIC TEST', 'basis_key': 'TEST'}
+        self.assertEqual(tension_capacity(data)['tension_capacity_kn'], 90.)
+        data['axial_rating']['basis_key'] = 'STALE'
+        with self.assertRaisesRegex(AnalysisError, 'tension rating required'):
+            tension_capacity(data)
+        data['axial_rating'] = {'tension_method': 'declared'}
+        with self.assertRaisesRegex(AnalysisError, 'tension rating required'):
+            tension_capacity(data)
+        data['axial_rating'] = {}
+        data['area_mm2'] = 999.
+        with self.assertRaisesRegex(AnalysisError, 'area does not match'):
+            tension_capacity(data)
+
     def test_simplified_purlin_workings_match_sheet_and_metroll_axes(self):
         self.assertAlmostEqual(compression_capacity(713., 79.6, 8000.), 63.7416705975)
         props = properties("C/Z 200 19", "Z")
@@ -65,7 +86,7 @@ class RatedComponentTests(unittest.TestCase):
     def test_simplified_limits_tension_missing_properties_and_exhausted_bending(self):
         loc = location()
         data = loc["purlin"]
-        data.update(section="C/Z 250 15", area_mm2=638., axial_rating={"compression_method": METHOD})
+        data.update(section="C/Z 250 15", area_mm2=638., axial_rating={"compression_method": METHOD, "tension_method": "declared"})
         def assess(force):
             return assembly_assessment(fixture(force), 0, location_options(loc, [])[0], DesignCriteria(), member_assessment)
         self.assertTrue(assess(-1000.)["passes"])
@@ -233,6 +254,8 @@ class ComponentWorkspaceTests(unittest.TestCase):
         editor = dialog.component_editor
         for combo in editor.purlin_methods.values():
             combo.setCurrentIndex(combo.findData("declared"))
+        for combo in editor.purlin_tension_methods.values():
+            combo.setCurrentIndex(combo.findData("declared"))
         for row in range(editor.purlin_table.rowCount()):
             for col, value in ((2, "100"), (3, "160"), (4, "300"), (6, "SYNTHETIC SOFTWARE TEST ONLY")):
                 editor.purlin_table.setItem(row, col, QTableWidgetItem(value))
@@ -248,6 +271,8 @@ class ComponentWorkspaceTests(unittest.TestCase):
     def test_unrated_real_purlins_are_visible_but_cannot_pass_or_auto_size(self):
         dialog = self.dialog()
         try:
+            for combo in dialog.component_editor.purlin_tension_methods.values():
+                combo.setCurrentIndex(combo.findData('declared'))
             self.assertTrue(dialog.component_editor.mixed.isChecked())
             self.assertEqual(len(dialog.component_editor.wire_candidates()), 5)
             self.assertEqual([o["label"] for o in dialog.component_editor.brace_candidates() if o.get("component_type") == "scheduled_rod"], ["16 DIA ROD", "20 DIA ROD", "24 DIA ROD", "30 DIA ROD"])
@@ -289,6 +314,42 @@ class ComponentWorkspaceTests(unittest.TestCase):
             self.assertIsNotNone(dialog.result, dialog.status_label.text())
             self.assertTrue(dialog.result["design"]["passes"])
             self.assertNotIn("sizing_failure", dialog.result)
+        finally:
+            dialog.reject()
+
+    def test_default_calculated_tension_allows_cost_sizing_and_exact_rerun(self):
+        dialog = self.dialog()
+        try:
+            editor = dialog.component_editor
+            self.assertTrue(all(combo.currentData() == 'calculated' for combo in editor.purlin_tension_methods.values()))
+            self.assertTrue(all(r['tension_kn'] is None for r in editor.snapshot()['purlin_axial_ratings'].values()))
+            dialog.run_analysis()
+            self.assertIsNotNone(dialog.result, dialog.status_label.text())
+            worked = [r for check in dialog.result['section_checks'].values() for r in check['case_checks'] if r.get('tension_method') == 'calculated']
+            self.assertTrue(worked)
+            for r in worked:
+                expected = .9*min(r['tension_gross_area_mm2']*450, .85*.85*.7*r['tension_gross_area_mm2']*480)/1000
+                self.assertAlmostEqual(r['tension_capacity_kn'], expected)
+                self.assertAlmostEqual(r['ratio'], r['axial_kn']/expected+r['bending_ratio'])
+            preview = float(editor.purlin_table.item(0, 13).text())
+            dialog.criteria_inputs['net_area_factor'].setValue(.5)
+            self.assertLess(float(editor.purlin_table.item(0, 13).text()), preview)
+            dialog.criteria_inputs['net_area_factor'].setValue(.7)
+            dialog.run_auto_size()
+            self.assertIsNotNone(dialog.result, dialog.status_label.text())
+            self.assertTrue(dialog.result['design']['passes'], dialog.status_label.text())
+            self.assertTrue(all(row['passes'] for row in dialog.result['section_checks'].values()))
+            self.assertIn('PURLIN MEMBER TENSION WORKINGS', dialog.report_text)
+            rerun = solve_selection(dialog.current_context(), dialog.selections(), dialog.criteria(), dialog.context['cost_rates'])
+            self.assertTrue(rerun['design']['passes'])
+            self.assertAlmostEqual(rerun['design']['estimated_cost'], dialog.result['design']['estimated_cost'])
+            saved = dialog.snapshot()
+            restored = self.dialog(saved)
+            try:
+                self.assertEqual(saved, restored.snapshot())
+            finally:
+                restored.reject()
+            json.dumps(dialog.result, allow_nan=False)
         finally:
             dialog.reject()
 

@@ -39,5 +39,11 @@ def select_roof_purlin_pair(general, edge, general_rows, edge_rows):
         "general_rows": general_rows,
         "edge_rows_total": edge_rows,
         "weighted_area_mm2": score[0],
+        "profile_alternatives": [
+            {"profile": profile, "general_section": general_option['section'],
+             "edge_section": edge_option['section'], "weighted_area_mm2": order[0],
+             "weight_kg_per_m_building": order[0]*.00785,
+             "extra_material_percent": 100*(order[0]/score[0]-1) if score[0] else 0.}
+            for order, general_option, edge_option, profile in sorted(pairs, key=lambda item:item[0])],
         "basis": "Lowest combined material weight across general and edge rows; same profile, independently selected thicknesses.",
     }

@@ -22,7 +22,7 @@ def _positive(record, key):
 
 def with_beam_demands(result, plan):
     """Solve every affected roof line, including adjoining bays without additions."""
-    lines = sorted({a.location["line"] for a in plan.members.values() if a.arrangement == ARRANGEMENT})
+    lines = sorted({a.location["line"] for a in plan.members.values() if a.arrangement in {ARRANGEMENT, 'shared_purlin'}})
     runs, by_member = {}, {}
     stations = result["analysis_layout"]["geometry"]["bay_stations_mm"]
     spans = [b-a for a, b in zip(stations, stations[1:])]
@@ -32,6 +32,13 @@ def with_beam_demands(result, plan):
         rating = data["axial_rating"]
         error = None
         try:
+            if any(a.arrangement == 'shared_purlin' for a in assemblies):
+                from purlin_shared_design import solve_shared
+                run = solve_shared(assemblies, spans, line)
+                runs[str(line)] = run
+                for bay, assembly in enumerate(assemblies):
+                    by_member[assembly.location['id']] = {'line': str(line), 'bay': bay, 'error': None}
+                continue
             if len({a.location["existing_count"] for a in assemblies}) != 1:
                 raise AnalysisError("Sheeted beam model needs a consistent existing-purlin count along the run")
             if any(a.location["purlin"]["section"] != data["section"] for a in assemblies):
@@ -102,7 +109,7 @@ def with_beam_demands(result, plan):
     return {**result, "purlin_beams": {"runs": runs, "members": by_member}}
 
 
-def beam_check(result, identifier, component, force_kn, name, level, sls_divisor):
+def beam_check(result, identifier, component, force_kn, name, level, sls_divisor, criteria=None):
     """No UDL-table capacity is applied to redistributed moment diagrams.
 
     Entered member M+/M-/V capacities must cover the actual restraint/span/
@@ -113,6 +120,9 @@ def beam_check(result, identifier, component, force_kn, name, level, sls_divisor
         return None
     data, existing = component["data"], component["existing"]
     run = result["purlin_beams"]["runs"][entry["line"]]
+    if run.get('design_method') == 'assigned_half_reference':
+        from purlin_shared_design import shared_check
+        return shared_check(run, entry, component, force_kn, name, level, sls_divisor, criteria)
     base = {"case": name, "method": "coupled_purlin_beam", "section": data["section"],
             "axial_kn": force_kn, "beam_line": entry["line"], "beam_bay": entry["bay"],
             "beam_role": "roof" if existing else "added", "coupling_defined": run.get("coupling_defined", False)}
@@ -145,10 +155,10 @@ def beam_check(result, identifier, component, force_kn, name, level, sls_divisor
         bending = max(max(d["positive_moment_knm"]/mp, d["negative_moment_knm"]/mn) for _, d in envelopes)
         shear = max(d["shear_kn"]/v for _, d in envelopes)
         if force_kn > 1e-8:
-            nt = _positive(rating, "tension_kn" if existing else "beam_added_tension_kn")
-            source = rating.get("source") if existing else rating.get("beam_capacity_source")
-            if not str(source or "").strip():
-                raise AnalysisError("Purlin tension source is required")
+            from purlin_combined import tension_capacity
+            tension = tension_capacity(data, criteria, added=not existing)
+            base.update(tension)
+            nt = tension["tension_capacity_kn"]
             axial = force_kn/nt
         else:
             nt, axial = None, max(-force_kn, 0.)/ns

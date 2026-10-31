@@ -117,6 +117,21 @@ class RoofIntegrationTests(unittest.TestCase):
             self.assertEqual(item["section"], match["section"])
         self.assertEqual(sum(item["count"] for item in items), len(w.purlin_layout.points))
 
+    def test_default_200_pair_is_heavier_and_thinner_200s_fail_uplift(self):
+        w, p = self.window, self.window.purlin_check
+        self.assertEqual(p['span_type'], 'Double span')
+        self.assertEqual(p['match']['section'], 'C/Z 250 15')
+        self.assertEqual(p['local_match']['section'], 'C/Z 250 19')
+        options = {item['profile']: item for item in p['profile_selection']['profile_alternatives']}
+        shallow = options['C/Z 200']
+        self.assertEqual(shallow['general_section'], 'C/Z 200 19')
+        self.assertEqual(shallow['edge_section'], 'C/Z 200 24')
+        expected = (9*713+6*900)/(9*638+6*808)-1
+        self.assertAlmostEqual(shallow['extra_material_percent'], expected*100)
+        self.assertGreater(p['outward_kn_m'], w.purlin_capacity_row(w.metroll_tables['tables']['2A'], 'C/Z 200 15', 8000)['strength_capacity_kn_m'])
+        self.assertGreater(p['local_outward_kn_m'], w.purlin_capacity_row(w.metroll_tables['tables']['2A'], 'C/Z 200 19', 8000)['strength_capacity_kn_m'])
+        self.assertIn('C 200 19 / C 200 24', w.section_checks_box.toPlainText())
+
     def test_incompatible_passes_are_not_reported_as_a_passing_roof(self):
         from loads import BasicRoofLoads
         w = self.window

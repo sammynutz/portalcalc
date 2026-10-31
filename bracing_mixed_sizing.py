@@ -49,7 +49,7 @@ def auto_size_mixed(context, selections, candidates, criteria, rates, progress=N
                 from purlin_beam_design import with_beam_demands, ARRANGEMENT
                 line = old.location["line"]
                 trial = {**current["strut"].members, member["id"]: option}
-                affected = any(a.location["line"] == line and a.arrangement == ARRANGEMENT for a in trial.values()) or any(a.location["line"] == line and a.arrangement == ARRANGEMENT for a in current["strut"].members.values())
+                affected = any(a.location["line"] == line and a.arrangement in {ARRANGEMENT, 'shared_purlin'} for a in trial.values()) or any(a.location["line"] == line and a.arrangement in {ARRANGEMENT, 'shared_purlin'} for a in current["strut"].members.values())
                 screened = with_beam_demands(result, StrutPlan(trial, current["strut"].fallback)) if affected else result
                 checked = member_assessment(screened, index, option, criteria)
                 if not checked["passes"]:

@@ -14,6 +14,9 @@ REFERENCE = "Lysaght Zeds & Cees, reprinted May 1999, p20, simplified combined l
 REFERENCE_URL = "https://www.scribd.com/document/993312318/1999-Complete-Purlins"
 PROPERTY_SOURCE = "metroll_MEGASPAN_Design_Manual_23.pdf, p7"
 PROPERTY_SHA256 = "3de61ae96adffca89fbc902a4368ed6fb7d8939eefc04faaa8689761c7dcae38"
+TENSION_REFERENCE = "Hancock, Design of Cold-Formed Steel Structures, 4th ed, p170, equations 8.12/8.13"
+TENSION_URL = "https://www.steel.org.au/getattachment/09a22a15-030c-4d27-b341-7959aa5fd49b/Cold-formed-members-in-combined-axial-tensile-load-and-bending_bk150.pdf"
+MATERIAL_URL = "https://metaltex.com.au/downloads/GALVASPAN_G450.pdf"
 
 # depth, thickness (tenths): Ag mm2, rectangular/web-axis Ix (10^6 mm4), rx mm.
 # Retain the published Z15024 row, but reject its inconsistent Ag/I/r tuple
@@ -68,7 +71,55 @@ def compression_capacity(area_mm2, radius_mm, span_mm):
     return 903*area_mm2/(span_mm/radius_mm)**2
 
 
-def installed_check(component, force_kn, name, level, sls_divisor):
+def tension_method(rating):
+    # Existing entered capacities keep their original meaning, including an
+    # invalid entry that must be repaired rather than silently bypassed.
+    return rating.get("tension_method") or ("declared" if rating.get("tension_kn") is not None else "calculated")
+
+
+def tension_capacity(data, criteria=None, added=False):
+    """Member-only screen; net area/kt are visible project assumptions.
+
+    MEGASPAN material is G450/G500/G550. Use G450 minima for every gauge;
+    credit no cold-work enhancement. This does not check bolts/tearout/anchors.
+    """
+    rating = data.get("axial_rating", {})
+    field = "beam_added_tension_kn" if added else "tension_kn"
+    declared = (rating.get(field) is not None) if added else tension_method(rating) == "declared"
+    if declared:
+        try:
+            nt = float(rating.get(field) or 0.)
+            source = rating.get("beam_capacity_source" if added else "source", "")
+            if not math.isfinite(nt) or nt <= 0 or not str(source).strip():
+                raise ValueError()
+            if not added and rating.get("basis_key") != data["basis_key"]:
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise AnalysisError("Purlin tension rating required; enter valid Nt/source for the current basis")
+        return {"tension_capacity_kn": nt, "tension_method": "declared", "tension_source": source}
+    if tension_method(rating) not in {"calculated", "declared"}:
+        raise AnalysisError("Unsupported purlin tension method")
+    props = properties(data["section"], rating.get("purlin_shape", "Z"))
+    if abs(data["area_mm2"]/props["area_mm2"]-1) > .005:
+        raise AnalysisError("Installed purlin area does not match the selected Metroll section properties")
+    net_factor = criteria.net_area_factor if criteria is not None else .70
+    kt = criteria.tension_distribution_factor if criteria is not None else .85
+    if any(not math.isfinite(v) or not 0 < v <= 1 for v in (net_factor, kt)):
+        raise AnalysisError("Purlin net-area and kt assumptions must be in (0,1]")
+    area, fy, fu, phi = props["area_mm2"], 450., 480., .9
+    net = area*net_factor
+    gross, fracture = phi*area*fy/1000, phi*.85*kt*net*fu/1000
+    return {"tension_capacity_kn": min(gross, fracture), "tension_method": "calculated",
+            "tension_gross_yield_kn": gross, "tension_net_fracture_kn": fracture,
+            "tension_gross_area_mm2": area, "tension_net_area_mm2": net,
+            "tension_net_area_factor": net_factor, "tension_kt": kt,
+            "tension_fy_mpa": fy, "tension_fu_mpa": fu, "tension_phi": phi,
+            "tension_source": TENSION_REFERENCE, "tension_source_url": TENSION_URL,
+            "tension_material_source_url": MATERIAL_URL,
+            "tension_basis": "phi Nt = 0.9 min(Ag fy, 0.85 kt An fu); G450 lower-bound material (fy450/fu480 MPa); An=Ag times configured net-area factor. Assumed net area and kt, not a verified connection detail. Conservative additive N/phiNt + table bending; no beneficial tension effect."}
+
+
+def installed_check(component, force_kn, name, level, sls_divisor, criteria=None):
     data = component["data"]
     rating = data.get("axial_rating", {})
     fraction = component.get("roof_bending_share", 1.)
@@ -95,11 +146,9 @@ def installed_check(component, force_kn, name, level, sls_divisor):
                 compression_ratio=compression/ns+bending)
     if force_kn > 1e-8:
         try:
-            nt = float(rating.get("tension_kn") or 0.)
-            if not math.isfinite(nt) or nt <= 0 or not str(rating.get("source", "")).strip() or rating.get("basis_key") != data["basis_key"]:
-                raise ValueError()
-        except (TypeError, ValueError):
-            return {**base, "mode": "Purlin tension rating required; simplified compression calculated", "ratio": None, "passes": False}
-        return {**base, "mode": "Declared purlin tension + bending envelope", "ratio": force_kn/nt+bending,
-                "tension_capacity_kn": nt, "tension_source": rating["source"]}
+            tension = tension_capacity(data, criteria)
+        except AnalysisError as error:
+            return {**base, "mode": str(error), "ratio": None, "passes": False}
+        return {**base, **tension, "mode": f"{tension['tension_method'].title()} purlin tension + bending envelope",
+                "ratio": force_kn/tension["tension_capacity_kn"]+bending}
     return {**base, "mode": "Lysaght 1999 simplified compression + bending", "ratio": compression/ns+bending}

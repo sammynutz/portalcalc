@@ -125,18 +125,21 @@ def prepare_context(window, allow_unconfigured=False):
             "basis_key": f"{match['section']}|{purlin_check['span_type']}|{match.get('tables')}|{match.get('outward_bridging')}|{match.get('inward_bridging')}",
             "zone": "edge" if edge else "general", "nearest_installed_x_mm": px-left.x,
             "node_offset_mm": px-left.x-x, "bending_snapshot": copy.deepcopy(match),
-            "source": "Existing Metroll bending-table check; axial ratings must be supplied separately"}
+            "source": "Existing Metroll bending-table check; axial member compression/tension calculated or separately declared in the 3D workspace"}
         installed[str(line)]["bending_span_mm"] = purlin_check["span_mm"]
         installed[str(line)]["beam_inputs"] = {"span_type": purlin_check["span_type"],
             "outward_kn_m": purlin_check[prefix+"outward_kn_m"],
             "inward_strength_kn_m": purlin_check[prefix+"inward_strength_kn_m"],
             "service_kn_m": purlin_check[prefix+"inward_service_kn_m"],
+            "service_outward_kn_m": purlin_check[prefix+"wind_service_upward_kpa"]*purlin_check['spacing_mm']/1000,
+            "service_inward_kn_m": purlin_check[prefix+"wind_service_downward_kpa"]*purlin_check['spacing_mm']/1000,
             "permanent_kn_m": purlin_check["permanent_kpa"]*purlin_check["spacing_mm"]/1000,
             "gravity_service_kn_m": (purlin_check["permanent_kpa"]+purlin_check["live_kpa"])*purlin_check["spacing_mm"]/1000}
         installed[str(line)]["bending_key"] = hashlib.sha256(json.dumps({
             key: installed[str(line)][key] for key in ("section", "area_mm2", "bending_ratio", "service_ratio",
                 "added_bending_ratio", "added_service_ratio", "basis_key", "bending_span_mm", "bending_snapshot", "beam_inputs")
         }, sort_keys=True).encode()).hexdigest()
+    from purlin_strut_tables import snapshot as strut_table_snapshot
     return {
         "layout": layout, "nominal_layout": saved.to_dict(), "nominal_geometry": nominal, "portal": portal, "cases": cases,
         "roof_brace": copy.deepcopy(window.selected_brace_size(window.roof_brace_size_combo)),
@@ -153,6 +156,7 @@ def prepare_context(window, allow_unconfigured=False):
                        "wb": window.costing_rate_from_input(window.wb_cost_input, "wb_rate_per_kg"),
                        "purlin": window.costing_rate_from_input(window.purlin_cost_input, "purlin_rate_per_kg")},
         "installed_purlins": installed,
+        "purlin_strut_tables": strut_table_snapshot(window.metroll_tables or {}),
     }
 
 
