@@ -28,11 +28,15 @@ def timed_step(label: str):
 
 
 def compile_sources(root: Path) -> None:
+    for name in ('bracing_diaphragm.py', 'bracing_diaphragm_regression.py'):
+        py_compile.compile(str(root / name), doraise=True)
+    for name in ('column_flybracing.py', 'column_flybracing_regression.py'):
+        py_compile.compile(str(root / name), doraise=True)
     for name in ("bracing_layout.py", "bracing_layout_ui.py", "bracing_layout_regression.py"):
         py_compile.compile(str(root / name), doraise=True)
     for name in ("bracing_analysis.py", "bracing_analysis_desktop.py", "bracing_analysis_ui.py", "bracing_analysis_regression.py"):
         py_compile.compile(str(root / name), doraise=True)
-    for name in ("bracing_design.py", "bracing_design_regression.py", "bracing_workspace_ui.py"):
+    for name in ("bracing_design.py", "bracing_design_regression.py", "bracing_workspace_ui.py", 'bracing_policy.py', 'bracing_policy_regression.py', 'bracing_calculation_cache.py', 'bracing_cache_regression.py', 'bracing_serviceability_regression.py', 'bracing_mullion_design.py', 'bracing_alignment_regression.py'):
         py_compile.compile(str(root / name), doraise=True)
     for name in ("bracing_components.py", "bracing_component_ui.py", "bracing_mixed_sizing.py", "bracing_sizing_diagnostics.py", "bracing_components_regression.py", "bracing_schedule.py", "purlin_combined.py", "purlin_beam.py", "purlin_beam_design.py", "purlin_beam_ui.py", "purlin_beam_regression.py", 'purlin_shared_design.py', 'purlin_strut_tables.py', 'purlin_strut_regression.py'):
         py_compile.compile(str(root / name), doraise=True)
@@ -2327,6 +2331,8 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     expected_left_column_flybrace_length = abs(window.concept_main_top_nodes[0].y - window.base_nodes[0].y) / 2.0
     assert math.isclose(left_column_restraint["major_mm"], expected_left_column_flybrace_length, rel_tol=1e-9)
     assert math.isclose(left_column_restraint["minor_mm"], expected_left_column_flybrace_length, rel_tol=1e-9)
+    assert left_column_restraint["ke"] == 1.0
+    assert left_column_restraint["am"] == 1.3
 
     window.right_canopy_length_input.setText("6")
     window.right_canopy_type_combo.setCurrentText("Lean-to")
@@ -2375,6 +2381,8 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     ) / 2.0
     assert math.isclose(right_lean_restraint["major_mm"], expected_right_lean_flybrace_length, rel_tol=1e-9)
     assert math.isclose(right_lean_restraint["minor_mm"], expected_right_lean_flybrace_length, rel_tol=1e-9)
+    assert right_lean_restraint["ke"] == 1.0
+    assert right_lean_restraint["am"] == 1.3
     right_lean_midheight = window.design_envelope_actions["sls_column_midspan_ws_deflections"]["RIGHT_LEAN_COLUMN"]
     assert right_lean_midheight["value"] >= 0.0
     assert "mid Ws" in window.right_lean_column_deflection_check_label.text()
@@ -2385,10 +2393,11 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     }
     right_lean_stability = stability_rows["RIGHT_LEAN_COLUMN"]
     assert right_lean_stability["wall_clad"] is True
-    assert "mid-height flybrace" in right_lean_stability["restraint_assumption"]
+    assert "no in-plane support" in right_lean_stability["restraint_assumption"]
+    assert right_lean_stability['flybrace_schedule'] is not None
     assert math.isclose(
         right_lean_stability["major_restraint_length_mm"],
-        expected_right_lean_flybrace_length,
+        right_lean_stability['flybrace_schedule']['in_plane_length_mm'],
         rel_tol=1e-9,
     )
     assert right_lean_stability["mid_height_ws_deflection"]["checked"] is True
@@ -2561,7 +2570,7 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     assert left_column_restraint["crane_minor"]
     assert math.isclose(
         left_column_restraint["minor_mm"] * left_column_restraint["ke"],
-        0.85 * left_column_restraint["minor_mm"],
+        (1.0 if left_column_restraint["clad"] else 0.85) * left_column_restraint["minor_mm"],
         rel_tol=1e-9,
     )
     assert "crane minor length: base to crane height" in window.section_checks_box.toPlainText()
@@ -2763,6 +2772,30 @@ def main() -> None:
         suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(test) for test in (DesignMechanicsTests, WorkspaceTests))
         result = unittest.TextTestRunner(verbosity=1).run(suite)
         assert result.wasSuccessful(), "Bracing design/workspace regression failed"
+    with timed_step('brace family preferences and unclad-wall rod rules'):
+        import unittest
+        import bracing_policy_regression
+        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromModule(bracing_policy_regression))
+        assert result.wasSuccessful(), 'Bracing material policy regression failed'
+    with timed_step('saved bracing calculations and stale-result rejection'):
+        import unittest
+        import bracing_cache_regression
+        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromModule(bracing_cache_regression))
+        assert result.wasSuccessful(), 'Bracing saved-calculation regression failed'
+    with timed_step('bracing strength-only and serviceability design modes'):
+        import unittest
+        import bracing_serviceability_regression
+        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromModule(bracing_serviceability_regression))
+        assert result.wasSuccessful(), 'Bracing serviceability-mode regression failed'
+    with timed_step('eave tributaries and aligned main/bracing mullion checks'):
+        import unittest
+        import bracing_alignment_regression
+        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromModule(bracing_alignment_regression))
+        assert result.wasSuccessful(), 'Bracing alignment regression failed'
+    with timed_step('SLS stressed-skin diaphragms and conventional ULS independence'):
+        import bracing_diaphragm_regression
+        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromModule(bracing_diaphragm_regression))
+        assert result.wasSuccessful(), 'Bracing diaphragm regression failed'
     with timed_step("rated ropes and per-location purlin strut checks"):
         import unittest
         from bracing_components_regression import RatedComponentTests, ComponentWorkspaceTests
@@ -2785,6 +2818,11 @@ def main() -> None:
         from internal_columns_regression import InternalColumnsRegression
         result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromTestCase(InternalColumnsRegression))
         assert result.wasSuccessful(), "Internal column layout regression failed"
+    with timed_step('automatic column flybrace segment checks'):
+        import unittest
+        from column_flybracing_regression import FlybraceRegression
+        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromTestCase(FlybraceRegression))
+        assert result.wasSuccessful(), 'Automatic column flybrace regression failed'
     with timed_step(f"{mode_name} UI checks"):
         run_ui_smoke_checks(quick=args.quick)
     print(f"{mode_name} smoke checks ok")

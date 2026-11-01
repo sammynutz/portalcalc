@@ -322,6 +322,9 @@ def prepare_request(raw: Mapping[str, Any]) -> PreparedCalculationRequest:
     if not isinstance(raw_inputs, Mapping):
         raise InvalidCalculationRequest("inputs must be an object")
     inputs = _plain_json(raw_inputs)
+    if isinstance(inputs.get('bracing'),dict):
+        # Optional saved UI calculations are evidence, never engine inputs.
+        inputs['bracing'].pop('calculation_3d',None)
     for key in ("geometry", "loads", "wind", "sections"):
         if not isinstance(inputs.get(key), dict):
             raise InvalidCalculationRequest(f"inputs.{key} must be an object")
@@ -383,6 +386,7 @@ class PortalCalcCalculationService:
             "status": "proposal" if request.mode is CalculationMode.AUTO_SIZE else "checked",
             "verified": verified,
             "sizing": sizing,
+            "column_flybraces": json_safe(dossier.get("column_flybraces", [])),
             "checks": {
                 "overall_governing": json_safe(governing),
                 "members": json_safe(dossier.get("member_checks", [])),

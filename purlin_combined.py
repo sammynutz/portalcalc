@@ -43,6 +43,13 @@ PROPERTIES = {
 }
 
 
+def same_profile_size(first, second):
+    """Same catalogue web depth; C/Z identifiers allow thickness to vary."""
+    a = re.fullmatch(r'(?:C/Z|Z|C)\s*(\d+)\s+(\d+)', str(first).strip())
+    b = re.fullmatch(r'(?:C/Z|Z|C)\s*(\d+)\s+(\d+)', str(second).strip())
+    return bool(a and b and a.group(1) == b.group(1))
+
+
 def properties(section, shape="Z"):
     match = re.fullmatch(r"(?:C/Z|Z|C)\s*(\d+)\s+(\d+)", section.strip())
     key = tuple(map(int, match.groups())) if match else None
@@ -125,6 +132,7 @@ def installed_check(component, force_kn, name, level, sls_divisor, criteria=None
     fraction = component.get("roof_bending_share", 1.)
     bending = data["bending_ratio"]*fraction
     base = {"case": name, "method": METHOD, "section": data["section"], "axial_kn": force_kn,
+            'tributary_width_mm': data.get('tributary_width_mm'),
             "bending_ratio": bending, "roof_bending_share": fraction, "source": REFERENCE,
             "source_url": REFERENCE_URL,
             "basis": "Ns=903 Ag/(L/rx')^2; Nav=Ns(1-Wa/Ws); UC=Ncompression/Ns+Wa/Ws. No additional phi, kt or Euler amplification. Installed sheeted purlins only; tension and connections separate."}

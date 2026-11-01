@@ -22,11 +22,14 @@ remain separate work.
 
 Analysis section choices save under optional `bracing.analysis_3d` with schema
 `portalcalc.bracing-analysis-settings.v1`. Legacy presets omit it. Results are
-transient: changing a section, check assumption or layout clears the previous result and
-disables exports until another successful run. The evidence freezes the source
+retained when the workspace closes and optionally saved with the building preset
+as a compressed `bracing.calculation_3d` cache. Reopening validates the current
+inputs, physical model and engine revision before restoring without a 3D solve.
+Changing a section, check assumption or layout clears the previous result and
+disables exports until another run. The evidence freezes the source
 preset and its SHA256, actual analysis geometry, sections, load workings and
-case results. Cancel/window close discards unsaved layout/section changes; Save
-layout and sections records both. Configurator Review locks inputs and automatic
+case results. Cancel discards unsaved edits; Save and close or the window X retains
+the current workspace and calculations. Configurator Review locks inputs and automatic
 sizing while allowing analysis and visual inspection.
 
 The production portal is rebuilt once before opening the dialog. The 3D adapter
@@ -52,7 +55,49 @@ Identical portal sections repeat at each longitudinal station, including ends.
   beneath a gable ridge which is not a mullion station.
 - Brace/end-post ground translations are fixed. Portal base supports and springs
   come from the 2D model. Foundation flexibility and connection slip are absent.
-- There is no sheet/diaphragm stiffness and no weak-axis portal column bending.
+- Sheet/diaphragm stiffness is excluded by default. The optional SLS-only roof
+  model is described below. There is no weak-axis portal column bending.
+
+## Optional SLS stressed-skin roof contribution
+
+In **Sections / criteria > SLS stressed-skin roof contribution**, enable the
+technical-note option to add equivalent roof diagonals for serviceability.
+It saves under `analysis_3d.stressed_skin`; legacy jobs default to disabled.
+The adopted panel flexibility starts at **1.8 mm/kN**. The supplied technical
+note's 1.5-1.8 range relates to its particular crest-fixed assembly and panel;
+0.72 is a stiffer sensitivity case. Geometry determines the equivalent member
+area from an entered flexibility, never the flexibility itself.
+
+Each bay gets one panel across each complete roof slope (one across a skillion),
+independent of the mullion/brace strip mesh. Each panel has two crossed
+tension-only diagonals, each assigned the full area
+`Aeq = Ld^3 / (E c s^2)`, where E = 200 kN/mm2 and Ld = sqrt(s^2+n^2).
+The initial shear-displacement direction defining s is **along the roof slope**,
+matching the note. The current applied wind is longitudinal. The report therefore
+also gives the equivalent model's implied longitudinal flexibility; it is not a
+separately validated directional test value. A longitudinal definition of c can
+be selected when adopting a directional flexibility. The note's range must not
+be assumed to validate that direction or another installed assembly.
+
+Conventional members remain installed. Every ULS case uses the bare network;
+every SLS case solves both the bare and enhanced networks. Bare-model mechanisms
+still fail, and a neutral bare tangent still prevents checked acceptance. Panels
+do not cross the ridge or add ridge-flashing links. They connect only to existing
+structural roof nodes; collector and boundary connections are assumed. No wall
+diaphragm, screw/collector strength or connection-slip acceptance is added.
+This option does not add transverse wind or alter the production portal model.
+
+TXT/JSON retain c, its direction, s/n/Ld, Aeq, EA, equivalent diameter, bare and
+enhanced longitudinal movements, diagonal forces, `Vpanel = Ndiag*s/Ld` and
+average shear flow `Vpanel/(n/1000)`. SLS surrogate members appear as teal dashed
+lines. Per-case net panel shear sums the signed contributions of opposite
+diagonals, so equal tensions due to panel extension do not become net shear.
+Individual diagonal forces remain available for boundary/collector checks. The
+surrogates appear as separate stiffness-only table rows and are excluded from
+physical member sizing and purchased quantities. Changing the option, c or direction
+invalidates the calculation/export cache. `bracing_diaphragm_regression.py`
+checks independent racking stiffness and reversal, directional conversion,
+ULS independence, recovery, sizing and saved-workspace behavior.
 
 Eight wind cases cover front-to-back/back-to-front, Cpi +/- and ULS/SLS. Each
 uses simultaneous windward/leeward pressures from the existing wind module,
@@ -61,6 +106,41 @@ wind swaps physical end identities for the Cpi model. `End +`/`End -` in the
 existing roof-pressure API are coefficient branches, not opposite wind directions.
 An open end receives no cladding pressure.
 
+End-wind leeward coefficients use the along-wind length/span ratio and the
+parallel-to-ridge coefficient branch, independently of the transverse portal's
+roof-pitch lookup. The corrected leeward coefficient is also used for dominant
+leeward-end openings. End-pressure action-combination factors count only the
+applied clad end surfaces and an effective internal surface (abs(Cpi)>=0.4),
+not a roof pressure that this model does not apply. Case evidence freezes d/b,
+Cp,e, surface count, Ka/Kce/Kci and the source: AS/NZS 1170.2:2021 Amendment 2,
+Table 5.2(B) and clause 5.4.3. Transverse cases and connection acceptance remain
+separate.
+
+External roof friction is added simultaneously in each end-wind case, using
+clause 5.5/Table 5.9: mean roof height h, crosswind breadth b, alongwind depth d,
+and projected roof area b * max(d - 4*min(h,b), 0). Down-slope sheet ribs run
+across longitudinal wind: Cf=0.04 for 5-Rib (Trimdek), 0.02 for Corry (Corodek).
+Unknown profiles require a configured coefficient. The matching ULS/SLS velocity
+pressure is used without end-wall Ka/Kce/Kci reductions. The downwind strip is
+mirrored for reverse wind and integrated onto roof stations and bay lines,
+including a cutoff inside a bay. All roof drag enters the roof network; it is
+not split half to ground like the simply supported end-wall pressure.
+
+For open-sided buildings this external-roof method is explicitly labelled a
+PRELIMINARY extension of the enclosed-building rule. It is not a complete
+free-roof aerodynamic check. Underside, wall friction and exposed-member drag
+are excluded. The summary and full TXT/JSON expose the coefficient, load strip,
+projected area, force, source and applicability assumption. Adding this load does
+not add cladding/diaphragm stiffness. Old cached calculations are invalidated.
+
+End-wall pressure acts normal to the front/back walls along Y. Side-wall braces
+have a Y component and carry longitudinal forces to ground; front/back end-wall
+braces are in X/Z and have no direct Y component. Their coupled spatial actions
+are calculated, but transverse-wind end-wall bracing sizing is not included.
+Per-case load-path evidence resolves actual axial forces at their ground ends,
+reports reactions by wall face and balances the roof-applied Y load separately
+from pressure delivered directly to end-post bases.
+
 End cladding/mullions use the stated simply supported vertical-strip assumption.
 Half of each strip's resultant is delivered to roof and half directly to ground.
 Two-point Gaussian integration preserves the resultant and overturning for the
@@ -68,10 +148,13 @@ piecewise linear roof height. Roof forces interpolate onto roof stations; ground
 forces interpolate onto real end-post stations. This is a declared load model,
 not a separately verified cladding/girt/mullion connection design.
 
-Excluded actions include G/Q, transverse wind, roof/wall friction or drag, crane,
+Excluded actions include G/Q, transverse wind, wall/underside/exposed-member drag, crane,
 storage and full production load combinations. They cannot be inferred from a
 successful end-wind solve. ULS/SLS pressure scales are applied within each wind
 case; rod active sets are solved afresh rather than superposing nonlinear results.
+Normal roof and side-wall pressures are also outside this reduced 3D solve;
+the separate purlin roof-bending envelope is not a simultaneous whole-building
+wind-pressure pattern.
 
 ## Portal reduction and recovery
 

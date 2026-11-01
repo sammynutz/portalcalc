@@ -3,15 +3,16 @@ import math
 from types import SimpleNamespace
 
 from PySide6.QtCore import Qt, Signal, QSignalBlocker
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QHeaderView, QLabel, QTabWidget,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QHeaderView, QLabel, QTabWidget, QHBoxLayout,
                               QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from bracing_analysis import AnalysisError
 from bracing_components import (StrutPlan, location_options, strut_locations,
-                                wire_options, WIRE_DIAMETERS_MM)
-from bracing_schedule import ROD_SCHEDULE, SOURCE, rod_options
+                                wire_options, WIRE_DIAMETERS_MM, WIRE_ASSUMED_STIFFNESS,
+                                assumed_wire_stiffness)
+from bracing_schedule import ROD_SCHEDULE, SOURCE, rod_options, WIRE_PRICE_SCHEMA, WIRE_FITTING_COST_BASIS
 from purlin_combined import (METHOD, method, properties, compression_capacity,
-                            tension_method, tension_capacity)
+                            tension_method, tension_capacity, same_profile_size)
 
 
 def numeric(text):
@@ -35,7 +36,22 @@ class ComponentEditor(QWidget):
         self.mixed.setChecked(bool(saved.get("mixed_struts", True)))
         self.mixed.setEnabled(not read_only)
         layout.addWidget(self.mixed)
-        note = QLabel("Installed compression uses the adopted Lysaght 1999 method with automatic Metroll Ag/rx' (default Z; C selectable). Declared Nc/Nex is an alternative. Member tension is calculated using G450 minima (fy450/fu480 MPa), with the net-area factor and kt from Sections / criteria; declared Nt/source can override it. These are member sizing assumptions; connection checks remain separate. Linked counts share axial force; enter 2 at a connected apex pair.")
+        policy_row = QHBoxLayout()
+        policy_row.addWidget(QLabel('Project use / brace preference'))
+        self.project_use = QComboBox()
+        for label, key in (('Unspecified - lowest checked cost', 'unspecified'),
+                           ('Agricultural - prefer wire rope', 'agricultural'),
+                           ('Commercial / industrial - prefer rod', 'commercial_industrial')):
+            self.project_use.addItem(label, key)
+        project_use = (saved.get('brace_policy') or {}).get('project_use', 'unspecified')
+        self.project_use.setCurrentIndex(max(0, self.project_use.findData(project_use)))
+        self.project_use.setEnabled(not read_only)
+        policy_row.addWidget(self.project_use, 1)
+        layout.addLayout(policy_row)
+        self.policy_note = QLabel('Wire: Austlift 6x24 fibre core G1570. Interim stiffness defaults to E = 200 GPa with nominal circular area; declared EA/source can override it in Wire-rope ratings. Project rope rates and one forged-rated turnbuckle per diagonal are loaded; 12 mm uses $1.90/m, M10/M12 use $4 allowances. Grips and other terminations are excluded. Agricultural projects prefer passing, priced wire; commercial/industrial prefer rod. Rod is mandatory for any wall-brace group containing a brace on an unclad face. Family preference is applied before cost; missing data can cause fallback to another eligible family.')
+        self.policy_note.setWordWrap(True)
+        layout.addWidget(self.policy_note)
+        note = QLabel("Installed compression uses the adopted Lysaght 1999 method with automatic Metroll Ag/rx' (default Z; C selectable). Declared Nc/Nex is an alternative. Member tension is calculated using G450 minima (fy450/fu480 MPa), with the net-area factor and kt from Sections / criteria; declared Nt/source can override it. These are member sizing assumptions; connection checks remain separate. Linked existing purlins share axial force; the confirmed gable apex pair defaults to 2.")
         note.setWordWrap(True)
         layout.addWidget(note)
         tabs = QTabWidget()
@@ -43,11 +59,15 @@ class ComponentEditor(QWidget):
         layout.addWidget(tabs, 1)
         self.strut_table = QTableWidget()
         self.strut_table.setColumnCount(7)
-        self.strut_table.setHorizontalHeaderLabels(["Strut", "Purlin", "Braced bay", "Identical linked count", "Arrangement", "Added steel", '50/50 added purlin'])
+        self.strut_table.setHorizontalHeaderLabels(["Strut", "Purlin", "Braced bay", "Existing connected purlins", "Arrangement", "Added steel", 'Added purlin section'])
         self.strut_rows = []
         self.added_purlin_combos = {}
         member_settings = saved.get("strut_members", {})
-        counts = {key: value.get("existing_count", 1) for key, value in member_settings.items() if isinstance(value, dict)}
+        # Old automatic count=1 entries adopt the confirmed installed apex pair.
+        # New manual overrides and non-default legacy counts remain explicit.
+        counts = {key: value.get('existing_count', 1) for key, value in member_settings.items()
+                  if isinstance(value, dict) and (value.get('existing_count_mode') == 'manual' or
+                     (not value.get('existing_count_mode') and value.get('existing_count', 1) != 1))}
         try:
             locations = strut_locations(context, saved.get("purlin_axial_ratings"), counts)
         except AnalysisError as error:
@@ -60,12 +80,15 @@ class ComponentEditor(QWidget):
                 item = QTableWidgetItem(value)
                 if col != 3:
                     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                elif location['purlin'].get('installed_count_source'):
+                    item.setToolTip(location['purlin']['installed_count_source']+f"; roof tributary width {location['purlin'].get('tributary_width_mm', 0):.1f} mm per ply. Editable count if the connected detail differs. Common-end force transfer is assumed, not connection-checked.")
                 self.strut_table.setItem(row, col, item)
             arrangement = QComboBox()
             for text, key in (("Existing purlins only", "existing_purlins"), ("Extra unsheeted purlin", "additional_purlin"),
                               ('Sheeted purlin: 50/50 load (preliminary)', 'shared_purlin'),
+                              ('Added back-to-back pair: equal roof load per ply', 'shared_purlin_pair'),
                               ("Sheeted single-span purlin (beam model)", "sheeted_purlin"),
-                              ("Back-to-back mate", "back_to_back"), ("Additional steel strut", "additional_steel")):
+                              ("Mate to existing purlin (declared residual)", "back_to_back"), ("Additional steel strut", "additional_steel")):
                 arrangement.addItem(text, key)
             arrangement.setCurrentIndex(max(0, arrangement.findData(config.get("arrangement", "existing_purlins"))))
             steel = QComboBox()
@@ -83,6 +106,12 @@ class ComponentEditor(QWidget):
             for candidate in location['added_purlins']:
                 added_combo.addItem(candidate['section'].replace('C/Z ', 'C '), candidate['section'])
             added_name = config.get('added_purlin_section', location['purlin']['section'])
+            if added_name and not same_profile_size(added_name, location['purlin']['section']):
+                old = added_name
+                added_name = location['purlin']['section']
+                if added_combo.findData(added_name) < 0 and added_combo.count():
+                    added_name = added_combo.itemData(0)
+                added_combo.setToolTip(f'Saved {old} replaced to match roof profile size. Thickness may vary. Reanalyse or auto-size before adoption.')
             index = added_combo.findData(added_name)
             if index < 0:
                 added_combo.addItem('Unavailable saved purlin: '+str(added_name), None)
@@ -90,9 +119,9 @@ class ComponentEditor(QWidget):
             added_combo.setCurrentIndex(index)
             self.added_purlin_combos[location['id']] = added_combo
             self.strut_table.setCellWidget(row, 6, added_combo)
-            added_combo.setEnabled(not read_only and arrangement.currentData() == 'shared_purlin')
+            added_combo.setEnabled(not read_only and arrangement.currentData() in {'shared_purlin', 'shared_purlin_pair'})
             added_combo.currentIndexChanged.connect(lambda *_: self.changed.emit())
-            arrangement.currentIndexChanged.connect(lambda _i, a=arrangement, c=added_combo: c.setEnabled(not read_only and a.currentData() == 'shared_purlin'))
+            arrangement.currentIndexChanged.connect(lambda _i, a=arrangement, c=added_combo: c.setEnabled(not read_only and a.currentData() in {'shared_purlin', 'shared_purlin_pair'}))
             arrangement.setEnabled(not read_only)
             steel.setEnabled(not read_only and arrangement.currentData() == "additional_steel")
             arrangement.currentIndexChanged.connect(lambda _index, a=arrangement, s=steel: s.setEnabled(not read_only and a.currentData() == "additional_steel"))
@@ -122,8 +151,13 @@ class ComponentEditor(QWidget):
         self.bending_keys = {}
         for row, key in enumerate(self.rating_keys):
             location = keys[key]
-            rating = (saved.get("purlin_axial_ratings") or {}).get(key, {})
-            label = QTableWidgetItem(f"{location['purlin']['section']} / {location['length_mm']/1000:g} m")
+            data = location['purlin']
+            rating = data.get('axial_rating', {})
+            duty = (f"{data.get('tributary_width_mm', 0):g} mm trib; {data.get('zone', 'roof')}"
+                    f"; roof line {location['line']+1}")
+            rating_label = f"{data['section']} / {location['length_mm']/1000:g} m / {duty}"
+            label = QTableWidgetItem(rating_label)
+            label.setToolTip(data.get('tributary_width_source', '')+'; separate entry for this bending-load snapshot')
             label.setFlags(label.flags() & ~Qt.ItemIsEditable)
             self.shared_table.setItem(row, 0, label)
             fixed = QTableWidgetItem()
@@ -132,7 +166,7 @@ class ComponentEditor(QWidget):
             self.shared_table.setItem(row, 1, fixed)
             self.shared_table.setItem(row, 2, QTableWidgetItem(str(rating.get('shared_bridging_rows', location['purlin']['bending_snapshot'].get('bridging_rows', 0)))))
             self.bending_keys[key] = location["purlin"].get("bending_key")
-            for col, value in ((0, key.split("|bay_span_mm=")[0]), (1, f"{location['length_mm']/1000:g}"),
+            for col, value in ((0, key.split("|bay_span_mm=")[0]+' / '+duty), (1, f"{location['length_mm']/1000:g}"),
                                (2, rating.get("compression_kn")), (3, rating.get("tension_kn")),
                                (4, rating.get("elastic_buckling_kn")), (6, rating.get("source", ""))):
                 item = QTableWidgetItem("" if value is None else str(value))
@@ -186,7 +220,7 @@ class ComponentEditor(QWidget):
             shape.currentIndexChanged.connect(refresh)
             shape.currentIndexChanged.connect(lambda *_: self.refresh_tension_preview())
             tension_choice.currentIndexChanged.connect(lambda *_: self.changed.emit())
-            label = QTableWidgetItem(f"{location['purlin']['section']} / {location['length_mm']/1000:g} m")
+            label = QTableWidgetItem(rating_label)
             label.setFlags(label.flags() & ~Qt.ItemIsEditable)
             self.extra_table.setItem(row, 0, label)
             current = rating.get("extra_bending_key") == self.bending_keys[key]
@@ -194,7 +228,7 @@ class ComponentEditor(QWidget):
                 value = rating.get(field) if current else None
                 self.extra_table.setItem(row, col, QTableWidgetItem("" if value is None else str(value)))
             pair_current = rating.get("beam_capacity_key") == self.bending_keys[key]
-            for col, value in enumerate((f"{location['purlin']['section']} / {location['length_mm']/1000:g} m",
+            for col, value in enumerate((rating_label,
                     rating.get("cladding_coupling_kn_m_per_mm"), rating.get("cladding_coupling_source", ""),
                     *(rating.get(field) if pair_current else None for field in
                       ("beam_roof_positive_moment_knm", "beam_roof_negative_moment_knm", "beam_roof_shear_kn", "beam_added_positive_moment_knm", "beam_added_negative_moment_knm", "beam_added_shear_kn", "beam_added_tension_kn")),
@@ -206,16 +240,19 @@ class ComponentEditor(QWidget):
         tabs.addTab(self.purlin_table, "Purlin axial ratings")
         tabs.addTab(self.extra_table, "Added-ply residual ratings")
         tabs.addTab(self.paired_table, "Sheeted-purlin beam")
-        tabs.addTab(self.shared_table, '50/50 strut assumptions')
-        self.shared_table.setToolTip('PRELIMINARY reference-envelope check, not manufacturer M/V resistances. Apply half the local roof load to each line in added bays; axial shares by EA. Original continuity and neighbours retained. Requires flange screw fixing and stated bridging. Use the finite beam model with declared M/V for supplier-rated checks.')
-        note.setText(note.text()+' Automatic sizing also considers sheeted C-purlin struts with an adopted 50/50 applied-load split and PRELIMINARY table-reference checks. Confirm cladding fixing and bridging in 50/50 strut assumptions. These inputs do not establish the connection capacity.')
+        tabs.addTab(self.shared_table, 'Shared-load strut assumptions')
+        self.shared_table.setToolTip('PRELIMINARY reference-envelope check, not manufacturer M/V resistances. Single addition: 50/50 roof-run/added load. Added back-to-back pair: equal roof load per physical ply. Axial shares by EA. Original continuity and neighbours retained. Requires flange screw fixing and stated bridging. No composite bending stiffness.')
+        note.setText(note.text()+' Added purlins must match the roof profile size; thickness may vary. Automatic sizing considers one added sheeted purlin (50/50 roof-run/added load) or two added purlins back-to-back (equal roof load per physical ply). Each added ply is checked as single span; no composite bending stiffness is credited. Gable apex defaults to two connected existing purlins. Confirm cladding fixing/bridging in the shared-load assumptions; connections remain unchecked.')
         note.setText(note.text()+" Sheeted single-span additions use a roof-run beam model. Enter cladding transfer stiffness, direct roof-load pickup fraction and source; missing data gives fallback demands and UNVERIFIED checks. Metroll's rotational-restraint value is not this transfer stiffness. Redistributed diagrams need actual M+/M-/V member ratings. See Sheeted-purlin beam.")
         note.setText(note.text()+" Unsheeted additions use separate residual ratings; installed roof tables are not reused for them.")
         self.wire_table = QTableWidget()
-        self.wire_table.setColumnCount(10)
-        self.wire_table.setHorizontalHeaderLabels(["Diameter mm", "Construction / grade", "EA kN", "Factored brace tension kN", "$/m", "Listed fittings $/diagonal", "Strength / rating source", "EA source", "Forged-rated turnbuckle", "Grade S turnbuckle"])
+        self.wire_table.setColumnCount(11)
+        self.wire_table.setHorizontalHeaderLabels(["Diameter mm", "Construction / grade", "EA kN", "Factored brace tension kN", "$/m", "Turnbuckle $/diagonal", "Strength / rating source", "EA source / assumption", "Forged-rated turnbuckle", "Grade S turnbuckle", 'Stiffness basis'])
+        self.wire_table.setToolTip('Interim assumption: E = 200 GPa and nominal circular area, not verified rope stiffness. May underpredict rope stretch; omitted cladding does not establish conservatism. Select Declared EA to enter product data. Strength remains the supplied factored schedule.')
         self.wire_table.setRowCount(len(WIRE_DIAMETERS_MM))
+        self.wire_stiffness_modes = {}
         scheduled_wires = wire_options(saved.get("wire_rope_ratings"))
+        self.wire_saved_ratings = {str(o['diameter_mm']): o['rating'] for o in scheduled_wires}
         for row, diameter in enumerate(WIRE_DIAMETERS_MM):
             option = scheduled_wires[row]
             record = option["rating"]
@@ -224,7 +261,23 @@ class ComponentEditor(QWidget):
                 item = QTableWidgetItem("" if value is None else str(value))
                 if col in (0, 8, 9):
                     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if col == 4:
+                    item.setToolTip(record['rope_price_source']+'; '+record['rope_price_adoption'])
+                elif col == 5:
+                    item.setToolTip(record['fitting_price_source']+'; '+WIRE_FITTING_COST_BASIS)
                 self.wire_table.setItem(row, col, item)
+            choice = QComboBox()
+            choice.addItem('Interim: 200 GPa / nominal area', WIRE_ASSUMED_STIFFNESS)
+            choice.addItem('Declared EA / source', 'declared_ea')
+            basis = record['stiffness_basis']
+            if choice.findData(basis) < 0:
+                choice.addItem('Unknown saved basis: '+basis, basis)
+            choice.setCurrentIndex(choice.findData(basis))
+            choice.setEnabled(not read_only)
+            self.wire_stiffness_modes[row] = choice
+            self.wire_table.setCellWidget(row, 10, choice)
+            choice.currentIndexChanged.connect(lambda *_, r=row: self.refresh_wire_stiffness(r))
+            self.refresh_wire_stiffness(row, notify=False)
         tabs.addTab(self.wire_table, "Wire-rope ratings")
         self.rod_table = QTableWidget()
         self.rod_table.setColumnCount(7)
@@ -251,7 +304,7 @@ class ComponentEditor(QWidget):
                         if item:
                             item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
         for table, widths in ((self.rod_table, (65, 85, 145, 120, 100, 180, 420)),
-                              (self.wire_table, (95, 250, 95, 175, 80, 180, 420, 300, 180, 155))):
+                              (self.wire_table, (95, 250, 125, 175, 80, 180, 420, 370, 120, 155, 270))):
             for column, width in enumerate(widths):
                 table.setColumnWidth(column, width)
         self.purlin_table.setColumnWidth(7, 200)
@@ -265,10 +318,29 @@ class ComponentEditor(QWidget):
         for visual, logical in enumerate((0, 7, 11, 12, 13, 8, 1, 9, 10, 3, 5, 2, 4, 6)):
             header.moveSection(header.visualIndex(logical), visual)
         self.refresh_tension_preview()
+        header = self.wire_table.horizontalHeader()
+        for visual, logical in enumerate((0, 4, 8, 5, 3, 10, 2, 9, 1, 7, 6)):
+            header.moveSection(header.visualIndex(logical), visual)
         self.mixed.toggled.connect(lambda *_: self.changed.emit())
+        self.project_use.currentIndexChanged.connect(lambda *_: self.changed.emit())
         for location, arrangement, steel in self.strut_rows:
             arrangement.currentIndexChanged.connect(lambda *_: self.changed.emit())
             steel.currentIndexChanged.connect(lambda *_: self.changed.emit())
+
+    def refresh_wire_stiffness(self, row, notify=True):
+        assumed = self.wire_stiffness_modes[row].currentData() == WIRE_ASSUMED_STIFFNESS
+        values = assumed_wire_stiffness(WIRE_DIAMETERS_MM[row])
+        blocker = QSignalBlocker(self.wire_table)
+        for col, key in ((2, 'ea_kn'), (7, 'ea_source')):
+            item = self.wire_table.item(row, col)
+            if assumed:
+                item.setText(f"{values[key]:.3f}" if key == 'ea_kn' else values[key])
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            else:
+                item.setFlags(item.flags() | Qt.ItemIsEditable)
+        del blocker
+        if notify:
+            self.changed.emit()
 
     @staticmethod
     def cell(table, row, col):
@@ -318,18 +390,25 @@ class ComponentEditor(QWidget):
                 ratings[key][field] = numeric(self.cell(self.extra_table, row, col))
         wires = {}
         for row, diameter in enumerate(WIRE_DIAMETERS_MM):
-            wires[str(diameter)] = {"construction": self.cell(self.wire_table, row, 1),
+            wires[str(diameter)] = {**self.wire_saved_ratings[str(diameter)],
+                                   'pricing_schema': WIRE_PRICE_SCHEMA,
+                                   "construction": self.cell(self.wire_table, row, 1),
+                                   'stiffness_basis': self.wire_stiffness_modes[row].currentData(),
                                    **{key: numeric(self.cell(self.wire_table, row, col)) for col, key in
                                       ((2, "ea_kn"), (3, "design_tension_kn"), (4, "price_per_m"), (5, "fittings_per_run"))},
                                    "source": self.cell(self.wire_table, row, 6), "ea_source": self.cell(self.wire_table, row, 7)}
+        wires = {str(o['diameter_mm']): o['rating'] for o in wire_options(wires)}
         members = {}
         for row, (location, arrangement, steel) in enumerate(self.strut_rows):
             raw = numeric(self.cell(self.strut_table, row, 3))
             count = int(raw) if raw is not None and raw.is_integer() else -1
             members[location["id"]] = {"existing_count": count, "arrangement": arrangement.currentData(), "steel_section": steel.currentData(),
+                                      'existing_count_mode': 'installed_default' if count == location['purlin'].get('installed_count', 1) else 'manual',
                                       'added_purlin_section': self.added_purlin_combos[location['id']].currentData()}
         prices = {str(d): numeric(self.cell(self.rod_table, row, 5)) for row, d in enumerate(ROD_SCHEDULE)}
         return {"mixed_struts": self.mixed.isChecked(), "strut_members": members, "rod_fitting_prices": prices,
+                'brace_policy': {'schema': 'portalcalc.brace-policy.v1', 'project_use': self.project_use.currentData(),
+                                 'unclad_walls_require_rod': True},
                 "purlin_axial_ratings": ratings, "wire_rope_ratings": wires}
 
     def wire_candidates(self):
@@ -351,7 +430,7 @@ class ComponentEditor(QWidget):
             if profile is None:
                 raise AnalysisError("Unknown added steel profile in strut plan")
             options = [option for option in location_options(location, [profile]) if option.arrangement == row['arrangement']]
-            if row['arrangement'] == 'shared_purlin':
+            if row['arrangement'] in {'shared_purlin', 'shared_purlin_pair'}:
                 options = [option for option in options if next(c['data']['section'] for c in option.components if c.get('shared_beam')) == row['added_purlin_section']]
             if not options:
                 raise AnalysisError('Selected added purlin is unavailable for the current span/bridging data')

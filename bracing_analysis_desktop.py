@@ -13,11 +13,52 @@ from bracing_layout import BracingLayout, LayoutGeometry
 from bracing_analysis import (AnalysisError, PortalReduction, build_braced_building,
                               solve_building_case)
 from wind import (CPI_CASE_OPTIONS, active_cpi_for_case, calculate_wind,
-                  direction_bearing_degrees, external_pressure_factor,
-                  internal_pressure_factor, wind_pressure_scale)
+                  direction_bearing_degrees, area_reduction_factor,
+                  leeward_wall_cpe, wind_pressure_scale)
 
 
-def end_wind_cases(inputs):
+END_WIND_PRESSURE_SOURCE = 'AS/NZS 1170.2:2021 (Amendment 2), Table 5.2(B) end-wind branch and clause 5.4.3'
+END_WIND_PRESSURE_URL = 'https://webstore.ansi.org/preview-pages/sai/preview_00-2666920554-primary.pdf'
+
+
+def end_wind_combination_factors(inputs,cpi):
+    """Count applied end-wall/internal surfaces; no absent roof contribution."""
+    external=int(bool(inputs.front_wall_clad))+int(bool(inputs.back_wall_clad))
+    internal=external>0 and abs(cpi)>=.4
+    count=external+int(internal)
+    kce=.8 if count>=3 else .9 if count==2 else 1.
+    kci=kce if internal else 1.
+    return kce,kci,count
+
+
+def roof_friction_drag(inputs, q_kpa, mean_height_m, reverse=False, roof_profile='5-Rib (Trimdek)'):
+    """External roof component of clause 5.5; ribs run down the roof slope.
+
+    Open-sided buildings retain the same external-roof calculation as an
+    explicit preliminary extension of the enclosed-building method. This is
+    not a free-roof/underside or exposed-member drag assessment.
+    """
+    coefficients = {'5-Rib (Trimdek)': .04, 'Corry (Corodek)': .02}
+    if roof_profile not in coefficients:
+        raise AnalysisError(f'Roof friction coefficient is not configured for {roof_profile!r}')
+    b, d, h = inputs.building_width_m, inputs.building_length_m, mean_height_m
+    cutoff = 4*min(h,b)
+    start, end = (0., max(0.,d-cutoff)) if reverse else (min(cutoff,d),d)
+    area = b*max(0.,d-cutoff)
+    cf = coefficients[roof_profile]
+    enclosed = all((inputs.front_wall_clad,inputs.back_wall_clad,inputs.left_wall_clad,inputs.right_wall_clad))
+    return {'profile':roof_profile,'cf':cf,'surface':'External roof; sheet ribs/corrugations across longitudinal wind',
+            'q_kpa':q_kpa,'signed_y_pressure_kpa':(-1 if reverse else 1)*q_kpa*cf,
+            'mean_roof_height_m':h,'breadth_m':b,'depth_m':d,'d_over_h':d/h,'d_over_b':d/b,
+            'windward_exclusion_m':cutoff,'y_start_m':start,'y_end_m':end,
+            'projected_area_m2':area,'signed_y_force_kn':(-1 if reverse else 1)*q_kpa*cf*area,
+            'application':'Enclosed building' if enclosed else 'PRELIMINARY: enclosed-building external-roof method extended to an open-sided building',
+            'preliminary_open_sided':not enclosed,'source':'AS/NZS 1170.2:2021 (Amendment 2), clauses 2.4.2, 5.5 and Table 5.9',
+            'url':END_WIND_PRESSURE_URL,
+            'basis':'Projected roof area b * max(d - 4*min(h,b), 0); full force delivered to roof nodes. No Ka/Kce/Kci reduction. No wall, underside or exposed-member drag.'}
+
+
+def end_wind_cases(inputs, roof_profile='5-Rib (Trimdek)'):
     """Simultaneous signed front/back pressures, both directions, ULS/SLS.
 
     Reversing wind swaps windward/leeward end identities for the existing Cpi
@@ -34,21 +75,33 @@ def end_wind_cases(inputs):
                               front_wall_clad=inputs.back_wall_clad if reverse else inputs.front_wall_clad,
                               back_wall_clad=inputs.front_wall_clad if reverse else inputs.back_wall_clad)
         wind = calculate_wind(directional)
+        # Wind runs along the building length, parallel to the gable ridge.
+        # Use d=length, b=span and the all-pitches end-wind coefficient branch,
+        # not the main transverse frame's span/length and roof-pitch lookup.
+        end_ratio=directional.building_length_m/directional.building_width_m
+        end_cpe=leeward_wall_cpe(end_ratio,0.)
+        wind=replace(wind,leeward_wall_cpe=end_cpe)
         for cpi_case in CPI_CASE_OPTIONS:
             cpi = active_cpi_for_case(wind, cpi_case, "End +")
+            kce,kci,surface_count=end_wind_combination_factors(directional,cpi)
             for level, pressure_type in (("ULS", "ultimate"), ("SLS", "serviceability")):
                 scale = wind_pressure_scale(wind, pressure_type)
                 inward = []
                 components = []
                 for clad, cpe, surface in ((directional.front_wall_clad, .7, "windward_wall"),
-                                           (directional.back_wall_clad, wind.leeward_wall_cpe, "leeward_wall")):
-                    external_factor = external_pressure_factor(wind, surface, max(area, .01))
-                    internal_factor = internal_pressure_factor(wind, cpi)
+                                           (directional.back_wall_clad, end_cpe, "leeward_wall")):
+                    ka=area_reduction_factor(wind,surface,max(area,.01))
+                    external_factor = max(ka*kce,.8)
+                    internal_factor = kci
                     external = cpe * wind.wu_kn_m2 * scale * external_factor
                     internal = cpi * wind.wu_kn_m2 * scale * internal_factor
                     inward.append(external-internal if clad else 0.)
+                    physical_face=(('back_end' if reverse else 'front_end') if surface=='windward_wall'
+                                   else ('front_end' if reverse else 'back_end'))
                     components.append({"surface": surface, "clad": bool(clad), "cpe": cpe,
+                                       'face':physical_face,
                                        "external_factor": external_factor, "internal_factor": internal_factor,
+                                       'area_reduction_factor':ka,'kce':kce,'kci':kci,
                                        "external_kpa": external, "internal_kpa": internal,
                                        "inward_net_kpa": inward[-1]})
                 # +Y points front to back. Back inward pressure therefore acts -Y.
@@ -57,10 +110,40 @@ def end_wind_cases(inputs):
                               "level": level, "front_kpa": front, "back_kpa": back,
                               "source_direction": source, "cpi_case": cpi_case, "cpi": cpi,
                               "wind_pressure_scale": scale, "wu_kpa": wind.wu_kn_m2,
-                              "end_wall_area_m2": area, "components_windward_leeward": components})
+                              "end_wall_area_m2": area, "components_windward_leeward": components,
+                              'roof_drag':roof_friction_drag(directional,wind.wu_kn_m2*scale,wind.h_m,reverse,roof_profile)})
+                cases[-1]['pressure_basis']={'alongwind_depth_m':directional.building_length_m,
+                    'crosswind_breadth_m':directional.building_width_m,'d_over_b':end_ratio,
+                    'leeward_cpe':end_cpe,'effective_surface_count':surface_count,
+                    'kce':kce,'kci':kci,'source':END_WIND_PRESSURE_SOURCE,'url':END_WIND_PRESSURE_URL,
+                    'scope':'Normal end-wall pressures plus external roof friction; wall/underside/exposed-member drag and transverse-wind cases excluded'}
     if not any(abs(case["front_kpa"]) + abs(case["back_kpa"]) > 1e-12 for case in cases):
-        raise AnalysisError("No end-wall pressure loads: this stage requires at least one clad end wall; roof drag is not included")
+        raise AnalysisError("No end-wall pressure loads: this model requires at least one clad end wall; a free-roof wind model is not included")
     return cases
+
+
+def apex_tributary_widths(points, apex):
+    """Half the adjacent along-roof sheet span, independently on each slope."""
+    widths = []
+    for side in (-1, 1):
+        distances = [math.hypot(x-apex[0], z-apex[1]) for x,z in points if side*(x-apex[0]) > 1e-5]
+        if not distances:
+            return []  # Do not credit a reduction without actual adjacent rows.
+        widths.append(min(distances)/2)
+    return widths
+
+
+def eave_tributary_width(points, eave, roof_end):
+    """Half the first actual sheet span plus support inset from the roof edge."""
+    sign = 1 if roof_end[0]>eave[0] else -1
+    rows = sorted({(float(x),float(z)) for x,z in points
+                   if sign*(x-eave[0])>=-1e-5 and sign*(roof_end[0]-x)>=-1e-5},
+                  key=lambda p:sign*(p[0]-eave[0]))
+    if len(rows)<2:
+        return None
+    span = math.dist(rows[0],rows[1])
+    inset = math.dist(eave,rows[0])
+    return {'width_mm':span/2+inset,'adjacent_sheet_span_mm':span,'sheet_edge_offset_mm':inset}
 
 
 def prepare_context(window, allow_unconfigured=False):
@@ -98,9 +181,19 @@ def prepare_context(window, allow_unconfigured=False):
     points = [(left.x+x, g.roof_z(x)) for x in g.roof_stations]
     portal = PortalReduction(structure, points)
     wind_inputs = window.wind_inputs_from_ui(g.span_mm, g.pitch_deg, g.eave_mm)
-    cases = end_wind_cases(wind_inputs)
     source = copy.deepcopy(window.collect_preset_data())
+    cases = end_wind_cases(wind_inputs,source['finishes']['roof_profile'])
     profile = (window.end_wall_mullion_design or {}).get("selected") or {}
+    main_mullions = window.end_wall_mullion_design or {}
+    governing = main_mullions.get('governing_mullion') or {}
+    mullion_basis = ({'strength_pressure_kpa':main_mullions['strength_pressure_kpa'],
+        'service_pressure_kpa':main_mullions['service_kpa'],'deflection_divisor':main_mullions['deflection_divisor'],
+        'effective_length_factor':profile['effective_length_mm']/governing['height_mm'],
+        'moment_modifier':profile['actions'].moment_modifier,'restraint':main_mullions['restraint'],
+        'governing_height_mm':governing['height_mm'],'governing_width_mm':governing['tributary_width_mm'],
+        'mullions':copy.deepcopy(main_mullions['mullions']),
+        'basis':'Main calculation wind envelope, catalogue section properties and mid-height flybrace basis. Main baseline strength/serviceability remain prerequisites; 3D case axial demand is added to the local wind-bending envelope.'}
+        if profile and governing else None)
     installed = {}
     purlin_check = window.purlin_check or {}
     for line, x in enumerate(g.roof_stations):
@@ -108,6 +201,17 @@ def prepare_context(window, allow_unconfigured=False):
         if not points:
             continue
         px, pz = min(points, key=lambda p: abs(p[0]-(left.x+x)))
+        is_eave_strut = abs(x)<1e-4 or abs(x-g.span_mm)<1e-4
+        if is_eave_strut:
+            # The end roof line is an idealised interface for the strut at
+            # the first inboard purlin. Pick that physical purlin's section
+            # and wind zone, rather than the sheet-edge eave purlin's.
+            inward = 1 if abs(x)<1e-4 else -1
+            slope_end = g.span_mm/2 if g.roof_shape=='Gable' else (g.span_mm if inward==1 else 0.)
+            candidates = [p for p in points if inward*(p[0]-left.x-x)>1e-4
+                          and inward*(left.x+slope_end-p[0])>=-1e-4]
+            if candidates:
+                px,pz = min(candidates,key=lambda p:abs(p[0]-left.x-x))
         proximity = min(math.hypot(px-left.x, pz-left.y), math.hypot(px-right.x, pz-right.y))
         edge = proximity < float(purlin_check.get("local_dimension_a_m", 0))*1000
         match = purlin_check.get("local_match" if edge else "match", {})
@@ -116,7 +220,31 @@ def prepare_context(window, allow_unconfigured=False):
         prefix = "local_" if edge else ""
         area = match["area_mm2"]
         w = area*7.85e-6*9.80665
+        apex_pair = g.roof_shape == 'Gable' and g.pitch_deg > 0 and abs(x-g.span_mm/2) < 1e-4
+        original_width = float(purlin_check['spacing_mm'])
+        apex_widths = apex_tributary_widths(points, (px,pz)) if apex_pair else []
+        eave_data = None
+        if is_eave_strut:
+            roof_end_x = g.span_mm/2 if g.roof_shape=='Gable' else (g.span_mm if abs(x)<1e-4 else 0.)
+            eave_data = eave_tributary_width(points,(left.x+x,g.roof_z(x)),(left.x+roof_end_x,g.roof_z(roof_end_x)))
+            if eave_data:
+                # This axial strut aligns with the first inboard roof purlin,
+                # not the sheet-edge eave purlin. Retain edge geometry only as
+                # evidence; its half tributary is not the strut's roof duty.
+                eave_data['sheet_edge_tributary_width_mm'] = eave_data['width_mm']
+                eave_data['width_mm'] = original_width
+                eave_data['strut_alignment'] = 'First inboard purlin; full roof spacing'
+        tributary_width = eave_data['width_mm'] if eave_data else max(apex_widths) if apex_widths else original_width
+        width_factor = tributary_width/original_width
         installed[str(line)] = {"section": match["section"], "area_mm2": area,
+            'installed_count': 2 if apex_pair else 1,
+            'installed_count_source': ('User-confirmed apex pair: one purlin from each roof slope'
+                if apex_pair else 'Single installed roof-purlin line'),
+            'tributary_width_mm': tributary_width, 'original_roof_spacing_mm': original_width,
+            'apex_tributary_widths_mm': apex_widths,
+            'eave_tributary':eave_data,
+            'tributary_width_source': ('Half the actual adjacent sheet end span on each slope; larger per-ply width used if unequal'
+                if apex_widths else 'First inboard purlin alignment: full roof-check spacing; sheet-edge half tributary does not apply to the strut' if eave_data else 'Full installed roof-check spacing envelope'),
             "bending_ratio": max(purlin_check[prefix+"outward_kn_m"]/match["outward_capacity_kn_m"],
                                  purlin_check[prefix+"inward_strength_kn_m"]/match["inward_strength_capacity_kn_m"]),
             "service_ratio": purlin_check[prefix+"inward_service_kn_m"]/match["inward_service_capacity_kn_m"],
@@ -126,6 +254,8 @@ def prepare_context(window, allow_unconfigured=False):
             "zone": "edge" if edge else "general", "nearest_installed_x_mm": px-left.x,
             "node_offset_mm": px-left.x-x, "bending_snapshot": copy.deepcopy(match),
             "source": "Existing Metroll bending-table check; axial member compression/tension calculated or separately declared in the 3D workspace"}
+        installed[str(line)]['bending_ratio'] *= width_factor
+        installed[str(line)]['service_ratio'] *= width_factor
         installed[str(line)]["bending_span_mm"] = purlin_check["span_mm"]
         installed[str(line)]["beam_inputs"] = {"span_type": purlin_check["span_type"],
             "outward_kn_m": purlin_check[prefix+"outward_kn_m"],
@@ -135,9 +265,25 @@ def prepare_context(window, allow_unconfigured=False):
             "service_inward_kn_m": purlin_check[prefix+"wind_service_downward_kpa"]*purlin_check['spacing_mm']/1000,
             "permanent_kn_m": purlin_check["permanent_kpa"]*purlin_check["spacing_mm"]/1000,
             "gravity_service_kn_m": (purlin_check["permanent_kpa"]+purlin_check["live_kpa"])*purlin_check["spacing_mm"]/1000}
+        for key in installed[str(line)]['beam_inputs']:
+            if key != 'span_type':
+                installed[str(line)]['beam_inputs'][key] *= width_factor
+        if eave_data:
+            # Use the strut's full loaded area for pressure factors as well.
+            area_m2 = tributary_width*purlin_check['span_mm']/1e6
+            up,down = window.purlin_design_pressures(wind_inputs,tributary_area_m2=area_m2,edge_zone=edge)
+            su,sd = window.purlin_design_pressures(wind_inputs,tributary_area_m2=area_m2,edge_zone=edge,wind_pressure='serviceability')
+            loads = installed[str(line)]['beam_inputs'];width_m=tributary_width/1000
+            loads.update(outward_kn_m=up*width_m,
+                         inward_strength_kn_m=max(1.2*purlin_check['permanent_kpa']+1.5*purlin_check['live_kpa'],1.2*purlin_check['permanent_kpa']+down)*width_m,
+                         service_kn_m=max(su,sd)*width_m,service_outward_kn_m=su*width_m,service_inward_kn_m=sd*width_m)
+            installed[str(line)]['bending_ratio'] = max(loads['outward_kn_m']/match['outward_capacity_kn_m'],loads['inward_strength_kn_m']/match['inward_strength_capacity_kn_m'])
+            installed[str(line)]['service_ratio'] = loads['service_kn_m']/match['inward_service_capacity_kn_m']
+            eave_data.update(loaded_area_m2=area_m2,wind_upward_kpa=up,wind_downward_kpa=down)
         installed[str(line)]["bending_key"] = hashlib.sha256(json.dumps({
             key: installed[str(line)][key] for key in ("section", "area_mm2", "bending_ratio", "service_ratio",
-                "added_bending_ratio", "added_service_ratio", "basis_key", "bending_span_mm", "bending_snapshot", "beam_inputs")
+                "added_bending_ratio", "added_service_ratio", "basis_key", "bending_span_mm", "bending_snapshot", "beam_inputs",
+                'tributary_width_mm', 'original_roof_spacing_mm', 'apex_tributary_widths_mm','eave_tributary')
         }, sort_keys=True).encode()).hexdigest()
     from purlin_strut_tables import snapshot as strut_table_snapshot
     return {
@@ -150,12 +296,16 @@ def prepare_context(window, allow_unconfigured=False):
         "source_preset": source,
         "source_hash": hashlib.sha256(json.dumps(source, sort_keys=True, allow_nan=False).encode()).hexdigest(),
         "default_end_post": profile.get("section"),
+        'mullion_basis':mullion_basis,
         "front_clad": wind_inputs.front_wall_clad, "back_clad": wind_inputs.back_wall_clad,
+        'face_cladding': {'left_wall': wind_inputs.left_wall_clad, 'right_wall': wind_inputs.right_wall_clad,
+                          'front_end': wind_inputs.front_wall_clad, 'back_end': wind_inputs.back_wall_clad},
         "cost_rates": {"shs": window.costing_rate_from_input(window.shs_cost_input, "shs_rate_per_kg"),
                        "ub": window.costing_rate_from_input(window.ub_cost_input, "ub_rate_per_kg"),
                        "wb": window.costing_rate_from_input(window.wb_cost_input, "wb_rate_per_kg"),
                        "purlin": window.costing_rate_from_input(window.purlin_cost_input, "purlin_rate_per_kg")},
         "installed_purlins": installed,
+        'stressed_skin': copy.deepcopy((window.bracing_3d_settings or {}).get('stressed_skin')),
         "purlin_strut_tables": strut_table_snapshot(window.metroll_tables or {}),
     }
 
@@ -164,7 +314,9 @@ LIMITATIONS = [
     "Fixed pinned-panel layout; unmarked available panels are not installed braces. No automatic layout or section optimisation.",
     "First-order small-displacement elastic analysis, with tension-only rod slackening; no P-delta, buckling, prestress or connection slip.",
     "If zero-force rods are needed for the elastic tangent, equilibrium is reported with stability unverified. A positive taut-rod tangent is not a buckling or code stability check.",
-    "End-wall wind only: simultaneous windward/leeward pressures, both directions and both Cpi branches, ULS and SLS. No G/Q, transverse wind, roof drag or full design combinations.",
+    "Longitudinal wind: simultaneous end-wall pressures and external roof friction, both directions and both Cpi branches, ULS and SLS. No G/Q, transverse wind, wall/underside/exposed-member drag or full design combinations.",
+    "Normal roof/side-wall pressures are not applied to the reduced 3D frame. Purlin bending uses a separate roof-load envelope; it is not a simultaneous whole-building pressure pattern.",
+    "Roof friction uses the projected external-roof portion of clause 5.5/Table 5.9, with sheeting running down-slope. For open-sided buildings this is a preliminary extension of the enclosed-building method, not a complete open-roof aerodynamic assessment.",
     "End-wall pressure uses simply supported vertical strips: half of each strip resultant goes to roof and half directly to ground. Open ends receive no cladding pressure.",
     "Identical actual 2D portal sections/supports repeat at every frame line. Legacy eave restraints are removed in a private copy. Portal attachment translations use work-conjugate beam interpolation.",
     "Dedicated axial struts of the selected section run along every roof station. Intermediate end posts are included at clad or end-braced ends, are axial-only and use the selected post section. Their bending design is separate.",
@@ -194,10 +346,20 @@ def analyse_context(context, strut_profile, end_post_profile):
         end_post_faces=post_faces,
         strut_overrides=strut_profile.overrides() if isinstance(strut_profile, StrutPlan) else None,
         brace_moduli=moduli)
+    from bracing_diaphragm import DiaphragmSettings, roof_diaphragm_model, recover_diaphragm
+    diaphragm_settings = DiaphragmSettings.from_dict(context.get('stressed_skin'))
+    diaphragm = {'settings': vars(diaphragm_settings)}
+    sls_model = model
+    if diaphragm_settings.enabled:
+        sls_model, diaphragm = roof_diaphragm_model(model, layout, point_nodes, diaphragm_settings)
     cases = []
     for case in context["cases"]:
         try:
-            cases.append(solve_building_case(model, layout, portal, portal_dofs, point_nodes, case))
+            solved = solve_building_case(model, layout, portal, portal_dofs, point_nodes, case)
+            if diaphragm_settings.enabled and case['level'] == 'SLS':
+                enhanced = solve_building_case(sls_model, layout, portal, portal_dofs, point_nodes, case)
+                solved = recover_diaphragm(enhanced, diaphragm['panels'], len(model.members), solved)
+            cases.append(solved)
         except AnalysisError as error:
             raise AnalysisError(f"{case['name']}: {error}") from None
     envelopes = []
@@ -213,11 +375,23 @@ def analyse_context(context, strut_profile, end_post_profile):
            for case in cases if case["case"]["level"] == "SLS"
            for i, displacement in enumerate(case["displacements_mm"]) if i in roof_nodes]
     governing = max(sls, key=lambda item: item[0])
+    if diaphragm_settings.enabled:
+        bare = [(float(np.linalg.norm(d)), case['case']['name'], i)
+                for case in cases if 'bare_sls' in case
+                for i,d in enumerate(case['bare_sls']['displacements_mm']) if i in roof_nodes]
+        movement, name, node = max(bare)
+        diaphragm['bare_governing_sls'] = {'resultant_mm': movement, 'case': name, 'node': node}
+        diaphragm['bare_max_longitudinal_mm'] = max(abs(d[1]) for case in cases if 'bare_sls' in case
+            for i,d in enumerate(case['bare_sls']['displacements_mm']) if i in roof_nodes)
+        diaphragm['enhanced_max_longitudinal_mm'] = max(abs(d[1]) for case in cases if 'bare_sls' in case
+            for i,d in enumerate(case['displacements_mm']) if i in roof_nodes)
     strut_record = {"section": strut_profile.name, "area_mm2": strut_profile.A}
     if isinstance(strut_profile, StrutPlan):
         strut_record.pop("area_mm2")
         strut_record["per_member"] = {key: assembly_properties(value) for key, value in strut_profile.members.items()}
     return {
+        'face_cladding': dict(context.get('face_cladding', {})),
+        'mullion_basis':copy.deepcopy(context.get('mullion_basis')),
         "schema": "portalcalc.fixed-bracing-analysis.v1", "status": "SOLVED_DEMANDS_ONLY",
         "created_utc": datetime.now(timezone.utc).isoformat(), "elapsed_seconds": time.perf_counter()-start,
         "source_hash": context["source_hash"], "source_preset": context["source_preset"],
@@ -228,9 +402,12 @@ def analyse_context(context, strut_profile, end_post_profile):
         "nodes": [{"index": i, "label": model.node_labels[i], "point_mm": p} for i, p in enumerate(model.nodes)],
         "portal_full_dofs": len(portal.k), "portal_interface_dofs": len(portal.stiffness),
         "member_envelopes": envelopes, "cases": cases,
+        'stressed_skin': diaphragm,
         "governing_sls_displacement": {"resultant_mm": governing[0], "case": governing[1],
                                        "node": governing[2], "components_mm": governing[3]},
-        "limitations": LIMITATIONS,
+        "limitations": ([line.replace('No diaphragm or sheeting stiffness.',
+                         'Equivalent roof diaphragm stiffness is included in SLS only.') for line in LIMITATIONS]
+                        + [diaphragm['basis']] if diaphragm_settings.enabled else list(LIMITATIONS)),
     }
 
 
@@ -247,12 +424,24 @@ def text_report(result):
         if "per_member" in section:
             lines.append(f"{kind.title()}: per-location arrangements ({len(section['per_member'])} paths); see frozen component properties")
         elif section.get("component_type") == "wire_rope":
-            lines.append(f"{kind}: {section['label']}; declared rope EA / design capacity: {section.get('rating', {})}")
+            lines.append(f"{kind}: {section['label']}; adopted rope EA / design capacity: {section.get('rating', {})}")
         elif section.get("component_type") == "scheduled_rod":
             lines.append(f"{kind}: {section['label']}; Grade {section['grade_mpa']:g}; supplied factored tension {section['design_tension_kn']:g} kN; forged-rated {section['forged_turnbuckle']} / Grade S {section['grade_s_turnbuckle']}; {section['capacity_source']}")
         else:
             lines.append(f"{kind.replace('_', ' ').title()}: {section.get('section', section.get('label', '-'))}; A = {section['area_mm2']:.1f} mm2; E = 200000 MPa")
     lines += ["", "SCOPE AND ASSUMPTIONS"] + [f"- {item}" for item in result["limitations"]]
+    diaphragm = result.get('stressed_skin', {})
+    if diaphragm.get('settings', {}).get('enabled'):
+        settings = diaphragm['settings']
+        bare = diaphragm['bare_governing_sls']
+        lines += ['', 'SLS STRESSED-SKIN ROOF CONTRIBUTION', diaphragm['source'], diaphragm['basis'],
+                  f"Adopted c = {settings['flexibility_mm_per_kn']:g} mm/kN; shear-displacement direction = {settings['shear_direction']}.",
+                  'Aeq = Ld^3 / (E c s^2), E = 200 kN/mm2; Vpanel = Ndiag s/Ld. Equivalent diameters are stiffness surrogates, not installed rods.',
+                  f"Bare conventional maximum SLS resultant: {bare['resultant_mm']:.4f} mm; {bare['case']}; node {bare['node']+1}.",
+                  f"Maximum longitudinal SLS movement: bare {diaphragm['bare_max_longitudinal_mm']:.4f} mm; with stressed skin {diaphragm['enhanced_max_longitudinal_mm']:.4f} mm.",
+                  'Panel | s mm | n mm | Ld mm | Aeq mm2 per diagonal | equivalent diameter mm | implied longitudinal c mm/kN']
+        for panel in diaphragm['panels']:
+            lines.append(f"{panel['id']} | {panel['s_mm']:.3f} | {panel['n_mm']:.3f} | {panel['length_mm']:.3f} | {panel['area_mm2']:.4f} | {panel['equivalent_diameter_mm']:.3f} | {panel['implied_longitudinal_flexibility_mm_per_kn']:.4f}")
     lines += ["", "ULS MEMBER DEMAND ENVELOPES (positive magnitudes, kN)", "Member | Type | Tension | Compression | Governing source"]
     for item in result["member_envelopes"]:
         source = item["tension_case"] if item["tension_n"] >= item["compression_n"] else item["compression_case"]
@@ -267,10 +456,37 @@ def text_report(result):
                   f"Elastic tangent status: {case['tangent_status']}",
                   f"Global force residual [N]: {case['balance_force_error_n']}",
                   f"Global moment residual [Nmm]: {case['balance_moment_error_nmm']}"]
+        if case['case'].get('pressure_basis'):
+            b=case['case']['pressure_basis']
+            lines += [f"End-wind coefficient basis: d/b={b['d_over_b']:.5f} (length/span); leeward Cp,e={b['leeward_cpe']:.5f}; effective surfaces {b['effective_surface_count']}; Kce/Kci={b['kce']:g}/{b['kci']:g}.",b['source'],b['scope']]
+        if case['case'].get('components_windward_leeward'):
+            lines += ['SIMULTANEOUS END-WALL PRESSURES (kPa; inward positive)',
+                      'Common Cpi on both ends; net inward = external minus internal. Front inward acts +Y; back inward acts -Y.']
+            for component in case['case']['components_windward_leeward']:
+                lines.append(f"{component.get('face','end')} / {component['surface']} / {'clad' if component['clad'] else 'open, no applied pressure'}: external {component['external_kpa']:.5f}, internal {component['internal_kpa']:.5f}, applied net inward {component['inward_net_kpa']:.5f}.")
+        if case['case'].get('roof_drag'):
+            drag=case['case']['roof_drag']
+            lines += [f"External roof friction: {drag['signed_y_force_kn']:.3f} kN along Y; Cf={drag['cf']:g}, q={drag['q_kpa']:.5f} kPa; projected area={drag['projected_area_m2']:.3f} m2.",
+                      f"Mean roof height {drag['mean_roof_height_m']:.3f} m; windward exclusion {drag['windward_exclusion_m']:.3f} m; loaded Y={drag['y_start_m']:.3f} to {drag['y_end_m']:.3f} m; {drag['profile']}.",
+                      drag['application'],drag['basis'],drag['source']]
         for work in case["load_workings"]:
             lines.append(f"{work['face']}: roof {work['roof_resultant_n']/1000:.3f} kN; direct ground {work['direct_ground_resultant_n']/1000:.3f} kN")
+        if case.get('load_path'):
+            path = case['load_path']
+            lines += ['', 'LOAD PATH / BRACE DIRECTIONS',path['axes'],path['basis'],
+                      f"Roof-applied Y load {path['applied_roof_y_n']/1000:.3f} kN; direct-to-base end-wall load {path['direct_ground_y_n']/1000:.3f} kN (separate from bracing)."]
+            for face,value in path['member_base_reactions_n'].items():
+                lines.append(f"{face}: member-to-ground reaction X/Y/Z kN = "+' / '.join(f'{v/1000:.3f}' for v in value))
+            lines += [f"Roof Y + member base Y residual {path['roof_to_member_base_y_residual_n']:.6g} N.",
+                      'Peak brace tension kN: '+', '.join(f"{g} {v/1000:.3f}" for g,v in path['peak_brace_tension_n'].items())]
         lines += ["", "MEMBER FORCES | N kN (+tension) | Extension mm | State"]
         lines += [f"{m['id']} | {m['axial_n']/1000:.4f} | {m['extension_mm']:.5f} | {m['state']}" for m in case["members"]]
+        if case.get('diaphragm_members'):
+            lines += ['', 'SLS EQUIVALENT DIAPHRAGMS | Ndiag kN | diagonal shear component kN (adopted direction) | component flow kN/m | longitudinal component kN | State']
+            lines += [f"{m['id']} | {m['axial_n']/1000:.4f} | {m['panel_shear_kn']:.4f} | {m['shear_flow_kn_per_m']:.4f} | {m['longitudinal_shear_kn']:.4f} | {m['state']}" for m in case['diaphragm_members']]
+            lines += ['NET PANEL SHEAR | adopted direction kN | average boundary flow kN/m | longitudinal kN',
+                      'Signed shear sums opposite diagonal contributions; individual diagonal forces must also be checked for boundary/collector actions.']
+            lines += [f"{p['id']} | {p['net_shear_kn']:.4f} | {p['net_shear_flow_kn_per_m']:.4f} | {p['net_longitudinal_shear_kn']:.4f}" for p in case['diaphragm_panels']]
         lines += ["", "NODAL MOVEMENTS | X / Y / Z mm"]
         lines += [f"{n['index']+1}: {n['label']} | " + " / ".join(f"{v:.5f}" for v in d)
                   for n, d in zip(result["nodes"], case["displacements_mm"])]

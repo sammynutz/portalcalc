@@ -432,8 +432,78 @@ def end_wall_load_vector(model, layout, point_nodes, front_kpa, back_kpa):
     return vector, workings
 
 
+def roof_drag_load_vector(model, layout, point_nodes, drag):
+    """Consistent roof-node loads on the downwind projected roof strip.
+
+    Bilinear shape weights preserve total Y force and its X/Z moments on
+    irregular bay/roof grids, including a cutoff part-way through a bay.
+    The whole drag force enters the roof; none is applied directly to ground.
+    """
+    vector = np.zeros(3*len(model.nodes))
+    if drag is None:
+        return vector, []
+    g=layout.geometry
+    start,end = float(drag['y_start_m'])*1000,float(drag['y_end_m'])*1000
+    pressure=float(drag['signed_y_pressure_kpa'])
+    if not all(math.isfinite(v) for v in (start,end,pressure)) or not 0<=start<=end<=g.length_mm+1e-5:
+        raise AnalysisError('Invalid roof-friction load strip or pressure')
+    for ya,yb in zip(g.bay_stations_mm,g.bay_stations_mm[1:]):
+        lo,hi=max(ya,start),min(yb,end)
+        if hi<=lo:
+            continue
+        for xa,xb in zip(g.roof_stations,g.roof_stations[1:]):
+            for gx in (-1/math.sqrt(3),1/math.sqrt(3)):
+                x=(xa+xb)/2+gx*(xb-xa)/2
+                rx=(x-xa)/(xb-xa)
+                for gy in (-1/math.sqrt(3),1/math.sqrt(3)):
+                    y=(lo+hi)/2+gy*(hi-lo)/2
+                    ry=(y-ya)/(yb-ya)
+                    force=pressure/1000*(xb-xa)/2*(hi-lo)/2
+                    for sx,wx in ((xa,1-rx),(xb,rx)):
+                        for sy,wy in ((ya,1-ry),(yb,ry)):
+                            index=point_nodes[tuple(round(v,6) for v in (sx,sy,g.roof_z(sx)))]
+                            vector[3*index+1]+=force*wx*wy
+    return vector,[{'face':'roof_friction','signed_y_pressure_kpa':pressure,
+                   'roof_resultant_n':float(vector[1::3].sum()),'direct_ground_resultant_n':0.,
+                   'y_start_m':start/1000,'y_end_m':end/1000}]
+
+
+def load_path_evidence(nodes, result, workings):
+    """Resolve actual member forces at ground, independently of group naming.
+
+    X is across the portals, Y is along the building and Z is vertical. End
+    braces have no Y projection. Include direct end-post base load separately
+    so the ground-applied half of end-wall pressure is not counted as bracing.
+    """
+    peaks, ground = {}, {}
+    for member in result['members']:
+        kind = member['kind']
+        if kind.endswith('brace'):
+            peaks[kind] = max(peaks.get(kind,0.),max(0.,member['axial_n']))
+        a,b = (np.asarray(nodes[member[key]],dtype=float) for key in ('start','end'))
+        direction = (b-a)/np.linalg.norm(b-a)
+        vector = member['axial_n']*direction
+        for point,sign in ((a,-1.),(b,1.)):
+            if abs(point[2])<1e-6:
+                face = member.get('panel_id','').split('/')[0] or kind
+                ground.setdefault(face,np.zeros(3))
+                ground[face] += sign*vector
+    roof_y = sum(w['roof_resultant_n'] for w in workings)
+    direct_y = sum(w['direct_ground_resultant_n'] for w in workings)
+    member_y = sum(v[1] for v in ground.values())
+    return {'axes':'X across span; Y front to back along length; Z vertical',
+            'applied_roof_y_n':roof_y,'direct_ground_y_n':direct_y,
+            'member_base_reactions_n':{face:v.tolist() for face,v in ground.items()},
+            'roof_to_member_base_y_residual_n':float(roof_y+member_y),
+            'peak_brace_tension_n':peaks,
+            'basis':'End-wall pressure and any external roof friction act along Y. Roof/struts transfer the roof-applied forces to side-wall bracing. Front/back end-wall braces lie in X/Z and have zero direct Y resistance. Transverse-wind cases are not included in this analysis.'}
+
+
 def solve_building_case(model, layout, portal, portal_dofs, point_nodes, case):
     loads, workings = end_wall_load_vector(model, layout, point_nodes, case["front_kpa"], case["back_kpa"])
+    drag_loads,drag_workings=roof_drag_load_vector(model,layout,point_nodes,case.get('roof_drag'))
+    loads+=drag_loads
+    workings+=drag_workings
     result = model.solve(loads)
     displacements = np.asarray(result["displacements_mm"]).reshape(-1)
     portals = []
@@ -463,5 +533,6 @@ def solve_building_case(model, layout, portal, portal_dofs, point_nodes, case):
     if np.max(np.abs(force_error)) > force_scale*1e-6 or np.max(np.abs(moment_error)) > force_scale*length_scale*1e-6:
         raise AnalysisError("Recovered support reactions failed the building force/moment balance check")
     return {"case": case, "load_workings": workings, "nodal_loads_n": external.tolist(),
+            'load_path':load_path_evidence(model.nodes,result,workings),
             **result, "portals": portals,
             "balance_force_error_n": force_error.tolist(), "balance_moment_error_nmm": moment_error.tolist()}

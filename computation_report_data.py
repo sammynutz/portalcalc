@@ -86,6 +86,8 @@ def capacity_working(properties, actions):
                 (f"Normalised slenderness ({axis})", f"({length:.1f} / {radius:.3f}) x sqrt({properties.kf:.3f} x {properties.fy_mpa:.1f} / 250)", slenderness, ""),
                 (f"Buckling reduction ({axis})", "Production compression-slenderness reduction, alpha_c", steel.compression_slenderness_reduction(slenderness, properties.alpha_b), ""),
             ])
+    if actions.ltb_length_mm is not None:
+        rows.append(('Physical LTB segment', 'Separate from in-plane compression effective length', actions.ltb_length_mm, 'mm'))
     ms = steel.section_moment_capacity_knm(properties)
     mo = steel.reference_buckling_moment_knm(properties, actions)
     rows.extend([
@@ -124,7 +126,9 @@ def source_for_check(key, envelope, group):
 def member_record(window, label, profile, envelope, group):
     result, actions, restraint, notes = window.resolved_member_check(profile, envelope, group)
     properties = profile.check_properties()
-    checks = [{"key": key, **asdict(check), "source": source_for_check(key, envelope, group)}
+    flybraces = restraint.get('flybraces', {})
+    checks = [{"key": key, **asdict(check), "source": copy.deepcopy(flybraces.get('sources', {}).get(key))
+               or source_for_check(key, envelope, group)}
               for key, check in result.checks.items()]
     ratio, governing = result.governing_ratio, result.governing_check
     if group in CHORD_GROUPS:
@@ -252,6 +256,7 @@ def build_report_data(window, metadata=None):
         "overall": {"ratio": ratio, "group": group, "check": check},
         "envelopes": copy.deepcopy({k: v for k, v in window.design_envelope_actions.items() if k not in {"computation_cases", "computation_wind"}}),
         "analysis": copy.deepcopy(window.analysis_info),
+        "column_flybraces": window.column_flybrace_schedule(),
         "native_reports": {name: getattr(window, field).toPlainText() for name, field in (
             ("Section checks", "section_checks_box"), ("Analysis output", "results_box"),
             ("Storage loads", "storage_results_box"), ("Foundations", "foundation_box")) if hasattr(window, field)},

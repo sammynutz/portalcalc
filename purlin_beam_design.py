@@ -22,7 +22,7 @@ def _positive(record, key):
 
 def with_beam_demands(result, plan):
     """Solve every affected roof line, including adjoining bays without additions."""
-    lines = sorted({a.location["line"] for a in plan.members.values() if a.arrangement in {ARRANGEMENT, 'shared_purlin'}})
+    lines = sorted({a.location["line"] for a in plan.members.values() if a.arrangement in {ARRANGEMENT, 'shared_purlin', 'shared_purlin_pair'}})
     runs, by_member = {}, {}
     stations = result["analysis_layout"]["geometry"]["bay_stations_mm"]
     spans = [b-a for a, b in zip(stations, stations[1:])]
@@ -32,7 +32,7 @@ def with_beam_demands(result, plan):
         rating = data["axial_rating"]
         error = None
         try:
-            if any(a.arrangement == 'shared_purlin' for a in assemblies):
+            if any(a.arrangement in {'shared_purlin', 'shared_purlin_pair'} for a in assemblies):
                 from purlin_shared_design import solve_shared
                 run = solve_shared(assemblies, spans, line)
                 runs[str(line)] = run

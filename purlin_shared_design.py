@@ -10,17 +10,22 @@ from functools import lru_cache
 
 from bracing_analysis import AnalysisError
 from purlin_beam import solve_run
-from purlin_combined import PROPERTIES, properties, compression_capacity, tension_capacity, method
+from purlin_combined import PROPERTIES, properties, compression_capacity, tension_capacity, method, same_profile_size
 from purlin_strut_tables import span_capacities, single_span_capacities
 
 ARRANGEMENT = 'shared_purlin'
+PAIR_ARRANGEMENT = 'shared_purlin_pair'
+ARRANGEMENTS = {ARRANGEMENT, PAIR_ARRANGEMENT}
 METHOD = 'assigned_half_reference'
-BASIS = ('PRELIMINARY table-reference screen: 50/50 APPLIED roof load in added bays; '
+BASIS = ('PRELIMINARY table-reference screen: assigned APPLIED roof load in added bays; '
          'existing continuity and adjoining bays analysed, added purlin single span. '
          'UC = axial interaction + max(moment/reference moment, shear/reference shear). '
          'Reference actions come from the published UDL-rated arrangement; they are NOT '
          'general moment/shear resistances or complete AS/NZS 4600 acceptance. '
-         'The 50/50 allocation and cladding/collector force transfer are design assumptions; connections unchecked.')
+         'A single addition retains 50/50 existing-run/added load sharing. An added back-to-back pair '
+         'uses equal applied roof load per physical ply (one-third each with one existing purlin). '
+         'Each addition is an independent single-span member; no composite bending I or reduced buckling length. '
+         'The load allocation and cladding/collector force transfer are design assumptions; connections unchecked.')
 
 
 def location_data(context, data, span):
@@ -37,6 +42,8 @@ def location_data(context, data, span):
             references[span_type] = {'error': str(error)}
     for depth, gauge in sorted(PROPERTIES['C']):
         section = f'C/Z {depth} {gauge}'
+        if not same_profile_size(section, data['section']):
+            continue
         try:
             p = properties(section, 'C')
             cap = single_span_capacities(bundle, section, span, bridge)
@@ -99,8 +106,19 @@ def solve_shared(assemblies, spans, line):
     lap = float(rating.get('beam_lap_ratio', .15))
     if kind == 'continuous_lapped' and (len(spans) != 5 or p['shape'] != 'Z' or abs(lap-.15) > 1e-8):
         raise AnalysisError('The 5A/5B preliminary reference requires five Z spans with 15% laps')
-    active = {i: next(c['data'] for c in a.components if c.get('shared_beam'))
-              for i, a in enumerate(assemblies) if a.arrangement == ARRANGEMENT}
+    additions = {i: [c['data'] for c in a.components if c.get('shared_beam')]
+                 for i, a in enumerate(assemblies) if a.arrangement in ARRANGEMENTS}
+    for i, parts in additions.items():
+        expected = 2 if assemblies[i].arrangement == PAIR_ARRANGEMENT else 1
+        if len(parts) != expected or any(c != parts[0] for c in parts):
+            raise AnalysisError('Added back-to-back pair requires two identical independently checked single-span purlins')
+        if not same_profile_size(parts[0]['section'], data['section']):
+            raise AnalysisError('Added purlin struts must match the installed roof profile size; thickness may vary')
+    active = {i: parts[0] for i, parts in additions.items()}
+    added_counts = {i: len(parts) for i, parts in additions.items()}
+    # The new pair shares equally per physical ply. Keep the previously
+    # adopted existing-run/single-addition 50/50 rule for that separate option.
+    fractions = {i: (n/(n+2) if added_counts[i] == 2 else .5) for i in active}
     if any(not c.get('shared_cladding_fixed') for c in active.values()):
         raise AnalysisError('50/50 purlins must be screw-fixed to cladding and have the stated bridging installed')
     loads = [dict(name='ULS outward', roof_n_mm=-inputs['outward_kn_m'], own_factor=0.),
@@ -109,7 +127,7 @@ def solve_shared(assemblies, spans, line):
              dict(name='SLS inward G + wind', roof_n_mm=inputs.get('service_inward_kn_m', inputs['service_kn_m'])+inputs['permanent_kn_m'], own_factor=1.),
              dict(name='SLS gravity G + Q', roof_n_mm=inputs['gravity_service_kn_m'], own_factor=1.)]
     for load in loads:
-        load['roof_n_mm_by_bay'] = [load['roof_n_mm']*(.5 if i in active else 1.) for i in range(len(spans))]
+        load['roof_n_mm_by_bay'] = [load['roof_n_mm']*fractions.get(i, 1.) for i in range(len(spans))]
         load['added_n_mm'] = 0.
     roof = _solve({'spans_mm': spans, 'roof_i_mm4': p['web_ix_mm4'], 'added_i_mm4': p['web_ix_mm4'],
                    'roof_count': n, 'span_type': kind, 'lap_ratio': lap, 'loads': loads})
@@ -121,15 +139,16 @@ def solve_shared(assemblies, spans, line):
             q = 0.
             if i in active:
                 c = active[i]
-                q = load['roof_n_mm']*n*.5 + load['own_factor']*c['area_mm2']*7.85e-6*9.80665
+                q = load['roof_n_mm']*n*(1-fractions[i])/added_counts[i] + load['own_factor']*c['area_mm2']*7.85e-6*9.80665
                 added = _added_actions(q, length, c['section_properties']['web_ix_mm4'], offset)
-                added_total += q*length
+                added_total += added_counts[i]*q*length
             else:
                 added = bay['added']
             bays.append({**bay, 'added': added})
             added_loads.append(q)
             offset += length
-        cases.append({**base, 'bays': bays, 'loads': {**load, 'added_n_mm_by_bay': added_loads},
+        cases.append({**base, 'bays': bays, 'loads': {**load, 'added_n_mm_by_bay': added_loads,
+                      'added_count_by_bay': [added_counts.get(i, 0) for i in range(len(spans))]},
                       'applied_load_n': base['applied_load_n']+added_total,
                       'support_reaction_n': base['support_reaction_n']-added_total})
     references = {}
@@ -149,19 +168,30 @@ def solve_shared(assemblies, spans, line):
                      'shear_per_kn_m': max(b['roof']['shear_kn'] for b in ref['cases'][0]['bays']), 'capacity': caps}
         references[str(i)] = reference
     return {**roof, 'cases': cases, 'line': line, 'added_bays': list(active),
+            'existing_count': n,
+            'roof_tributary_width_mm': data.get('tributary_width_mm'),
             'section_properties': p, 'added_sections': {str(i): c for i,c in active.items()},
+            'load_allocation_by_bay': {str(i): {'existing_count': n, 'added_count': added_counts[i],
+                'existing_group_fraction': fractions[i], 'each_added_fraction': (1-fractions[i])/added_counts[i]}
+                for i in active},
             'references': references, 'design_method': METHOD, 'preliminary': True,
-            'coupling_defined': True, 'coupling_source': 'Project-adopted 50/50 applied roof-load allocation; no stiffness-derived sharing',
-            'direct_roof_pickup_fraction': .5, 'basis': BASIS,
-            'note': '50% of the original line load goes to each line in added bays; adjoining bays retain full applied load. Axial force shares by EA. Added self-weight is separate. No equal-moment or rigid cladding-tie assumption.'}
+            'coupling_defined': True, 'coupling_source': 'Project-adopted applied roof-load allocation; no stiffness-derived sharing',
+            'direct_roof_pickup_fraction': None if any(m == 2 for m in added_counts.values()) else .5, 'basis': BASIS,
+            'note': 'Single addition: 50/50 existing run/added. Added pair: equal roof load per physical ply. Plots are per ply; adjoining bays retain full applied load. Axial shares by EA. Each added ply includes its own self-weight. No composite bending I, equal-moment or rigid cladding-tie assumption.'}
 
 
 def shared_check(run, entry, component, force, name, level, divisor, criteria):
     existing = component['existing']
     data, bay = component['data'], entry['bay']
+    allocation = run.get('load_allocation_by_bay', {}).get(str(bay), {})
+    count = run.get('existing_count', 1)
+    split = 'equal-per-ply' if allocation.get('added_count') == 2 else '50/50' if allocation else 'assigned-load'
     base = {'case': name, 'method': METHOD, 'preliminary': True, 'section': data['section'],
+            'tributary_width_mm': run.get('roof_tributary_width_mm'),
             'beam_role': 'roof' if existing else 'added', 'beam_line': entry['line'], 'beam_bay': bay,
-            'axial_kn': force, 'coupling_defined': True, 'roof_load_fraction': .5 if bay in run['added_bays'] else 1., 'basis': BASIS}
+            'axial_kn': force, 'coupling_defined': True,
+            'roof_load_fraction': allocation.get('existing_group_fraction', 1.)/count if existing else allocation.get('each_added_fraction', 0.),
+            'added_purlin_count': allocation.get('added_count', 0), 'basis': BASIS}
     if entry['error']:
         return {**base, 'mode': entry['error'], 'ratio': None, 'passes': False}
     role = base['beam_role']
@@ -179,7 +209,7 @@ def shared_check(run, entry, component, force, name, level, divisor, criteria):
         rated = reference['deflection_per_kn_m']*reference['capacity']['service_capacity_kn_m']
         limit = data['analysis_span_mm']/divisor
         adjusted = d/rated*(data['analysis_span_mm']/150.)
-        return {**base, 'mode': 'PRELIMINARY 50/50 table-reference serviceability',
+        return {**base, 'mode': f'PRELIMINARY {split} table-reference serviceability',
                 'ratio': max(d, adjusted)/limit, 'elastic_deflection_mm': d,
                 'table_adjusted_deflection_mm': adjusted, 'deflection_mm': max(d, adjusted),
                 'limit_mm': limit, 'table_reference': reference}
@@ -202,7 +232,7 @@ def shared_check(run, entry, component, force, name, level, divisor, criteria):
         axial = force/tension['tension_capacity_kn'] if force > 1e-8 else max(-force,0.)/ns
     except AnalysisError as error:
         return {**base, 'mode': str(error), 'ratio': None, 'passes': False}
-    return {**base, **tension, 'mode': 'PRELIMINARY 50/50 axial + table-reference envelope',
+    return {**base, **tension, 'mode': f'PRELIMINARY {split} axial + table-reference envelope',
             'ratio': axial+envelope, 'bending_ratio': max(c['moment_ratio'] for c in comparisons),
             'reference_envelope_ratio': envelope, 'axial_ratio': axial, 'compression_capacity_kn': ns,
             'table_reference': reference, 'reference_comparisons': comparisons}

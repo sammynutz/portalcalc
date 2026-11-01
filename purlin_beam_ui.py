@@ -25,7 +25,7 @@ class BeamPlot(QWidget):
             datasets = [("Cladding transfer (+ roof to added)", "#8b45a6", [b["transfer_samples"] for b in self.case["bays"]])]
         else:
             datasets = [("Existing roof, per ply", "#176b9c", [b["roof"]["samples"] for b in self.case["bays"]]),
-                        ("Added single-span", "#c26314", [b["added"]["samples"] for b in self.case["bays"]])]
+                        ("Added single-span, per ply", "#c26314", [b["added"]["samples"] for b in self.case["bays"]])]
         largest = max((abs(s[self.field]) for _, _, groups in datasets for samples in groups for s in samples), default=0.)
         largest = max(largest*1.12, 1e-8)
         def point(x, value):
@@ -106,8 +106,11 @@ class PurlinBeamResults(QWidget):
         if run.get("error"):
             self.note.setText(run["error"])
         elif run.get("cases"):
-            state = 'PRELIMINARY: adopted 50/50 applied roof load; no stiffness-derived sharing' if run.get('preliminary') else "Declared cladding/load pickup inputs" if run["coupling_defined"] else "UNVERIFIED: cladding/load pickup inputs missing; fallback demands"
-            self.note.setText(f"{state}; k = {run['coupling_kn_m_per_mm']:g} kN/m per mm; direct pickup to added = {run['direct_roof_pickup_fraction']:.1%}. Existing: {run['span_type']}, releases after bays {run['roof_releases_after_bays']}; additions: single span. Demand plots do not establish member or connection acceptance.")
+            if run.get('preliminary'):
+                self.note.setText('PRELIMINARY assigned roof loads. '+run['note']+' Existing: '+run['span_type']+'. Demand plots do not establish member or connection acceptance.')
+            else:
+                state = "Declared cladding/load pickup inputs" if run["coupling_defined"] else "UNVERIFIED: cladding/load pickup inputs missing; fallback demands"
+                self.note.setText(f"{state}; k = {run['coupling_kn_m_per_mm']:g} kN/m per mm; direct pickup to added = {run['direct_roof_pickup_fraction']:.1%}. Existing: {run['span_type']}, releases after bays {run['roof_releases_after_bays']}; additions: single span. Demand plots do not establish member or connection acceptance.")
         else:
             self.note.setText("Select a sheeted single-span purlin in Components / ratings to analyse roof-load sharing.")
         self.plot.update()

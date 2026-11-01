@@ -12,7 +12,7 @@ from unittest import mock
 import numpy as np
 
 from bracing_analysis import (AnalysisError, AxialMember, AxialModel3D, PortalReduction,
-                              build_braced_building, end_wall_load_vector, solve_building_case)
+                              build_braced_building, end_wall_load_vector, roof_drag_load_vector, solve_building_case)
 from bracing_layout import BracingLayout, LayoutGeometry
 
 
@@ -47,6 +47,135 @@ def fixed_layout(g, end=False):
 
 
 class MechanicsTests(unittest.TestCase):
+    def test_simultaneous_end_wall_and_internal_pressures_resolve_in_building_axes(self):
+        from bracing_analysis_desktop import end_wind_cases
+        from wind import WindInputs
+        # Uniform internal pressure has zero longitudinal resultant on equal
+        # opposing clad ends. Its local effects on each end remain present.
+        for open_side in (False,True):
+            inputs=WindInputs(building_width_m=30.,building_length_m=40.,orientation='Any',
+                              left_wall_clad=True,right_wall_clad=not open_side,
+                              front_wall_clad=True,back_wall_clad=True)
+            for i,case in enumerate(end_wind_cases(inputs)):
+                ww,lw=case['components_windward_leeward']
+                reverse=i>=4
+                front_internal=ww['internal_kpa'] if not reverse else lw['internal_kpa']
+                back_internal=lw['internal_kpa'] if not reverse else ww['internal_kpa']
+                self.assertAlmostEqual(front_internal,back_internal)
+                expected_external=(ww['external_kpa']-lw['external_kpa'])*(-1 if reverse else 1)
+                self.assertAlmostEqual(case['front_kpa']+case['back_kpa'],expected_external)
+                front_external=ww['external_kpa'] if not reverse else lw['external_kpa']
+                back_external=lw['external_kpa'] if not reverse else ww['external_kpa']
+                self.assertAlmostEqual(case['front_kpa'],front_external-front_internal)
+                self.assertAlmostEqual(case['back_kpa'],-back_external+back_internal)
+        # With one clad end, internal pressure cannot cancel against an absent wall.
+        one=WindInputs(orientation='Any',front_wall_clad=True,back_wall_clad=False)
+        for case in end_wind_cases(one):
+            self.assertEqual(case['back_kpa'],0.)
+            self.assertNotEqual(case['front_kpa'],0.)
+
+    def test_roof_friction_threshold_profiles_pressure_scale_and_open_side_basis(self):
+        from bracing_analysis_desktop import end_wind_cases,roof_friction_drag
+        from wind import WindInputs
+        from dataclasses import replace
+        inputs=WindInputs(building_width_m=30.,building_length_m=40.,eave_height_m=6.,roof_pitch_deg=0.,
+                          front_wall_clad=True,back_wall_clad=True,left_wall_clad=True,right_wall_clad=True)
+        drag=roof_friction_drag(inputs,.8,6.)
+        self.assertEqual(drag['windward_exclusion_m'],24.)
+        self.assertEqual(drag['projected_area_m2'],480.)
+        self.assertAlmostEqual(drag['signed_y_force_kn'],15.36)
+        self.assertFalse(drag['preliminary_open_sided'])
+        self.assertAlmostEqual(roof_friction_drag(inputs,.8,6.,roof_profile='Corry (Corodek)')['signed_y_force_kn'],7.68)
+        for depth in (20.,24.):
+            self.assertEqual(roof_friction_drag(replace(inputs,building_length_m=depth),.8,6.)['projected_area_m2'],0.)
+        # Narrow tall building: breadth controls, even though d/h <= 4.
+        narrow=replace(inputs,building_width_m=5.,building_length_m=24.,eave_height_m=10.)
+        self.assertEqual(roof_friction_drag(narrow,.8,10.)['projected_area_m2'],20.)
+        opened=replace(inputs,right_wall_clad=False)
+        self.assertTrue(roof_friction_drag(opened,.8,6.)['preliminary_open_sided'])
+        with self.assertRaises(AnalysisError):roof_friction_drag(inputs,.8,6.,roof_profile='Unknown')
+        cases=end_wind_cases(opened)
+        for c in cases:
+            d=c['roof_drag']
+            # No end-wall area/action-combination or internal-pressure factor.
+            self.assertAlmostEqual(abs(d['signed_y_force_kn']),c['wu_kpa']*c['wind_pressure_scale']*.04*480.)
+        first=cases[0]['roof_drag'];back=cases[4]['roof_drag']
+        self.assertEqual((first['y_start_m'],first['y_end_m']),(24.,40.))
+        self.assertEqual((back['y_start_m'],back['y_end_m']),(0.,16.))
+        self.assertLess(back['signed_y_force_kn'],0.)
+
+    def test_roof_drag_distribution_preserves_force_moments_and_mirrors_strip(self):
+        # Cutoff crosses an irregular bay; external force all enters the roof.
+        for shape in ('Gable','Skillion'):
+            g=geometry(roof_shape=shape,bay_stations_mm=[0.,5000.,11000.,16000.])
+            layout=fixed_layout(g)
+            macro=PortalReduction(frame(g),[(x,g.roof_z(x)) for x in g.roof_stations])
+            model,_,dofs,lookup=build_braced_building(layout,macro,1500,300,300,300,1500)
+            for reverse in (False,True):
+                lo,hi=(0.,6.5) if reverse else (9.5,16.)
+                p=-.032 if reverse else .032
+                drag={'y_start_m':lo,'y_end_m':hi,'signed_y_pressure_kpa':p}
+                f,work=roof_drag_load_vector(model,layout,lookup,drag)
+                amount=p*g.span_mm*(hi-lo)
+                self.assertAlmostEqual(f[1::3].sum(),amount,places=7)
+                self.assertEqual(work[0]['direct_ground_resultant_n'],0.)
+                self.assertTrue(all(np.linalg.norm(f[3*i:3*i+3])==0 for i,n in enumerate(model.nodes) if n[2]==0.))
+                roof_integral=sum((b-a)*(g.roof_z(a)+g.roof_z(b))/2 for a,b in zip(g.roof_stations,g.roof_stations[1:]))
+                moments=np.cross(np.asarray(model.nodes),f.reshape(-1,3)).sum(axis=0)
+                np.testing.assert_allclose(moments,[-p*(hi-lo)*roof_integral,0.,amount*g.span_mm/2],atol=1e-6)
+                # Spatial distribution also retains the loaded strip's Y centre.
+                centre=sum(n[1]*f[3*i+1] for i,n in enumerate(model.nodes))/amount
+                self.assertAlmostEqual(centre,(lo+hi)*500.,places=6)
+                r=solve_building_case(model,layout,macro,dofs,lookup,{'front_kpa':0.,'back_kpa':0.,'roof_drag':drag})
+                self.assertAlmostEqual(r['load_path']['applied_roof_y_n'],amount,places=6)
+                self.assertAlmostEqual(r['load_path']['direct_ground_y_n'],0.)
+                self.assertLess(abs(r['load_path']['roof_to_member_base_y_residual_n']),1e-5)
+                self.assertLess(max(abs(v) for v in r['balance_force_error_n']),1e-5)
+                self.assertLess(max(abs(v) for v in r['balance_moment_error_nmm']),.01)
+            f,work=roof_drag_load_vector(model,layout,lookup,None)
+            self.assertFalse(np.any(f));self.assertEqual(work,[])
+            with self.assertRaises(AnalysisError):
+                roof_drag_load_vector(model,layout,lookup,{'y_start_m':0.,'y_end_m':17.,'signed_y_pressure_kpa':.03})
+
+    def test_end_wind_leeward_coefficient_uses_length_over_span_all_gable_pitches(self):
+        from bracing_analysis_desktop import end_wind_cases
+        from wind import WindInputs
+        for pitch in (0.,7.5,20.,30.):
+            for depth,expected in ((15.,-.5),(40.,-.5+.2/3),(60.,-.3),(120.,-.2)):
+                with self.subTest(pitch=pitch,depth=depth):
+                    cases=end_wind_cases(WindInputs(building_width_m=30.,building_length_m=depth,roof_pitch_deg=pitch))
+                    for case in cases:
+                        self.assertAlmostEqual(case['pressure_basis']['leeward_cpe'],expected)
+                        self.assertAlmostEqual(case['pressure_basis']['d_over_b'],depth/30.)
+                        self.assertEqual(case['components_windward_leeward'][1]['cpe'],case['pressure_basis']['leeward_cpe'])
+
+    def test_end_pressure_reductions_count_only_applied_end_and_effective_internal_surfaces(self):
+        from bracing_analysis_desktop import end_wind_combination_factors,end_wind_cases
+        from wind import WindInputs
+        inputs=WindInputs(front_wall_clad=True,back_wall_clad=True,left_wall_clad=True,right_wall_clad=True)
+        self.assertEqual(end_wind_combination_factors(inputs,.2),(.9,1.,2))
+        self.assertEqual(end_wind_combination_factors(inputs,-.44),(.8,.8,3))
+        one=__import__('dataclasses').replace(inputs,front_wall_clad=False)
+        self.assertEqual(end_wind_combination_factors(one,.2),(1.,1.,1))
+        self.assertEqual(end_wind_combination_factors(one,.5),(.9,.9,2))
+        cases=end_wind_cases(inputs)
+        # Large enclosed end walls: Ka is 0.9 windward, 0.95 leeward.
+        # Two end walls only: Kce=0.9, with no absent roof counted as a third.
+        for case in cases:
+            ww,lw=case['components_windward_leeward']
+            self.assertAlmostEqual(ww['external_factor'],.81)
+            self.assertAlmostEqual(lw['external_factor'],.855)
+            self.assertEqual(ww['internal_factor'],1.)
+
+    def test_open_leeward_end_cpi_uses_corrected_end_wall_coefficient(self):
+        from bracing_analysis_desktop import end_wind_cases
+        from wind import WindInputs
+        cases=end_wind_cases(WindInputs(building_width_m=30.,building_length_m=40.,front_wall_clad=True,back_wall_clad=False,
+                                      left_wall_clad=True,right_wall_clad=True))
+        first=cases[0]
+        # Dominant leeward opening: 1.085 volume multiplier, leeward Ka=0.95.
+        self.assertAlmostEqual(first['cpi'],(-.5+.2/3)*.95*1.085)
+
     def x_model(self, area=200, rods=True):
         model = AxialModel3D()
         left = model.add_node((0, 0, 0), fixed=True)
@@ -247,6 +376,31 @@ class MechanicsTests(unittest.TestCase):
         model, _, dofs, lookup = build_braced_building(layout, macro, 1500, 200, 200, 200, 1500)
         with self.assertRaises(AnalysisError):
             solve_building_case(model, layout, macro, dofs, lookup, {"front_kpa": 1., "back_kpa": .3})
+
+    def test_longitudinal_roof_load_reaches_side_brace_bases_not_normal_end_braces(self):
+        g = geometry()
+        layout = fixed_layout(g,end=True)
+        macro = PortalReduction(frame(g),[(x,g.roof_z(x)) for x in g.roof_stations])
+        model,_,dofs,lookup = build_braced_building(layout,macro,1500,300,300,300,1500)
+        for sign in (1.,-1.):
+            result = solve_building_case(model,layout,macro,dofs,lookup,
+                                        {'front_kpa':sign,'back_kpa':sign*.3})
+            path = result['load_path']
+            # Independent integrated wall area for this symmetric gable. Half
+            # reaches roof supports and half goes directly to end-post bases.
+            area = g.span_mm*(g.eave_mm+(g.roof_z(g.span_mm/2)-g.eave_mm)/2)
+            expected = sign*1.3*area/1000/2
+            self.assertAlmostEqual(path['applied_roof_y_n'],expected,places=6)
+            self.assertAlmostEqual(path['direct_ground_y_n'],expected,places=6)
+            ground = path['member_base_reactions_n']
+            side_y = sum(v[1] for face,v in ground.items() if face in {'left_wall','right_wall'})
+            end_y = sum(v[1] for face,v in ground.items() if face in {'front_end','back_end'})
+            self.assertAlmostEqual(side_y,-expected,places=6)
+            self.assertEqual(end_y,0.)
+            self.assertLess(abs(path['roof_to_member_base_y_residual_n']),1e-5)
+            for member in result['members']:
+                if member['kind']=='end_brace':
+                    self.assertEqual(model.nodes[member['start']][1],model.nodes[member['end']][1])
 
 
 class DesktopTests(unittest.TestCase):

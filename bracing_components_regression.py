@@ -1,6 +1,7 @@
 """Rated components, sharing/interaction, mixed sizing and data-entry checks.
 
-All numerical ratings in tests are synthetic software fixtures, not design data.
+Declared test ratings are synthetic fixtures; named project-default tests also
+verify the supplied schedule, adopted interim stiffness and project rope pricing.
 """
 import copy
 import json
@@ -11,9 +12,9 @@ import unittest
 
 from bracing_analysis import AnalysisError, AxialModel3D, AxialMember
 from bracing_components import (StrutPlan, assembly_assessment, location_options,
-                                wire_check, wire_modulus, wire_options, wire_price)
+                                wire_check, wire_modulus, wire_options, wire_price, WIRE_ASSUMED_STIFFNESS)
 from bracing_design import DesignCriteria, group_cost, member_assessment, solve_selection, auto_size
-from bracing_schedule import rod_options, SOURCE
+from bracing_schedule import rod_options, SOURCE, WIRE_PRICE_SCHEMA, WIRE_PRICE_SOURCE, WIRE_PRICE_SHA256
 from purlin_combined import properties, compression_capacity, tension_capacity, METHOD
 
 
@@ -38,6 +39,32 @@ def fixture(force=-20000.):
 
 
 class RatedComponentTests(unittest.TestCase):
+    def test_result_summary_separates_strength_local_deflection_and_global_movement(self):
+        from bracing_sizing_diagnostics import result_summary, governing_check_row
+        strength = {'case': 'ultimate', 'mode': 'Axial plus bending', 'ratio': 1.6, 'component': 1}
+        local = {'case': 'service', 'mode': 'Local deflection', 'ratio': 2.0}
+        check = {'case': 'ultimate', 'mode': 'Axial plus bending', 'ratio': 1.6,
+                 'case_checks': [{**strength, 'ratio': .4, 'component': 0}, strength, local]}
+        self.assertEqual(governing_check_row(check)['component'], 1)
+        result = {'cases': [{'case': {'name': 'ultimate', 'level': 'ULS'}}, {'case': {'name': 'service', 'level': 'SLS'}}],
+                  'nodes': [{'label': 'Right eave'}], 'design': {'global_sls': {'ratio': 13.125, 'node': 0,
+                     'case': 'service', 'movement_mm': 525., 'limit_mm': 40.}, 'taut_tangent_verified': True},
+                  'analysis_layout': {'pinned_panels': ['left_wall/bay/0']},
+                  'section_checks': {'a': check, 'b': {'case': 'ultimate', 'ratio': None,
+                    'case_checks': [{'case': 'ultimate', 'ratio': None}]}}}
+        summary = result_summary(result)
+        self.assertEqual(summary['member_counts']['Strength'], 1)
+        self.assertEqual(summary['member_counts']['Local deflection'], 1)
+        self.assertEqual(summary['member_counts']['Missing check'], 1)
+        self.assertEqual(summary['failed_members'], 2)
+        self.assertIn('525.0 mm / 40.0 mm limit', summary['text'])
+        self.assertEqual(summary['wall_panel_counts']['right_wall'], 0)
+        result['section_checks'] = {}
+        self.assertIn('Overall longitudinal movement: FAIL', result_summary(result)['text'])
+        self.assertEqual(result_summary(result)['failed_members'], 0)
+        result['sizing_failure'] = {'status': 'STOPPED_NO_ADOPTION'}
+        self.assertIn('original input selections shown', result_summary(result)['text'])
+
     def test_calculated_tension_independent_workings_and_declared_override(self):
         data = {'section': 'C/Z 250 19', 'area_mm2': 808., 'basis_key': 'TEST', 'axial_rating': {}}
         t = tension_capacity(data, DesignCriteria())
@@ -122,9 +149,34 @@ class RatedComponentTests(unittest.TestCase):
         self.assertAlmostEqual(result["displacements_mm"][1][0], 10000*5000/4000000)
         self.assertAlmostEqual(wire_check(wire, 10, "test")["ratio"], 1/3)
         self.assertAlmostEqual(wire_price(wire, 10, 2)["total"], 40.)
+        self.assertAlmostEqual(wire_modulus(options[2]), 200000.)
+        missing = wire_options({'12': {'stiffness_basis': 'declared_ea'}})[2]
         with self.assertRaises(AnalysisError):
-            wire_modulus(options[2])
-        self.assertIsNone(wire_check(options[2], 0, "test")["ratio"])
+            wire_modulus(missing)
+        self.assertIsNone(wire_check(missing, 0, "test")["ratio"])
+
+    def test_interim_wire_stiffness_nominal_area_preserves_strength_and_declared_overrides(self):
+        for option, capacity in zip(wire_options(), (22.96, 35.92, 51.2, 70.4, 92.)):
+            rating = option['rating']
+            self.assertEqual(rating['stiffness_basis'], WIRE_ASSUMED_STIFFNESS)
+            self.assertAlmostEqual(rating['ea_kn'], 200.*math.pi*option['diameter_mm']**2/4)
+            self.assertAlmostEqual(wire_modulus(option), 200000.)
+            self.assertEqual(rating['design_tension_kn'], capacity)
+            self.assertIn('not supplier-verified', rating['ea_source'])
+        # Hand check a 10 mm, 5 m rope: delta = PL/EA at 10 kN.
+        wire = wire_options()[1]
+        model = AxialModel3D()
+        a = model.add_node((0, 0, 0), fixed=True)
+        b = model.add_node((5000, 0, 0))
+        model.fixed.update((4, 5))
+        model.add_member(AxialMember('wire', a, b, wire['area_mm2'], wire_modulus(wire), True))
+        solved = model.solve([0, 0, 0, 10000, 0, 0])
+        self.assertAlmostEqual(solved['displacements_mm'][1][0], 10000*5000/(200000*math.pi*100/4))
+        for raw in (0., -1.):
+            invalid = wire_options({'10': {'ea_kn': raw, 'ea_source': 'EXPLICIT INVALID FIXTURE'}})[1]
+            self.assertEqual(invalid['rating']['stiffness_basis'], 'declared_ea')
+            with self.assertRaises(AnalysisError):
+                wire_modulus(invalid)
 
     def test_supplied_rod_strengths_and_exact_fittings(self):
         rods = rod_options()
@@ -156,6 +208,43 @@ class RatedComponentTests(unittest.TestCase):
         self.assertEqual(wire["rating"]["source"], SOURCE)
         data["10"]["design_tension_kn"] = 100.
         self.assertFalse(wire_check(wire_options(data)[1], 35.92, "test").get("passes", True))
+
+    def test_project_rope_prices_exact_turnbuckles_and_physical_diagonal_costs(self):
+        from pathlib import Path
+        import hashlib
+        image = Path(__file__).resolve().parent/'assets/project_wire_rope_prices_2026-10-31.png'
+        self.assertEqual(hashlib.sha256(image.read_bytes()).hexdigest().upper(), WIRE_PRICE_SHA256)
+        for option, rate, tb, fitting in zip(wire_options(), (1.35, 1.75, 1.90, 2.40, 3.50),
+                                             ('M10', 'M12', 'M16', 'M16', 'M20'), (4., 4., 9.62, 9.62, 16.60)):
+            self.assertEqual(option['rating']['price_per_m'], rate)
+            self.assertEqual(option['forged_turnbuckle'], tb)
+            cost = wire_price(option, 20., 2)  # two physical 10 m diagonals, including slack one
+            self.assertAlmostEqual(cost['material_cost'], 20*rate)
+            self.assertAlmostEqual(cost['listed_fittings_cost'], 2*fitting)
+            self.assertAlmostEqual(cost['total'], 20*rate+2*fitting)
+            self.assertEqual(cost['turnbuckle_count'], 2)
+            self.assertEqual(cost['rope_price_source'], WIRE_PRICE_SOURCE)
+            self.assertIn('excluded by user', cost['allowance'])
+        self.assertEqual(wire_options()[2]['rating']['quoted_rope_price_range_per_m'], [1.8, 1.9])
+        self.assertIn('Upper end', wire_options()[2]['rating']['rope_price_adoption'])
+
+    def test_rope_price_migration_preserves_overrides_and_deliberately_missing_values(self):
+        legacy = {'12': {'price_per_m': None, 'fittings_per_run': None},
+                  '10': {'price_per_m': 2.5, 'fittings_per_run': 8.}}
+        options = wire_options(legacy)
+        self.assertEqual(options[2]['rating']['price_per_m'], 1.9)
+        self.assertEqual(options[2]['rating']['fittings_per_run'], 9.62)
+        self.assertEqual(options[1]['rating']['price_per_m'], 2.5)
+        self.assertEqual(options[1]['rating']['fittings_per_run'], 8.)
+        self.assertEqual(options[1]['rating']['rope_price_source'], 'Project-entered rope rate override')
+        for key in ('price_per_m', 'fittings_per_run'):
+            option = wire_options({'12': {'pricing_schema': WIRE_PRICE_SCHEMA, key: None}})[2]
+            self.assertIsNone(option['rating'][key])
+            with self.assertRaises(AnalysisError):
+                wire_price(option, 10., 1)
+        zero = wire_options({'12': {'price_per_m': 0.}})[2]
+        with self.assertRaises(AnalysisError):
+            wire_price(zero, 10., 1)
 
     def test_two_existing_purlins_share_force_and_are_not_costed_again(self):
         single = location_options(location(), [])[0]
@@ -247,6 +336,55 @@ class ComponentWorkspaceTests(unittest.TestCase):
         from bracing_analysis_desktop import prepare_context
         from bracing_analysis_ui import BracingAnalysisDialog
         return BracingAnalysisDialog(prepare_context(self.window), self.window.catalog, saved)
+
+    def test_grade300_apex_pair_defaults_manual_override_and_cladding_overlay(self):
+        from bracing_analysis_desktop import prepare_context
+        from bracing_workspace_ui import BracingAnalysisDialog
+        from bracing_design import section_properties
+        context = prepare_context(self.window)
+        context['face_cladding'] = {'left_wall':True,'right_wall':False,'front_end':True,'back_end':True}
+        ridge = min(range(len(context['layout'].geometry.roof_stations)),key=lambda i:abs(context['layout'].geometry.roof_stations[i]-context['layout'].geometry.span_mm/2))
+        identifier = f'strut/bay/0/line/{ridge}'
+        d = BracingAnalysisDialog(context,self.window.catalog,{'criteria':{'brace_fy_mpa':250.},
+            'strut_members':{identifier:{'existing_count':1}}})
+        try:
+            self.assertEqual(d.criteria().brace_fy_mpa,300.)
+            self.assertTrue(d.criteria_inputs['brace_fy_mpa'].isReadOnly())
+            angle = next(c for c in d.component_editor.brace_candidates() if c['label'].startswith('EA '))
+            props = section_properties(angle,d.criteria())
+            self.assertEqual(props.fy_mpa,300.)
+            self.assertEqual(props.fu_mpa,410.)
+            member = d.selections()['strut'].members[identifier]
+            self.assertEqual(member.location['existing_count'],2)
+            self.assertAlmostEqual(member.A,2*member.location['purlin']['area_mm2'])
+            data = member.location['purlin']
+            self.assertAlmostEqual(data['tributary_width_mm'],600.,places=4)
+            self.assertAlmostEqual(data['analysis_span_mm'],8000.)
+            expected = self.window.purlin_check['outward_kn_m']*600/self.window.purlin_check['spacing_mm']
+            self.assertAlmostEqual(data['beam_inputs']['outward_kn_m'],expected)
+            self.assertEqual(d.canvas.orientation_label('right_wall'),'RIGHT (OPEN)')
+            self.assertEqual(d.canvas.orientation_label('left_wall'),'LEFT (CLAD)')
+            d.run_analysis()
+            self.assertIsNotNone(d.result,d.status_label.text())
+            checked = d.result
+            self.assertIn('600.000',d.report_text)
+            self.assertIn('Original roof tributary width: 600.0 mm',d.check_description(identifier))
+            self.assertFalse(checked['face_cladding']['right_wall'])
+            d.cladding_overlay.setChecked(False)
+            self.assertIs(d.result,checked)
+            self.assertFalse(d.canvas.show_cladding)
+            for azimuth in (-135.,-45.,45.,135.):
+                d.canvas.azimuth=azimuth
+                self.assertFalse(d.canvas.grab().isNull())
+            payload = d.snapshot()
+            payload['strut_members'][identifier]['existing_count'] = 1
+            payload['strut_members'][identifier]['existing_count_mode'] = 'manual'
+            restored = BracingAnalysisDialog(context,self.window.catalog,payload)
+            try:
+                self.assertEqual(restored.selections()['strut'].members[identifier].location['existing_count'],1)
+                self.assertEqual(restored.snapshot(),payload)
+            finally:restored.reject()
+        finally:d.reject()
 
     def fill_fixture_ratings(self, dialog):
         from PySide6.QtWidgets import QTableWidgetItem
@@ -353,6 +491,52 @@ class ComponentWorkspaceTests(unittest.TestCase):
         finally:
             dialog.reject()
 
+    def test_one_sided_layout_sls_stop_points_to_system_movement_without_adopting_sections(self):
+        d = self.dialog()
+        try:
+            model = d.layout_editor.model
+            for identifier in list(model.pinned):
+                model.toggle(identifier, 'pinned')
+            last = len(model.geometry.bay_stations_mm)-2
+            for panel in model.panels.values():
+                if (panel.face.startswith('roof') or panel.face == 'left_wall') and any(f'/bay/{i}' in panel.id for i in (0,last)):
+                    model.toggle(panel.id, 'pinned')
+            d.run_analysis()
+            self.assertIsNotNone(d.result, d.status_label.text())
+            self.assertGreater(d.result['design']['global_sls']['ratio'], 1.)
+            self.assertIn('Overall longitudinal movement: FAIL', d.result_summary_label.text())
+            self.assertIn('local deflection failures', d.result_summary_label.text())
+            self.assertTrue(d.movement_button.isEnabled())
+            before = d.snapshot()
+            d.run_auto_size()
+            self.assertIsNotNone(d.result, d.status_label.text())
+            issue = d.result['sizing_failure']
+            self.assertEqual(issue['input_target'], 'layout')
+            self.assertIn('global longitudinal serviceability', issue['reason'])
+            self.assertEqual(d.snapshot(), before)
+            self.assertGreater(issue['global_sls']['movement_mm'], issue['global_sls']['limit_mm'])
+            self.assertIn('Original-input longitudinal SLS movement', d.report_text)
+            self.assertEqual(d.case_combo.currentText(), issue['global_sls']['case'])
+            self.assertIn('original input selections shown', d.result_summary_label.text())
+            self.assertEqual(d.visual_mode.currentData(), 'deformed')
+            d.sizing_issue_button.click()
+            self.assertEqual(d.visual_mode.currentData(), 'deformed')
+            self.assertEqual(d.deformation_scale.value(), 1.)
+            d.case_combo.setCurrentIndex(0)
+            d.deformation_scale.setValue(50.)
+            d.movement_button.click()
+            self.assertEqual(d.case_combo.currentText(), issue['global_sls']['case'])
+            self.assertEqual(d.deformation_scale.value(), 1.)
+            self.assertIn('Circled node', d.member_detail.text())
+            self.assertEqual(d.member_table.item(0, 4).text(), 'Strength')
+            self.assertEqual(d.tabs.currentIndex(), 1)
+            json.dumps(d.result, allow_nan=False)
+            d.invalidate()
+            self.assertTrue(d.result_summary_box.isHidden())
+            self.assertFalse(d.movement_button.isEnabled())
+        finally:
+            d.reject()
+
     def test_simplified_method_shape_and_tension_data_roundtrip(self):
         from PySide6.QtWidgets import QTableWidgetItem
         dialog = self.dialog()
@@ -385,6 +569,7 @@ class ComponentWorkspaceTests(unittest.TestCase):
         dialog = self.dialog({"mixed_struts": False})
         try:
             table = dialog.component_editor.wire_table
+            dialog.component_editor.wire_stiffness_modes[1].setCurrentIndex(1)
             for col, value in ((2, "4000"), (4, "2"), (5, "12"), (7, "SYNTHETIC SOFTWARE TEST EA ONLY")):
                 table.setItem(1, col, QTableWidgetItem(value))
             for combo in dialog.brace_combos.values():
@@ -397,6 +582,92 @@ class ComponentWorkspaceTests(unittest.TestCase):
                 self.assertAlmostEqual(member["area_mm2"]*member["modulus_mpa"], 4000000.)
                 self.assertEqual(dialog.result["section_checks"][member["id"]]["case_checks"][0]["capacity_kn"], 35.92)
             json.dumps(dialog.result, allow_nan=False)
+        finally:
+            dialog.reject()
+
+    def test_interim_wire_stiffness_actual_model_export_roundtrip_and_invalidation(self):
+        from PySide6.QtWidgets import QTableWidgetItem
+        dialog = self.dialog({'mixed_struts': False})
+        try:
+            editor = dialog.component_editor
+            for col, value in ((4, '2'), (5, '12')):
+                editor.wire_table.setItem(1, col, QTableWidgetItem(value))
+            for combo in dialog.brace_combos.values():
+                combo.setCurrentIndex(combo.findText('10 mm WIRE ROPE'))
+            dialog.run_analysis()
+            self.assertIsNotNone(dialog.result, dialog.status_label.text())
+            physical = [m for m in dialog.result['cases'][0]['members'] if m['tension_only']]
+            self.assertTrue(physical)
+            for member in physical:
+                self.assertAlmostEqual(member['modulus_mpa'], 200000.)
+                self.assertAlmostEqual(member['area_mm2'], math.pi*100/4)
+                check = dialog.result['section_checks'][member['id']]['case_checks'][0]
+                self.assertEqual(check['stiffness_basis'], WIRE_ASSUMED_STIFFNESS)
+                self.assertEqual(check['capacity_kn'], 35.92)
+            self.assertIn('WIRE-ROPE STIFFNESS BASIS', dialog.report_text)
+            self.assertIn('E = 200 GPa', dialog.report_text)
+            self.assertIn('interim rope stiffness', dialog.status_label.text())
+            self.assertTrue(dialog.result['design']['assumed_wire_stiffness_groups'])
+            saved = dialog.snapshot()
+            restored = self.dialog(saved)
+            try:
+                self.assertEqual(saved, restored.snapshot())
+                self.assertEqual(restored.component_editor.wire_candidates()[1]['rating']['stiffness_basis'], WIRE_ASSUMED_STIFFNESS)
+            finally:
+                restored.reject()
+            json.dumps(dialog.result, allow_nan=False)
+            editor.wire_stiffness_modes[1].setCurrentIndex(1)
+            self.assertIsNone(dialog.result)
+            editor.wire_table.setItem(1, 2, QTableWidgetItem('4000'))
+            editor.wire_table.setItem(1, 7, QTableWidgetItem('SYNTHETIC DECLARED EA'))
+            self.assertEqual(editor.wire_candidates()[1]['rating']['ea_kn'], 4000.)
+            self.assertNotIn('modulus_mpa', editor.wire_candidates()[1]['rating'])
+            saved_declared = dialog.snapshot()
+            restored = self.dialog(saved_declared)
+            try:
+                self.assertEqual(saved_declared, restored.snapshot())
+                self.assertEqual(restored.component_editor.wire_candidates()[1]['rating']['ea_kn'], 4000.)
+            finally:
+                restored.reject()
+        finally:
+            dialog.reject()
+
+    def test_loaded_rope_prices_roundtrip_export_and_clearing_invalidates_results(self):
+        from PySide6.QtWidgets import QTableWidgetItem
+        dialog = self.dialog({'mixed_struts': False, 'wire_rope_ratings': {'12': {'price_per_m': None}}})
+        try:
+            editor = dialog.component_editor
+            for combo in dialog.brace_combos.values():
+                combo.setCurrentIndex(combo.findText('12 mm WIRE ROPE'))
+            dialog.run_analysis()
+            self.assertIsNotNone(dialog.result, dialog.status_label.text())
+            costs = [c for c in dialog.result['design']['cost_items'] if c.get('price_per_m')]
+            self.assertTrue(costs)
+            for cost in costs:
+                self.assertEqual(cost['price_per_m'], 1.9)
+                self.assertEqual(cost['fittings_per_run'], 9.62)
+                self.assertEqual(cost['turnbuckle'], 'M16')
+            self.assertIn('grips and other termination hardware excluded', dialog.report_text)
+            self.assertIn('Upper end of supplied $1.80-$1.90/m range', dialog.report_text)
+            for col, value in ((4, '2.25'), (5, '15')):
+                editor.wire_table.setItem(2, col, QTableWidgetItem(value))
+            self.assertIsNone(dialog.result)
+            saved = dialog.snapshot()
+            restored = self.dialog(saved)
+            try:
+                self.assertEqual(saved, restored.snapshot())
+                row = restored.component_editor.wire_candidates()[2]['rating']
+                self.assertEqual((row['price_per_m'], row['fittings_per_run']), (2.25, 15.))
+                self.assertIn('override', row['rope_price_source'])
+            finally:
+                restored.reject()
+            editor.wire_table.setItem(2, 4, QTableWidgetItem(''))
+            self.assertIsNone(editor.wire_candidates()[2]['rating']['price_per_m'])
+            cleared = self.dialog(dialog.snapshot())
+            try:
+                self.assertIsNone(cleared.component_editor.wire_candidates()[2]['rating']['price_per_m'])
+            finally:
+                cleared.reject()
         finally:
             dialog.reject()
 

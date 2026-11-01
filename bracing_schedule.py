@@ -2,7 +2,8 @@
 
 Capacities below are the supplied FACTORED brace capacities. They are not
 multiplied by another capacity factor and are not turnbuckle/anchor checks.
-Wire nominal area is a reference only; it does not establish rope EA.
+Wire nominal area does not establish strength; stiffness is recorded separately
+as declared EA or the explicitly adopted interim solid-steel assumption.
 """
 import math
 
@@ -24,6 +25,13 @@ WIRE_SCHEDULE = {
     14: (70.4, "M16", "M12"),
     16: (92., "M20", "M16"),
 }
+WIRE_PRICE_SCHEMA = 'portalcalc.wire-pricing.v1'
+WIRE_PRICES_PER_M = {8: 1.35, 10: 1.75, 12: 1.90, 14: 2.40, 16: 3.50}
+WIRE_PRICE_SOURCE = 'User rope pricing, 2026-10-31; assets/project_wire_rope_prices_2026-10-31.png'
+WIRE_PRICE_SHA256 = 'E8DEA355AA5A2DFF1AD297ECDECE57CEC9B5056DA95AD90EFBBF08118A16BD51'
+WIRE_TURNBUCKLE_ALLOWANCES = {'M10': 4., 'M12': 4.}
+WIRE_FITTING_COST_BASIS = ('One matching forged-rated turnbuckle per physical diagonal; '
+                          'grips and other termination hardware excluded by user, 2026-10-31')
 
 
 def fitting_price(size):
@@ -31,6 +39,17 @@ def fitting_price(size):
     # price for the M28 forged turnbuckle specified on a 30 mm rod here.
     return next((item["unit_cost"] for item in END_WALL_ROD_TURNBUCKLES.values()
                  if "M"+str(item["turnbuckle_size"]) == size), None)
+
+
+def wire_cost_defaults(diameter, turnbuckle):
+    allowance = turnbuckle in WIRE_TURNBUCKLE_ALLOWANCES
+    return {'pricing_schema': WIRE_PRICE_SCHEMA, 'price_per_m': WIRE_PRICES_PER_M[diameter],
+            'rope_price_source': WIRE_PRICE_SOURCE, 'rope_price_source_sha256': WIRE_PRICE_SHA256,
+            'quoted_rope_price_range_per_m': [1.80, 1.90] if diameter == 12 else [WIRE_PRICES_PER_M[diameter]]*2,
+            'rope_price_adoption': 'Upper end of supplied $1.80-$1.90/m range' if diameter == 12 else 'Supplied rate',
+            'fittings_per_run': WIRE_TURNBUCKLE_ALLOWANCES[turnbuckle] if allowance else fitting_price(turnbuckle),
+            'fitting_price_source': ('User-adopted $4 allowance, 2026-10-31' if allowance else 'Existing Costing exact-size forged turnbuckle price'),
+            'fitting_cost_basis': WIRE_FITTING_COST_BASIS}
 
 
 def rod_options(prices=None):
@@ -47,6 +66,7 @@ def rod_options(prices=None):
 def rod_check(option, force_kn, name):
     capacity = option["design_tension_kn"]
     return {"case": name, "mode": "Project-schedule Grade 300 rod tension", "ratio": max(force_kn, 0.)/capacity,
+            'capacity_factor': .9, 'factor_already_included': True,
             "capacity_kn": capacity, "tension_kn": max(force_kn, 0.), "grade_mpa": option["grade_mpa"],
             "forged_turnbuckle": option["forged_turnbuckle"], "grade_s_turnbuckle": option["grade_s_turnbuckle"],
             "basis": "Supplied factored brace capacity used directly. Thread/net rupture, fittings and anchor capacities remain separate.",

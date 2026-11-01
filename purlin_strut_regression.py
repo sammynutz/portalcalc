@@ -5,9 +5,9 @@ import unittest
 
 from bracing_analysis import AnalysisError
 from purlin_strut_tables import snapshot, table_row, single_span_capacities
-from purlin_shared_design import location_data, solve_shared, shared_check, ARRANGEMENT
-from purlin_combined import properties
-from bracing_components import location_options
+from purlin_shared_design import location_data, solve_shared, shared_check, ARRANGEMENT, PAIR_ARRANGEMENT
+from purlin_combined import properties, same_profile_size
+from bracing_components import location_options, assembly_assessment
 from bracing_design import DesignCriteria
 
 
@@ -67,6 +67,198 @@ class StrutTableTests(unittest.TestCase):
 
 
 class SharedMechanicsTests(unittest.TestCase):
+    def pair_fixture(self, count=1):
+        assemblies = fixture(count=count)
+        assemblies[0] = next(o for o in location_options(assemblies[0].location, [])
+            if o.arrangement == PAIR_ARRANGEMENT and o.components[-1]['data']['section'] == 'C/Z 250 15')
+        return assemblies
+
+    def test_added_pair_thirds_independent_moments_load_conservation_and_selfweight(self):
+        assemblies = self.pair_fixture()
+        pair = assemblies[0]
+        self.assertEqual(len(pair.components), 3)
+        self.assertAlmostEqual(pair.A, 3*638.)
+        run = solve_shared(assemblies, [8000.,8000.], 0)
+        out = run['cases'][0]
+        self.assertAlmostEqual(out['bays'][0]['roof']['positive_moment_knm'], (1+1/3)*8000**2/16/1e6)
+        self.assertAlmostEqual(out['bays'][0]['added']['negative_moment_knm'], (1/3)*8000**2/8/1e6)
+        self.assertAlmostEqual(out['applied_load_n'], -16000.)
+        self.assertEqual(out['loads']['added_count_by_bay'], [2,0])
+        self.assertAlmostEqual(out['loads']['added_n_mm_by_bay'][0], -1/3)
+        own = 638.*7.85e-6*9.80665
+        self.assertAlmostEqual(run['cases'][1]['applied_load_n'], 16000+2*1.2*own*8000)
+        for case in run['cases']:
+            self.assertLess(abs(case['applied_load_n']+case['support_reaction_n']), 1e-5)
+        for component in pair.components:
+            row = shared_check(run, {'line':'0','bay':0,'error':None}, component, -3., 'ULS', 'ULS',150.,DesignCriteria())
+            self.assertAlmostEqual(row['roof_load_fraction'], 1/3)
+            self.assertEqual(row['added_purlin_count'], 2)
+
+    def test_apex_pair_plus_two_additions_shares_in_quarters(self):
+        assemblies = self.pair_fixture(count=2)
+        run = solve_shared(assemblies, [8000.,8000.], 0)
+        allocation = run['load_allocation_by_bay']['0']
+        self.assertEqual((allocation['existing_count'], allocation['added_count']), (2,2))
+        self.assertAlmostEqual(allocation['existing_group_fraction'], .5)
+        self.assertAlmostEqual(allocation['each_added_fraction'], .25)
+        for component in assemblies[0].components:
+            row = shared_check(run, {'line':'0','bay':0,'error':None}, component, -3., 'ULS','ULS',150.,DesignCriteria())
+            self.assertAlmostEqual(row['roof_load_fraction'], .25)
+        self.assertAlmostEqual(run['cases'][0]['applied_load_n'], -32000.)
+
+    def test_pair_passes_when_single_fails_and_costs_two_physical_additions(self):
+        from bracing_components_regression import fixture as axial_fixture
+        from bracing_design import member_assessment, group_cost
+        rates = {'purlin':1.9, 'shs':5.12, 'ub':3.7, 'wb':4.48}
+        results = []
+        for assemblies in (fixture(), self.pair_fixture()):
+            run = solve_shared(assemblies, [8000.,8000.], 0)
+            result = {**axial_fixture(-120000.), 'purlin_beams': {'runs': {'0':run},
+                'members': {assemblies[0].location['id']: {'line':'0','bay':0,'error':None}}}}
+            checked = assembly_assessment(result,0,assemblies[0],DesignCriteria(),member_assessment)
+            cost = group_cost(result,'strut',assemblies[0],rates)['total']
+            results.append((checked,cost))
+        self.assertFalse(results[0][0]['passes'])
+        self.assertTrue(results[1][0]['passes'])
+        forces = [r['axial_kn'] for r in results[1][0]['case_checks'] if r['case']=='ULS']
+        self.assertEqual(len(forces), 3)
+        for force in forces:self.assertAlmostEqual(force, -40.)
+        self.assertAlmostEqual(results[1][1], 2*results[0][1])
+
+    def test_automatic_sizing_adopts_added_pair_and_exactly_reanalyses_it(self):
+        # Synthetic ULS stress fixture, not a wind-design/combination example.
+        import copy
+        from types import SimpleNamespace
+        from main import ShapeCatalog, END_WALL_BRACING_SIZE_OPTIONS
+        from bracing_design_regression import DesignMechanicsTests
+        from bracing_components import StrutPlan
+        from bracing_design import auto_size, solve_selection
+        from bracing_schedule import rod_options
+        catalog = ShapeCatalog('Shape_Catalog.xlsx')
+        context, selected, pools = DesignMechanicsTests.small_context(SimpleNamespace(catalog=catalog))
+        for case in context['cases']:
+            if case['level'] == 'ULS':
+                case['front_kpa'] *= 80
+                case['back_kpa'] *= 80
+        members = {}
+        for line,x in enumerate(context['layout'].geometry.roof_stations):
+            loc = copy.deepcopy(fixture()[0].location)
+            loc.update(id=f'strut/bay/0/line/{line}',line=line,x_mm=x)
+            loc['purlin']['axial_rating']['compression_method'] = 'lysaght_1999'
+            loc['purlin'].update(bending_ratio=1/1.57,service_ratio=.8/1.2,bending_span_mm=8000.)
+            members[loc['id']] = location_options(loc,[])[0]
+        selected['strut'] = StrutPlan(members,selected['strut'])
+        pools['strut'] = catalog.shs_profiles()
+        braces = [*rod_options(),*[{'label':label,'area_mm2':area,'description':text}
+                   for label,area,text in END_WALL_BRACING_SIZE_OPTIONS if label.startswith('EA')]]
+        for group in ('roof_brace','wall_brace','end_brace'):pools[group] = braces
+        rates = {'shs':5.12,'ub':3.7,'wb':4.48,'purlin':1.9}
+        result,chosen = auto_size(context,selected,pools,DesignCriteria(),rates)
+        self.assertTrue(result['design']['passes'])
+        self.assertTrue(any(a.arrangement == PAIR_ARRANGEMENT for a in chosen['strut'].members.values()))
+        rerun = solve_selection(context,chosen,DesignCriteria(),rates)
+        self.assertTrue(rerun['design']['passes'])
+        self.assertEqual({k:v['ratio'] for k,v in result['section_checks'].items()},
+                         {k:v['ratio'] for k,v in rerun['section_checks'].items()})
+
+    def test_added_profiles_match_roof_size_and_stale_frozen_mismatch_cannot_pass(self):
+        import copy
+        assemblies = fixture()
+        candidates = assemblies[0].location['added_purlins']
+        self.assertTrue(candidates)
+        self.assertTrue(all(same_profile_size(c['section'],'C/Z 250 15') for c in candidates))
+        self.assertGreater(len({c['section'] for c in candidates}), 1)  # thickness still varies
+        bad = copy.deepcopy(candidates[0]);bad['section'] = 'C/Z 200 19'
+        location = {**assemblies[0].location, 'added_purlins':[bad]}
+        self.assertFalse(any(o.arrangement in {ARRANGEMENT,PAIR_ARRANGEMENT} for o in location_options(location,[])))
+        assemblies[0].components[-1]['data']['section'] = 'C/Z 200 19'
+        with self.assertRaisesRegex(AnalysisError, 'match the installed roof profile'):
+            solve_shared(assemblies,[8000.,8000.],0)
+
+    def cost_trade_fixture(self):
+        import copy
+        from types import SimpleNamespace
+        from main import ShapeCatalog
+        from bracing_design_regression import DesignMechanicsTests, rod
+        from bracing_components import StrutPlan
+        catalog = ShapeCatalog('Shape_Catalog.xlsx')
+        context, selected, pools = DesignMechanicsTests.small_context(SimpleNamespace(catalog=catalog))
+        members = {}
+        large = catalog.profile_by_name['250*12.5 SHS']
+        for line,x in enumerate(context['layout'].geometry.roof_stations):
+            loc = copy.deepcopy(fixture()[0].location)
+            loc.update(id=f'strut/bay/0/line/{line}',line=line,x_mm=x)
+            loc['purlin']['axial_rating']['compression_method'] = 'lysaght_1999'
+            loc['purlin'].update(bending_ratio=1/1.57,service_ratio=.8/1.2,bending_span_mm=8000.)
+            members[loc['id']] = next(o for o in location_options(loc,[large]) if o.arrangement=='additional_steel')
+        selected['strut'] = StrutPlan(members,large)
+        pools['strut'] = [large]
+        for group in ('roof_brace','wall_brace'):
+            selected[group] = rod(16)
+            pools[group] = [rod(16),rod(20)]
+        rates = {'shs':5.12,'ub':3.7,'wb':4.48,'purlin':1.9}
+        return context,selected,pools,rates
+
+    def test_checked_strut_ceiling_does_not_stop_other_group_stiffening(self):
+        from unittest import mock
+        from bracing_design import auto_size,solve_selection,member_assessment,candidate_stiffness
+        c,s,p,rates = self.cost_trade_fixture()
+        load = 1.25*2*candidate_stiffness(s['roof_brace'])
+        def analysed(context,chosen,criteria,rates):
+            result = solve_selection(context,chosen,criteria,rates)
+            ratio = load/sum(candidate_stiffness(chosen[g]) for g in ('roof_brace','wall_brace'))
+            sls = result['design']['global_sls']
+            sls.update(ratio=ratio,movement_mm=ratio*sls['limit_mm'])
+            result['design']['passes'] = result['design']['member_checks_pass'] and ratio<=1 and result['design']['taut_tangent_verified']
+            return result
+        def assessed(result,index,option,criteria):
+            checked = member_assessment(result,index,option,criteria)
+            # No local capacity rating for the large steel addition in this
+            # search pool; the cold-formed alternatives retain real checks.
+            if getattr(option,'arrangement',None)=='additional_steel':
+                return {**checked,'passes':False,'ratio':None,'case_checks':[
+                    {'case':'ULS','mode':'Fixture unavailable steel rating','ratio':None}]}
+            return checked
+        with mock.patch('bracing_design.solve_selection',side_effect=analysed) as solver, \
+             mock.patch('bracing_design.member_assessment',side_effect=assessed):
+            result,chosen = auto_size(c,s,p,DesignCriteria(),rates,max_solves=8)
+        self.assertTrue(result['design']['passes'])
+        self.assertTrue(result['sizing_search']['locally_checked_strut_floor_limits'])
+        self.assertTrue(all(a.arrangement!='additional_steel' for a in chosen['strut'].members.values()))
+        self.assertEqual(result['sizing_search']['exact_solves'],solver.call_count)
+        self.assertLessEqual(solver.call_count,8)
+        self.assertTrue(analysed(c,chosen,DesignCriteria(),rates)['design']['passes'])
+
+    def test_coupled_cost_trade_rejects_movement_failure_and_adopts_exact_pass(self):
+        from unittest import mock
+        from bracing_design import solve_selection,candidate_stiffness
+        from bracing_mixed_sizing import reduce_strut_brace_cost
+        c,s,p,rates = self.cost_trade_fixture()
+        load = 1.8*2*candidate_stiffness(s['roof_brace'])
+        def analysed(context,chosen,criteria,rates):
+            result = solve_selection(context,chosen,criteria,rates)
+            # Independent parallel-spring oracle exercises a genuine coupled
+            # cost trade: cold-formed struts alone lose stiffness; larger braces
+            # recover it. Member checks and beam sharing remain the real solver.
+            ea = sum(candidate_stiffness(chosen[g]) for g in ('roof_brace','wall_brace'))
+            ea += .05*sum(a.A*200000 for a in chosen['strut'].members.values())
+            ratio = load/ea
+            sls = result['design']['global_sls']
+            sls.update(ratio=ratio,movement_mm=ratio*sls['limit_mm'])
+            result['design']['passes'] = result['design']['member_checks_pass'] and ratio<=1 and result['design']['taut_tangent_verified']
+            return result
+        initial = analysed(c,s,DesignCriteria(),rates)
+        self.assertTrue(initial['design']['passes'])
+        with mock.patch('bracing_design.solve_selection',side_effect=analysed) as solver:
+            best,trials,used = reduce_strut_brace_cost(c,(initial,s),p,DesignCriteria(),rates,4)
+        self.assertEqual(used,solver.call_count)
+        self.assertLessEqual(used,4)
+        self.assertTrue(any(not t.get('passes',False) and not t['adopted'] for t in trials))
+        self.assertTrue(any(t['adopted'] for t in trials))
+        self.assertTrue(best[0]['design']['passes'])
+        self.assertLess(best[0]['design']['estimated_cost'],initial['design']['estimated_cost'])
+        self.assertTrue(analysed(c,best[1],DesignCriteria(),rates)['design']['passes'])
+
     def test_half_load_changes_continuous_support_and_adjacent_span_moments(self):
         run = solve_shared(fixture(), [8000., 8000.], 0)
         c = next(c for c in run['cases'] if c['name'] == 'ULS outward')
@@ -139,6 +331,29 @@ class SharedWorkspaceTests(unittest.TestCase):
         from bracing_analysis_desktop import prepare_context
         from bracing_workspace_ui import BracingAnalysisDialog
         return BracingAnalysisDialog(prepare_context(self.window), self.window.catalog, saved)
+
+    def test_added_pair_ui_roundtrip_and_legacy_profile_migration(self):
+        from bracing_analysis_desktop import prepare_context
+        from bracing_workspace_ui import BracingAnalysisDialog
+        context = prepare_context(self.window)
+        saved = {'strut_members': {'strut/bay/0/line/1': {'existing_count':1,
+                 'arrangement':PAIR_ARRANGEMENT, 'steel_section':'100*4 SHS', 'added_purlin_section':'C/Z 200 12'}}}
+        d = BracingAnalysisDialog(context,self.window.catalog,saved)
+        try:
+            editor = d.component_editor
+            self.assertIn('replaced',editor.added_purlin_combos['strut/bay/0/line/1'].toolTip())
+            d.run_analysis()
+            self.assertIsNotNone(d.result,d.status_label.text())
+            pair = d.selections()['strut'].members['strut/bay/0/line/1']
+            self.assertEqual(sum(not c['existing'] for c in pair.components),2)
+            self.assertTrue(all(same_profile_size(c['data']['section'],pair.location['purlin']['section']) for c in pair.components))
+            self.assertIn('2 added single-span ply/plies each carry 33.33%',d.report_text)
+            payload = d.snapshot()
+            restored = BracingAnalysisDialog(context,self.window.catalog,payload)
+            try:self.assertEqual(restored.snapshot(),payload)
+            finally:restored.reject()
+            json.dumps(d.result,allow_nan=False)
+        finally:d.reject()
 
     def test_current_layout_sizing_competes_with_steel_reanalyses_and_roundtrips(self):
         from bracing_design import solve_selection

@@ -10,6 +10,9 @@ Most UI wiring, model generation, analysis orchestration, preset handling, 2D
 plotting, 3D export, costing, optimisation and report text live in `main.py`.
 Specialist calculations are gradually being split into smaller modules.
 
+Last checked against the working source: **2026-11-01**. This includes
+uncommitted source changes; it does not describe only the latest packaged release.
+
 Generated or packaged output lives in `build/`, `dist/`, `release/` and
 `__pycache__/`. Do not inspect those first unless the task is explicitly about
 packaging output.
@@ -39,28 +42,36 @@ Release packaging is performed only when the user explicitly asks. Routine chang
 | `purlin_selection.py` | Joint general/edge roof-purlin selection: shared profile with independent thicknesses, ranked by installed material weight; exports passing profile comparisons. |
 | `loads.py` | Basic load dataclasses, load combinations, non-wind roof/wall/self-weight load application. |
 | `wind.py` | Wind input dataclasses, AS/NZS 1170.2-style wind calculation helpers, Cpe/Cpi logic, wind load application to roof and columns. |
-| `member_checks.py` | Steel member capacity checks and governing utilisation result objects. |
+| `member_checks.py` | Steel member capacity checks and governing utilisation result objects. Optional separate compression-body area preserves legacy behaviour when unset. |
+| `column_flybracing.py` | Automatic girt flybrace selection for clad columns, cached exact segment demands and same-case am; no frame solves. |
+| `column_flybracing_regression.py` | Segment/load-case provenance, tall-column brace growth, LTB/in-plane separation, caching and export regression. |
 | `end_wall.py` | UI-independent end-wall mullion layout, pinned-member strength selection and H/150 deflection checks. |
 | `bracing_layout.py` | Qt-free versioned bracing geometry and blocked/pinned panel constraints for desktop/BOLT; no structural analysis. See `BRACING_LAYOUT.md`. |
 | `bracing_layout_ui.py` | Interactive Qt-painted 3D location editor, face filters, local undo/redo and geometry review. |
 | `bracing_layout_regression.py` | Geometry/constraint validation, real canvas clicks, preset persistence, read-only review and no structural-credit regressions. |
 | `bracing_analysis.py` | Axial 3D network, tension-only rod equilibrium, portal interface condensation/recovery, building assembly, integrated end-wall loads and reaction balance. |
 | `bracing_analysis_desktop.py` | Actual portal/section adapter, eight directional end-wind cases, frozen result evidence and readable report. See `BRACING_ANALYSIS.md`. |
+| `bracing_diaphragm.py` | Optional SLS-only full-slope equivalent roof diagonals from adopted panel flexibility; explicit shear direction, physical panel-shear recovery and independent bare-model stability. `bracing_diaphragm_regression.py` checks stiffness, reversal, ULS separation, sizing and saved UI behavior. |
 | `bracing_analysis_ui.py` | Compatibility import for the combined bracing workspace. |
-| `bracing_workspace_ui.py` | One-window selector, section/criterion inputs, visual results, cost sizing, member inspection and TXT/JSON export. |
-| `bracing_design.py` | Scoped tension/buckling/interaction and local deflection checks; material/fitting cost and reanalysed grouped catalogue sizing. See `BRACING_DESIGN.md`. |
+| `bracing_calculation_cache.py`, `bracing_cache_regression.py` | Compressed optional result cache with current-model/input/engine fingerprints; reopen/job persistence, stale/corrupt rejection, preserved failure diagnostics and input-hash separation. |
+| `bracing_serviceability_regression.py` | Strength-only versus combined ULS/SLS scope, exhaustive grouped cost comparison, mixed purlin sizing, mandatory strength/stability/material checks, toggle persistence and cache invalidation. |
+| `bracing_mullion_design.py`, `bracing_alignment_regression.py` | Main/3D shared mullion wind-bending plus bracing-axial checks, native properties/restraint, baseline prerequisites and checked main adoption; eave tributary geometry, pressure-area scaling, costing and cached reopen regression. |
+| `bracing_workspace_ui.py` | One-window selector, section/criterion inputs, visual results, cost sizing, member inspection and TXT/JSON export. Persistent failure categories and x1 governing-movement navigation use `bracing_sizing_diagnostics.py`; the canvas circles the governing SLS node. |
+| `bracing_design.py` | Scoped tension/buckling/interaction and local deflection checks; material/fitting cost and reanalysed grouped catalogue sizing. Available-EA ceilings prevent false saturation stops; remaining solve budget checks cheaper/preferred groups with exact acceptance. `bracing_mixed_sizing.py` shares those helpers. See `BRACING_DESIGN.md`. |
+| `bracing_policy.py`, `bracing_policy_regression.py` | Agricultural wire/commercial rod preferences, mandatory rod eligibility on active unclad wall groups, whole-design preference/cost ranking and policy evidence; real-solve and UI regression checks using synthetic rope EA/prices only. |
 | `bracing_design_regression.py` | Independent capacity/cost workings, tiny exhaustive sizing comparison, real orbit/member picking and transactional workspace save/sizing. |
-| `bracing_components.py`, `bracing_component_ui.py` | Per-location installed/added purlin and steel assemblies, axial/bending ratings, common-end force sharing and rope EA/price input. |
+| `bracing_components.py`, `bracing_component_ui.py` | Per-location installed/added purlin and steel assemblies, axial/bending ratings, common-end force sharing and rope EA/price input. Wire stiffness defaults blank ratings to the explicit interim 200 GPa / nominal area assumption; declared EA overrides and the adopted basis are saved and exported. `bracing_schedule.py` holds supplied rope rates and the M10/M12 turnbuckle allowances, with price-source evidence and legacy migration. |
 | `purlin_combined.py` | Adopted Lysaght May 1999 simplified compression/bending calculation; Metroll C/Z web-axis properties; calculated member tension using G450 minima and explicit net-area/kt assumptions, or preserved declared Nt; source evidence and worked output. |
-| `purlin_shared_design.py` | User-adopted 50/50 applied roof-load allocation, existing-run/added single-span beam demands and explicitly preliminary table-reference checks; catalogue candidates and cached reference solves. |
+| `purlin_shared_design.py` | User-adopted single-addition 50/50 run/added allocation and two-addition equal-per-ply allocation; existing-run/added single-span beam demands and explicitly preliminary table-reference checks. Candidates/frozen checks enforce matching roof profile size; each added ply is checked and costed independently. |
 | `purlin_strut_tables.py` | In-range manufacturer UDL-table interpolation with stated bridging and frozen source rows; separate single/double/five-span reference arrangements. |
 | `purlin_strut_regression.py` | Independent asymmetric two-span statics, single-span responses, load conservation/self-weight, table/reference limits, sizing, UI invalidation and persistence. |
 | `purlin_beam.py`, `purlin_beam_design.py` | Roof-run Euler-Bernoulli model, finite distributed cladding coupling, direct load pickup, single-span additions, demand evidence and gated M/V/axial checks. |
 | `purlin_beam_ui.py`, `purlin_beam_regression.py` | Native moment/shear/deflection/transfer plots; independent beam and load-sharing benchmarks, whole-run sizing and workspace persistence tests. |
 | `bracing_schedule.py` | Supplied Grade 300 rod and Grade 1570 rope factored capacities, exact turnbuckle sizes and source image evidence. |
-| `bracing_mixed_sizing.py`, `bracing_components_regression.py` | Bounded per-location incremental-cost sizing with exact reanalysis; sharing, missing/stale ratings, schedule capacities and saved UI regression. |
+| `bracing_mixed_sizing.py`, `bracing_components_regression.py` | Bounded per-location incremental-cost sizing with exact reanalysis; locally checked EA ceilings and coupled purlin/brace cost trials share the 18-analysis cap. Sharing, missing/stale ratings, schedule capacities and saved UI regression. |
 | `bracing_sizing_diagnostics.py` | Specific sizing-stop reasons and rejected alternatives; retains unchanged-input analysis and directs the workspace to the relevant rating row. |
 | `bracing_analysis_regression.py` | Closed-form mechanics, unreduced/reduced comparison, load/moment integration, missing-path failures and real offscreen desktop/export checks. |
+| `bracing_analysis_desktop.end_wind_cases` | End-pressure cases use along-wind length/span Cp,e, contributing end/internal surface Kc and explicit pressure-source evidence; frictional drag and transverse-wind cases remain excluded. |
 | `crane_beam.py` | Crane runway beam input/result dataclasses and section checks. |
 | `storage_loads.py` | Stored-material pressure/load calculations, storage panel design, storage load application and summary text. |
 | `elevation_drawings.py` | PDF elevation/plan/section drawing export using Qt painting. |
@@ -71,7 +82,21 @@ Release packaging is performed only when the user explicitly asks. Routine chang
 | `licensing.py` | Desktop license token storage, machine ID, local verification, activation and refresh client. |
 | `license_server.py` | FastAPI license server, SQLite persistence, key generation, admin routes and CLI helpers. |
 | `license_generator_app.py` | Admin-only PySide license generator/client. |
-| `smoke_checks.py` | Compile checks plus non-visual and UI smoke tests. |
+| `bracing.py` | Legacy UI-independent preliminary longitudinal bracing calculation; distinct from the explicit 3D network in `bracing_analysis.py`. |
+| `reduced_optimizer.py` | Qt-free physics-guided stiffness screening, catalogue frontiers, candidate projection and static condensation; full-engine checking remains the acceptance gate. |
+| `physics_optimiser_regression.py` | Real-frame reduced-screen evaluation and optional comparison with production optimisation. |
+| `future_canopy_design.py`, `future_canopy_design_regression.py` | Merge primary-steel/reinforcement schedules and recheck the same physical frame before/after canopy installation. Desktop orchestration uses Qt. See `FUTURE_CANOPY_DESIGN.md`. |
+| `future_solar_design.py` | Four-state bare/canopy/solar/combined verification and bounded repair of one common schedule. See `FUTURE_SOLAR_DESIGN.md`. |
+| `hay_shed_backend.py` | Search-specific backend and build-now cost objective, preserving future-condition structural checks. |
+| `hay_shed_search.py`, `hay_shed_search_regression.py` | Resumable process-parallel geometry search, exact proposal reload, ranking and policy regressions. See `HAY_SHED_SEARCH.md`. |
+| `hay_shed_check.py`, `hay_shed_orientation.py` | Saved-input exact rechecking and orientation-factor assessment respectively. |
+| `hay_shed_pair.py`, `hay_shed_staged.py`, `hay_shed_fixed_bearing.py` | Paired solar/no-solar searches, staged geometry refinement and fixed-bearing actual-region verification. |
+| `hay_shed_future_solar.py`, `hay_shed_optional_solar_report.py` | Four-state checking of search finalists and assembly of the completed-study report. |
+| `hay_shed_pitch_bale_study.py`, `hay_shed_pitch_matched_check.py` | Separate pitch/storage study and matched-geometry checks against its saved leaders. |
+| `hay_shed_report.py`, `hay_shed_bale_comparison.py`, `hay_shed_pitch_bale_report.py` | Study-specific report generation and storage-capacity ranking of saved results. |
+| `purlin_selection_regression.py` | Compatible general/edge profile selection and real roof-selection integration checks. |
+| `storage_load_path_regression.py`, `wind_envelope_regression.py`, `web_force_envelope_regression.py` | Focused storage transfer, directional wind and web force-envelope regressions. |
+| `smoke_checks.py` | Compile checks plus non-visual and UI smoke tests; selected specialist suites are also invoked here. |
 
 ## Key Data Files
 
@@ -83,38 +108,50 @@ Release packaging is performed only when the user explicitly asks. Routine chang
 
 ## Main.py Landmarks
 
-`main.py` is currently the high-context file. Use these landmarks before doing a
-wide read:
+Use symbol names with `rg -n` rather than fixed line numbers: this file changes
+frequently and the old line-number map had drifted substantially.
 
-- Lines 1-120: imports, environment settings, global constants and release text.
-- Around 300: section catalogue model (`SectionProfile`, `ShapeCatalog`).
-- Around 540: 2D finite-element primitives (`Node`, `FrameElement2D`, `Structure2D`).
-- Around 965: custom wall envelope selector widgets; button contrast and rotated labels live here.
-- Around 1151: 2D matplotlib plotting canvas.
-- Around 1712: concept 3D viewers, including OpenGL rendering.
-- Around 2492: `MainWindow` starts; the app-level combo-box mouse-wheel filter is installed here.
-- Around 3176: `MainWindow.build_ui`, the main tab/control construction.
-- Around 4390: engineering tooltips.
-- Around 5008: storage load UI input conversion.
-- Around 5229: crane beam UI/helper logic.
-- Around 6070: preset/default file locations and optimisation learning paths.
-- Around 6723: collect preset data.
-- Around 7016: apply preset data.
-- Around 7393: solve helpers and preset history.
-- Around 7704: elevation drawing export wrapper; implementation is in `elevation_drawings.py`.
-- Around 8161: costing/foundation wrappers; costing implementation is in `costing.py`.
-- Around 8338: structural support/restraint/purlin/foundation helpers.
-- Around 8647: wind input creation from UI.
-- Around 8732: UI visibility/theme/license status updates.
-- Around 8998: `generate_and_solve`, main model creation and analysis entry point.
-- Around 11100: member/check envelope calculation across load combinations.
-- Around 13050: auto-sizing candidate and optimisation logic.
-- Around 15560: section check result text.
-- Around 15860: thin costing text wrapper; implementation is in `costing.py`.
-- Around 16760: foundation text.
-- Around 16921: final results text.
-- Around 17055: plot refresh.
-- Around 17115: desktop app startup and license gate.
+| Area | Search symbols in `main.py` |
+| --- | --- |
+| Catalogue and section data | `SectionProfile`, `ShapeCatalog`, `PurlinLayout` |
+| 2D finite-element primitives and solver | `Node`, `FrameElement2D`, `Structure2D` |
+| Envelope widgets and plotting | `CompassSelector`, `BuildingEnvelopeSelector`, `PlotCanvas` |
+| Embedded 3D viewers | `Concept3DViewer`, `OpenGLConcept3DViewer` |
+| Desktop construction | `MainWindow`, `build_ui`, `apply_engineering_tooltips` |
+| Frozen service/review evidence | `calculation_design_dossier` |
+| Defaults and preset persistence | `factory_defaults_paths`, `load_factory_defaults`, `load_default_inputs`, `collect_preset_data`, `apply_preset_data` |
+| Drawing export wrapper | `export_elevation_sheet` |
+| Foundation calculations | `foundation_design_from_reactions`, `foundation_design_from_envelopes` |
+| Wind input conversion | `wind_inputs_from_ui` |
+| Model construction and topology selection | `generate_and_solve`, `_generate_and_solve_once` |
+| Load-case checking and envelope assembly | `member_check_envelope_lines` |
+| Physics optimisation integration | `run_physics_structure_optimisation` |
+| Full optimiser orchestration | `auto_size_current_preset`, `auto_size_local_search` |
+| Results and report text | `update_section_checks_text`, `update_costing_text`, `update_foundation_text`, `update_results_text` |
+| Plot refresh | `refresh_plot` |
+| Desktop startup and licence gate | `if __name__ == "__main__"` |
+
+## Dependency Boundaries
+
+- The Qt-free calculation modules include `loads.py`, `wind.py`,
+  `member_checks.py`, `column_flybracing.py`, `end_wall.py`, `storage_loads.py`,
+  `crane_beam.py`, `purlin_selection.py` and `reduced_optimizer.py`.
+- The newer bracing/purlin features generally split geometry, mechanics,
+  design/policy, desktop adaptation and Qt widgets into separate modules.
+  Shared purlin modules currently obtain common types from `bracing_analysis.py`.
+- `portalcalc_service.py` is a Qt-free request/result boundary. Its production
+  compatibility backend in `portalcalc_headless.py` still constructs an offscreen
+  `MainWindow`; headless execution is not yet an independent calculation engine.
+- `future_canopy_design.py`, `future_solar_design.py` and the hay-shed backend
+  orchestrate that existing engine; they are not part of a separate solver.
+- `computation_report.py` renders frozen evidence rather than solving a model.
+  `computation_report_data.py` has local imports of two engineering constants
+  from `main.py`; this is a remaining reverse dependency on the desktop module.
+- `bracing_design.py` dispatches locally to `bracing_mixed_sizing.py`, which
+  imports shared helpers back from `bracing_design.py`. The delayed import
+  avoids an eager import loop but the design dependency is still bidirectional.
+- Desktop licensing, the FastAPI licence server and the admin desktop app have
+  separate entry points and packaging responsibilities.
 
 ## Common Change Routes
 
@@ -207,9 +244,28 @@ analysis orchestration, exports, reports and optimisation. When touching a
 feature repeatedly, consider extracting the calculation or pure data assembly
 into a focused module first, then leave `main.py` as the UI/orchestration layer.
 
-Good extraction candidates:
+Prioritise small extractions with regression coverage:
 
-- Foundation reaction/design summaries.
-- Preset schema conversion and backward compatibility.
-- Auto-sizing/optimisation search logic.
-- UI-independent purlin/girt checks.
+1. Move shared engineering constants/types out of `main.py` and shared bracing
+   sizing helpers out of the two mutually dependent sizing modules.
+2. Extract section catalogue and 2D solver primitives, preserving existing
+   imports while callers migrate. These are natural foundations for a Qt-free
+   model builder.
+3. Move preset conversion and widget-to-input conversion behind plain data
+   contracts, then extract model construction and checked result assembly.
+4. Move optimiser state/search orchestration behind the same calculation
+   boundary. Retain the reduced screen and full exact-check acceptance gate.
+5. Extract remaining foundation and purlin/girt calculation helpers as their
+   features are edited.
+
+The source already batches first-order load cases into a single matrix solve,
+uses load/topology/wind caches, parallelises case evaluation and screens
+optimiser candidates with reduced stiffness models. Column flybracing reuses
+solved demands rather than rerunning frame analysis. These are concrete
+performance measures, not a substitute for timing representative jobs. Dense
+matrix storage and offscreen window construction remain profiling candidates;
+there is no measured evidence here that either is the dominant cost.
+
+The root directory also contains study-specific scripts alongside reusable app
+modules and tests. Grouping them into packages can improve navigation later,
+but moving files alone will not remove the calculation/UI coupling.

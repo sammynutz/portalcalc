@@ -57,7 +57,9 @@ def mullion_layout(span_mm, eave_height_mm, pitch_deg, roof_shape, spacing_overr
     }
 
 
-def _profile_design(profile, height_mm, tributary_width_mm, strength_pressure_kpa, service_pressure_kpa):
+def mullion_profile_design(profile, height_mm, tributary_width_mm, strength_pressure_kpa, service_pressure_kpa,
+                           *, axial_force_kn=0., effective_length_factor=.5, moment_modifier=1.75,
+                           deflection_divisor=MULLION_DEFLECTION_DIVISOR):
     tributary_width_m = tributary_width_mm / 1000.0
     strength_line_load_kn_m = max(float(strength_pressure_kpa), 0.0) * tributary_width_m
     service_line_load_kn_m = max(float(service_pressure_kpa), 0.0) * tributary_width_m
@@ -66,14 +68,15 @@ def _profile_design(profile, height_mm, tributary_width_mm, strength_pressure_kp
     shear_kn = strength_line_load_kn_m * height_m / 2.0
     mass_kg_m = max(float(profile.A), 0.0) * 1e-6 * STEEL_DENSITY_KG_M3
     self_weight_compression_kn = 1.2 * mass_kg_m * GRAVITY_M_S2 * height_m / 1000.0
-    effective_length_mm = height_mm / 2.0
+    effective_length_mm = height_mm * effective_length_factor
     actions = MemberActions(
-        compression_kn=self_weight_compression_kn,
+        compression_kn=self_weight_compression_kn+max(-axial_force_kn,0.),
+        tension_kn=max(axial_force_kn,0.),
         shear_kn=shear_kn,
         moment_knm=moment_knm,
         effective_length_y_mm=effective_length_mm,
         effective_length_z_mm=effective_length_mm,
-        moment_modifier=1.75,
+        moment_modifier=moment_modifier,
         kt=1.0,
         kl=1.0,
         kr=1.0,
@@ -82,7 +85,7 @@ def _profile_design(profile, height_mm, tributary_width_mm, strength_pressure_kp
     inertia_mm4 = max(float(profile.I_analysis), 1.0)
     # kN/m is numerically equal to N/mm.
     deflection_mm = 5.0 * service_line_load_kn_m * height_mm**4 / (384.0 * E_STEEL_MPA * inertia_mm4)
-    deflection_limit_mm = height_mm / MULLION_DEFLECTION_DIVISOR
+    deflection_limit_mm = height_mm / deflection_divisor
     deflection_ratio = deflection_mm / deflection_limit_mm if deflection_limit_mm > 0.0 else float("inf")
     strength_ratio = check.governing_ratio
     return {
@@ -155,7 +158,7 @@ def design_end_wall_mullions(
     for profile in candidates:
         if profile is None:
             continue
-        item = _profile_design(
+        item = mullion_profile_design(
             profile,
             governing_mullion["height_mm"],
             governing_mullion["tributary_width_mm"],

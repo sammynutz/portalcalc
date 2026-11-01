@@ -16,7 +16,8 @@ from bracing_analysis import AnalysisError, PortalReduction
 from bracing_analysis_desktop import prepare_context
 from bracing_analysis_regression import frame
 from bracing_design import (DesignCriteria, auto_size, group_cost, member_assessment,
-                            solve_selection)
+                            solve_selection, candidate_stiffness, stiffness_ceiling)
+from bracing_sizing_diagnostics import SizingStopped
 from bracing_layout import BracingLayout, LayoutGeometry
 
 
@@ -34,23 +35,47 @@ def rod(d):
 
 
 class DesignMechanicsTests(unittest.TestCase):
+    def test_apex_roof_tributary_width_is_half_actual_sheet_span_not_frame_span(self):
+        from bracing_analysis_desktop import apex_tributary_widths
+        self.assertEqual(apex_tributary_widths([(-1200,0),(0,0),(1200,0)],(0,0)),[600.,600.])
+        self.assertEqual(apex_tributary_widths([(-1800,0),(0,0),(1200,0)],(0,0)),[900.,600.])
+        self.assertEqual(apex_tributary_widths([(0,0),(1200,0)],(0,0)),[])
     @classmethod
     def setUpClass(cls):
         from main import ShapeCatalog
         cls.catalog = ShapeCatalog("Shape_Catalog.xlsx")
 
-    def test_net_fracture_has_independent_085_multiplier(self):
+    def test_adopted_brace_tension_is_09_gross_yield_connections_separate(self):
         criteria = DesignCriteria()
         area = math.pi*16**2/4
-        expected = .9*min(area*250, .85*.85*.70*area*410)/1000
+        expected = .9*area*300/1000
         row = member_assessment(member_fixture(), 0, rod(16), criteria)
         self.assertAlmostEqual(row["case_checks"][0]["capacity_kn"], expected, places=9)
         self.assertAlmostEqual(row["ratio"], 40/expected, places=9)
-        self.assertFalse(row["passes"])
+        self.assertTrue(row["passes"])
+        self.assertTrue(row['case_checks'][0]['preliminary'])
+        self.assertFalse(row['case_checks'][0]['connections_checked'])
+        reduced = member_assessment(member_fixture(),0,rod(16),replace(criteria,net_area_factor=.1,tension_distribution_factor=.1))
+        self.assertEqual(reduced['case_checks'][0]['capacity_kn'],expected)
         with self.assertRaises(AnalysisError):
             replace(criteria, net_area_factor=1.01).validate()
         with self.assertRaises(AnalysisError):
             replace(criteria, brace_fu_mpa=200).validate()
+
+    def test_bracing_compression_area_is_independent_of_tension_connection_factors(self):
+        from bracing_design import section_properties
+        from member_checks import compression_section_capacity_kn, member_compression_capacity_kn, MemberActions
+        profile = self.catalog.profile_by_name['100*4 SHS']
+        a = section_properties(profile,DesignCriteria(net_area_factor=.7))
+        b = section_properties(profile,DesignCriteria(net_area_factor=.2,tension_distribution_factor=.1))
+        self.assertEqual(a.compression_area_mm2,profile.A)
+        self.assertAlmostEqual(compression_section_capacity_kn(a),.9*a.kf*profile.A*a.fy_mpa/1000)
+        actions = MemberActions(effective_length_y_mm=8000.,effective_length_z_mm=8000.)
+        self.assertEqual(member_compression_capacity_kn(a,actions),member_compression_capacity_kn(b,actions))
+        # General engine callers retain their original net-area behaviour when
+        # no separate compression-body area is declared.
+        legacy = replace(a,compression_area_mm2=None)
+        self.assertAlmostEqual(compression_section_capacity_kn(legacy),.7*compression_section_capacity_kn(a))
 
     def test_physical_cost_counts_slack_rods_fittings_waste_stock_and_rates(self):
         fixture = member_fixture(length=5000)
@@ -130,6 +155,61 @@ class DesignMechanicsTests(unittest.TestCase):
         with self.assertRaises(AnalysisError):
             auto_size(context, selections, candidates, replace(DesignCriteria(), sls_divisor=100000),
                       {"shs": 3., "ub": 4., "wb": 5.}, max_solves=4)
+
+    def collector_fixture(self, overload=1.25):
+        """Independent parallel-spring SLS oracle; real member checks remain."""
+        context, selected, pools = self.small_context()
+        selected.update(roof_brace=rod(16), wall_brace=rod(16))
+        pools['wall_brace'] = [rod(16)]  # already at its catalogue maximum
+        pools['roof_brace'] = [rod(16), rod(20)]
+        stiffness_load = overload*2*candidate_stiffness(rod(16))
+        real_solve = solve_selection
+        def analysed(c, sections, criteria, rates):
+            result = real_solve(c, sections, criteria, rates)
+            # For two parallel collector springs, displacement is P/(k1+k2).
+            ratio = stiffness_load/sum(candidate_stiffness(sections[g]) for g in ('roof_brace', 'wall_brace'))
+            sls = result['design']['global_sls']
+            sls.update(ratio=ratio, movement_mm=ratio*sls['limit_mm'])
+            result['design']['passes'] = result['design']['member_checks_pass'] and ratio <= 1 and result['design']['taut_tangent_verified']
+            return result
+        return context, selected, pools, analysed
+
+    def test_saturated_group_can_remain_while_other_groups_meet_sls(self):
+        c,s,p,analysed = self.collector_fixture()
+        with mock.patch('bracing_design.solve_selection', side_effect=analysed) as solver:
+            result, chosen = auto_size(c,s,p,DesignCriteria(),{'shs':3.,'ub':4.,'wb':5.},max_solves=8)
+        self.assertTrue(result['design']['passes'])
+        self.assertEqual(chosen['wall_brace']['label'], '16 DIA ROD')
+        self.assertEqual(chosen['roof_brace']['label'], '20 DIA ROD')
+        self.assertAlmostEqual(result['design']['global_sls']['ratio'], 1.25*2*16**2/(16**2+20**2))
+        self.assertLessEqual(solver.call_count, 8)
+        self.assertEqual(solver.call_count, result['sizing_search']['exact_solves'])
+        # The cheaper 16 mm roof alternative fails the exact SLS oracle and
+        # must not overwrite the passing sections or their frozen evidence.
+        self.assertTrue(any(not r.get('passes', False) and not r['adopted'] for r in result['sizing_search']['cost_reduction_trials']))
+        self.assertEqual(result['design_request']['sections']['roof_brace'], chosen['roof_brace']['label'])
+
+    def test_exhausted_bounded_search_retains_inputs_and_reports_movement(self):
+        c,s,p,analysed = self.collector_fixture(overload=10.)
+        with mock.patch('bracing_design.solve_selection', side_effect=analysed):
+            with self.assertRaises(SizingStopped) as caught:
+                auto_size(c,s,p,DesignCriteria(),{'shs':3.,'ub':4.,'wb':5.},max_solves=5)
+        error = caught.exception
+        self.assertEqual(error.diagnostic['input_target'], 'layout')
+        self.assertIn('not proof', error.diagnostic['action'])
+        self.assertEqual(error.result['design_request']['sections']['roof_brace'], '16 DIA ROD')
+        self.assertGreater(error.diagnostic['screening_global_sls']['ratio'], 1.)
+        json.dumps(error.result, allow_nan=False)
+
+    def test_stiffness_ceiling_excludes_unpriced_and_policy_ineligible_sections(self):
+        from bracing_schedule import rod_options
+        c,s,p = self.small_context()
+        c['face_cladding'] = {'left_wall': False, 'right_wall': True}
+        result = solve_selection(c,s,DesignCriteria(),{'shs':3.,'ub':4.,'wb':5.})
+        rods = rod_options()
+        angle = {'label': 'EA 100x100x10', 'area_mm2': 1900.}
+        ceiling = stiffness_ceiling(c,result,'wall_brace',[*rods,angle],{'shs':3.,'ub':4.,'wb':5.})
+        self.assertAlmostEqual(ceiling, candidate_stiffness(rods[2]))  # M28 unpriced, angle prohibited
 
 
 class WorkspaceTests(unittest.TestCase):

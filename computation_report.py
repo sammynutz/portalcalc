@@ -277,6 +277,8 @@ class Report:
         return self.case_ids.get(name, str(name or "-"))
 
     def source(self, item):
+        if 'from_mm' in item:
+            return f"{fmt(item['from_mm'], 0)}-{fmt(item['to_mm'], 0)} mm / {self.case_ref(item.get('combo'))}\nam {fmt(item.get('am'))}"
         member = item.get("member", "-")
         prefix = f"M{member}" if str(member).isdigit() else str(member)
         return f"{prefix} / {self.case_ref(item.get('combo'))}"
@@ -513,6 +515,8 @@ class Report:
             self.heading(f"{record['label']} / {record['profile']}", 2)
             self.p(f"Governing result: {record['governing']} | utilisation {fmt(record['ratio'])} | {'OK' if record['ratio'] <= 1 + 1e-9 else 'NOT OK'}")
             self.properties(record)
+            if record['restraint'].get('flybraces'):
+                self.p('Each check row below has its own governing segment and load case. Worked values use the overall governing segment. LTB length is independent of the in-plane compression length.', 'small')
             for note in record["notes"]:
                 self.p(note)
             if record["group"] == "INTERNAL_COLUMN":

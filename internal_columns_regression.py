@@ -1,4 +1,4 @@
-"""Offscreen checks for arbitrary internal supports and legacy preset compatibility."""
+"""Offscreen checks for column restraints, internal supports and preset compatibility."""
 import copy
 import json
 import math
@@ -42,6 +42,44 @@ class InternalColumnsRegression(unittest.TestCase):
         self.assertIsNotNone(self.window.displacements)
         self.assertTrue(np.isfinite(self.window.displacements).all())
         self.assertTrue(self.window.design_envelope_actions)
+
+    def test_clad_column_factors_follow_wall_state(self):
+        w = self.window
+        for side in ("left", "right"):
+            getattr(w, f"{side}_canopy_length_input").setText("6")
+            getattr(w, f"{side}_canopy_type_combo").setCurrentText("Lean-to")
+        for left_clad in (True, False):
+            with self.subTest(left_clad=left_clad):
+                w.envelope_plan_selector.set_wall_states({
+                    "left": left_clad, "right": not left_clad,
+                    "front": True, "back": True,
+                })
+                for side, clad in (("left", not left_clad), ("right", left_clad)):
+                    getattr(w, f"{side}_lean_outer_wall_clad_combo").setCurrentText("Yes" if clad else "No")
+                    getattr(w, f"{side}_lean_enclosure_selector").set_wall_states({side: clad})
+                self.solve()
+                rows = {row["group"]: row for row in w.column_stability_context_rows()}
+                for group, clad in (("LEFT_COLUMN", left_clad), ("RIGHT_COLUMN", not left_clad),
+                                    ("LEFT_LEAN_COLUMN", not left_clad), ("RIGHT_LEAN_COLUMN", left_clad)):
+                    with self.subTest(group=group):
+                        restraint = w.member_check_restraints[group]
+                        self.assertEqual(restraint["clad"], clad)
+                        expected_ke, expected_am = (1.0, 1.3) if clad else (0.85, 1.75)
+                        actions = w.member_actions_from_envelope(w.design_envelope_actions[group], group)
+                        if clad:
+                            plan = rows[group]['flybrace_schedule']
+                            self.assertIsNotNone(plan)
+                            self.assertEqual(actions.effective_length_z_mm, plan['in_plane_length_mm'])
+                            self.assertIsNotNone(actions.ltb_length_mm)
+                            self.assertTrue(0 < actions.moment_modifier <= 2.5)
+                            expected_am = actions.moment_modifier
+                        else:
+                            self.assertAlmostEqual(actions.effective_length_y_mm, expected_ke * restraint["minor_mm"])
+                            self.assertAlmostEqual(actions.effective_length_z_mm, expected_ke * restraint["major_mm"])
+                            self.assertEqual(actions.moment_modifier, expected_am)
+                        self.assertEqual(rows[group]["effective_length_factor_ke"], expected_ke)
+                        self.assertEqual(rows[group]["moment_modifier_am"], expected_am)
+                self.assertIn("am is calculated from each segment", w.section_checks_box.toPlainText())
 
     def test_custom_layouts_and_connections(self):
         w = self.window

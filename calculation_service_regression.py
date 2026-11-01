@@ -20,6 +20,8 @@ BASELINE_INPUT_DIGEST = "d27bc5545310f2dfaa95b316d3e595b28291d737fd535297412eda9
 # Updated after retaining independent compression/tension forces in the web
 # envelope. The request remains identical; separate native regression replays
 # the former false pass and asserts that its buckling failure is now detected.
+# autoSize updated for automatic girt flybracing and same-case segment am.
+# Cached segment checks allow lighter columns; the final exact solve is retained.
 BASELINE = {
     "checkSpecified": {
         "verified": False,
@@ -36,11 +38,11 @@ BASELINE = {
     },
     "autoSize": {
         "verified": True,
-        "ratio": 0.9815093042284594,
-        "group": "LEFT_COLUMN",
+        "ratio": 0.9912653065612982,
+        "group": "RIGHT_COLUMN",
         "check": "Combined",
         "sections": {
-            "left_column": "250 UB 31.4 (31.5 kg/m)",
+            "left_column": "310 UB 32.0 (32.0 kg/m)",
             "right_column": "250 UB 31.4 (31.5 kg/m)",
             "top_chord": "75*3 SHS (6.6 kg/m)",
             "bottom_chord": "75*3 SHS (6.6 kg/m)",

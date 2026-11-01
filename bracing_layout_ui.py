@@ -20,6 +20,8 @@ class BracingLayoutCanvas(QWidget):
         super().__init__(parent)
         self.layout_model = layout
         self.face = ""
+        self.face_cladding = {}
+        self.show_cladding = True
         self.azimuth, self.elevation = -135.0, 28.0
         self.selected = None
         self.read_only = False
@@ -37,6 +39,17 @@ class BracingLayoutCanvas(QWidget):
         self.setMinimumSize(480, 350)
         self.setMouseTracking(True)
         self.setAccessibleName("3D bracing panels. Click to edit; drag to rotate. Use the panel list for keyboard selection.")
+
+    def set_cladding(self, faces):
+        self.face_cladding = {face: bool(value) for face, value in faces.items()
+                              if face in {'left_wall', 'right_wall', 'front_end', 'back_end'}}
+        self.update()
+
+    def orientation_label(self, face):
+        label = {'left_wall': 'LEFT', 'right_wall': 'RIGHT', 'front_end': 'FRONT', 'back_end': 'BACK'}[face]
+        if face in self.face_cladding:
+            label += ' (CLAD)' if self.face_cladding[face] else ' (OPEN)'
+        return label
 
     def set_layout(self, layout):
         self.layout_model = layout
@@ -74,7 +87,13 @@ class BracingLayoutCanvas(QWidget):
     def member_description(self, identifier):
         if not self.result:
             return ""
-        member = next(m for m in self.result["cases"][self.case_index]["members"] if m["id"] == identifier)
+        case = self.result['cases'][self.case_index]
+        member = next(m for m in case['members']+case.get('diaphragm_members', []) if m['id'] == identifier)
+        if member['kind'] == 'roof_diaphragm':
+            return (f"{identifier}\nSLS equivalent diaphragm: {member['axial_n']/1000:.3f} kN ({member['state']})"
+                    f"\nPhysical panel shear component ({member['shear_direction']}): {member['panel_shear_kn']:.3f} kN; "
+                    f"boundary flow component {member['shear_flow_kn_per_m']:.3f} kN/m. Net panel shear is in Full results."
+                    '\nStiffness surrogate; sheet, fastener and collector capacities are not checked.')
         check = self.result.get("section_checks", {}).get(identifier, {})
         ratio = check.get("ratio")
         uc = f"{ratio:.1%}" if ratio is not None else "not checked"
@@ -123,6 +142,10 @@ class BracingLayoutCanvas(QWidget):
             pinned = panel.id in self.layout_model.pinned
             color = QColor("#d74343" if blocked else "#128265" if pinned else "#50748d")
             color.setAlpha(55 if blocked and active else 45 if pinned and active else 13 if active else 3)
+            if self.show_cladding and self.face_cladding.get(panel.face, False):
+                painter.setBrush(QColor(72, 128, 161, 42 if active else 22))
+                painter.setPen(Qt.NoPen)
+                painter.drawPolygon(polygon)
             painter.setBrush(color)
             painter.setPen(QPen(QColor("#8b9eac" if active else "#d1dbe2"), .8))
             painter.drawPolygon(polygon)
@@ -153,7 +176,8 @@ class BracingLayoutCanvas(QWidget):
         if self.result is not None and self.result_mode != "layout":
             points = self.result_points(self.result_mode == "deformed")
             original = self.result_points()
-            members = self.result["cases"][self.case_index]["members"]
+            case = self.result['cases'][self.case_index]
+            members = case['members']+case.get('diaphragm_members', [])
             maximum = max((abs(m["axial_n"]) for m in members), default=1.) or 1.
             draw = []
             for member in members:
@@ -166,6 +190,8 @@ class BracingLayoutCanvas(QWidget):
                     color = "#a43db2"
                 else:
                     color = "#c1c8ce" if member["state"] == "slack" else "#ce4d43" if member["axial_n"] >= 0 else "#287bb4"
+                if member['kind'] == 'roof_diaphragm':
+                    color = '#8bbab5' if member['state'] == 'slack' else '#008c82'
                 width = 1.5+2*abs(member["axial_n"])/maximum
                 draw.append(((a[1]+b[1])/2, a[0], b[0], color, width, member))
             for depth, a, b, color, width, member in sorted(draw, key=lambda item: item[0]):
@@ -173,9 +199,20 @@ class BracingLayoutCanvas(QWidget):
                     painter.setPen(QPen(QColor("#bac8d2"), 1, Qt.DashLine))
                     painter.drawLine(project(original[member["start"]])[0], project(original[member["end"]])[0])
                 selected = member["id"] == self.member_selected
-                painter.setPen(QPen(QColor("#e69b18" if selected else color), 4.5 if selected else width))
+                painter.setPen(QPen(QColor("#e69b18" if selected else color), 4.5 if selected else width,
+                                    Qt.DashLine if member['kind'] == 'roof_diaphragm' else Qt.SolidLine))
                 painter.drawLine(a, b)
                 self.hit_members.append((a, b, member["id"], depth))
+            sls = self.result.get('design', {}).get('global_sls', {})
+            if self.result_mode == 'deformed' and self.result['cases'][self.case_index]['case']['name'] == sls.get('case'):
+                point = project(points[sls['node']])[0]
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(QColor('#c43b3b' if sls['ratio'] > 1 else '#128265'), 2.5))
+                painter.drawEllipse(point, 8, 8)
+                label = f"Longitudinal: {sls['movement_mm']:.1f} / {sls['limit_mm']:.1f} mm"
+                width = painter.fontMetrics().horizontalAdvance(label)+8
+                label_point = QPointF(max(16., min(point.x()+12, self.width()-width-16.)), max(48., point.y()-12))
+                painter.drawText(label_point, label)
         painter.setPen(QColor("#284960"))
         font = painter.font()
         font.setPointSize(9)
@@ -183,10 +220,21 @@ class BracingLayoutCanvas(QWidget):
         painter.drawText(QRectF(16, 8, self.width() - 32, 36), Qt.TextWordWrap,
                          ("Click a member to inspect  |  Drag to orbit" if self.result is not None and self.result_mode != "layout" else
                           "Click a panel to edit  |  Drag to orbit  |  Filter a face to reach hidden panels"))
-        front = project((g.span_mm / 2, 0, 0))[0]
-        back = project((g.span_mm / 2, g.length_mm, 0))[0]
-        painter.drawText(front + QPointF(-28, 22), "FRONT")
-        painter.drawText(back + QPointF(-23, 22), "BACK")
+        anchors = {'front_end': (g.span_mm/2, 0, 0), 'back_end': (g.span_mm/2, g.length_mm, 0),
+                   'left_wall': (0, g.length_mm/2, g.eave_mm*.4),
+                   'right_wall': (g.span_mm, g.length_mm/2, g.eave_mm*.4)}
+        for face, anchor in anchors.items():
+            point = project(anchor)[0]
+            text = self.orientation_label(face)
+            width = painter.fontMetrics().horizontalAdvance(text)+12
+            rect = QRectF(max(8., min(point.x()-width/2, self.width()-width-8)),
+                          max(48., min(point.y()+6, self.height()-62.)), width, 20)
+            painter.setBrush(QColor(246, 249, 252, 225))
+            painter.setPen(QPen(QColor('#8b9eac'), .6))
+            painter.drawRoundedRect(rect, 3, 3)
+            painter.setPen(QColor('#284960'))
+            painter.drawText(rect, Qt.AlignCenter, text)
+        painter.drawText(16, self.height()-34, 'Left / right are viewed from the FRONT')
         painter.drawText(16, self.height() - 16,
                          f"{g.span_mm / 1000:g} m span  x  {g.length_mm / 1000:g} m long  |  {len(g.bay_stations_mm) - 1} bays")
         painter.end()

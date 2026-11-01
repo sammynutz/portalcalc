@@ -40,6 +40,9 @@ class SectionCheckProperties:
     net_area_mm2: Optional[float] = None
     alpha_b: float = 0.0
     nonuniform_shear_stress_ratio: float = 2.0
+    # Optional independent body area: a tension connection deduction need not
+    # describe the compression member. Unspecified preserves existing callers.
+    compression_area_mm2: Optional[float] = None
 
     @property
     def design_fyw_mpa(self) -> float:
@@ -84,6 +87,10 @@ class MemberActions:
     kl: float = 1.0
     kr: float = 1.0
 
+    # Separate physical LTB segment from in-plane compression effective length.
+    # None preserves the historical caller behaviour for other member groups.
+    ltb_length_mm: Optional[float] = None
+
 
 @dataclass
 class CapacityCheck:
@@ -119,7 +126,8 @@ def safe_ratio(demand: float, capacity: float) -> float:
 
 def compression_section_capacity_kn(section: SectionCheckProperties) -> float:
     """Design section compression capacity, phi Ns."""
-    return PHI_STEEL * section.kf * section.design_net_area_mm2 * section.fy_mpa / 1000.0
+    area = section.design_net_area_mm2 if section.compression_area_mm2 is None else section.compression_area_mm2
+    return PHI_STEEL * section.kf * area * section.fy_mpa / 1000.0
 
 
 def is_hollow_section(section: SectionCheckProperties) -> bool:
@@ -224,7 +232,7 @@ def section_moment_capacity_knm(section: SectionCheckProperties) -> float:
 
 def reference_buckling_moment_knm(section: SectionCheckProperties, actions: MemberActions) -> float:
     """Reference elastic buckling moment Mo for lateral torsional buckling."""
-    le = actions.effective_length_z_mm
+    le = actions.ltb_length_mm if actions.ltb_length_mm is not None else actions.effective_length_z_mm
     if not le or le <= 0.0 or section.minor_i_mm4 <= 0.0 or section.j_mm4 <= 0.0:
         return float("inf")
 

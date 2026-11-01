@@ -1583,7 +1583,7 @@ class PlotCanvas(FigureCanvasQTAgg):
     def plot_structure(self, nodes, elements, base_nodes, support_types, load_arrows,
                        result_type="Deflection", displacements=None, scale=100, diagram_scale_factor=1.0,
                        purlin_layout=None, wall_cladding_segments=None, doubled_chord_zones=None,
-                       governing_deflection=None, analysis_structure=None):
+                       governing_deflection=None, analysis_structure=None, column_flybraces=None):
         self.ax.clear()
 
         for element in elements:
@@ -1627,6 +1627,13 @@ class PlotCanvas(FigureCanvasQTAgg):
             self.plot_purlins(purlin_layout)
         if wall_cladding_segments:
             self.plot_wall_cladding(wall_cladding_segments)
+        if result_type == 'Geometry':
+            for schedule in column_flybraces or []:
+                colour = '#9e2876' if schedule['passes'] else '#c43a25'
+                for y in schedule['positions_mm']:
+                    self.ax.plot(schedule['x_mm'], y, marker='>', markersize=7, color=colour, zorder=8)
+                    self.ax.annotate(f"FB {y-schedule['base_mm']:.0f}", (schedule['x_mm'], y),
+                                     xytext=(8, 5), textcoords='offset points', fontsize=7, color=colour)
 
         self.plot_supports(base_nodes, support_types)
         if result_type != "Geometry":
@@ -1764,11 +1771,11 @@ class PlotCanvas(FigureCanvasQTAgg):
             height = max(y2 - y1, 0.0)
             if height <= 1e-9:
                 continue
-            girt_spacing = 1500.0
-            count = max(1, int(math.floor(height / girt_spacing)))
             tick = 260.0
-            for i in range(count + 1):
-                y = y1 + min(i * girt_spacing, height)
+            levels = segment.get('girt_levels_mm')
+            if levels is None:
+                levels = [y1 + i*1500.0 for i in range(int(height/1500.0)+1)]
+            for y in levels:
                 self.ax.plot([x - tick, x + tick], [y, y], color="#2f6f73", linewidth=1.1, alpha=0.85)
 
     def plot_deflected_shape(
@@ -3075,6 +3082,7 @@ class MainWindow(QMainWindow):
         self.longitudinal_bracing_design = None
         self.bracing_location_layout = None
         self.bracing_3d_settings = None
+        self.bracing_3d_calculation_cache = None
         self.load_combinations = build_load_combinations(CPE_CASE_OPTIONS, CPI_CASE_OPTIONS)
         self.factory_default_data = None
         self.factory_defaults_loaded_path = ""
@@ -3981,6 +3989,17 @@ class MainWindow(QMainWindow):
             actions = self.member_actions_from_envelope(envelope, group)
         except (TypeError, ValueError):
             actions = None
+        automatic_plan = None
+        if envelope.get('column_flybrace_basis'):
+            for _, combo, candidate_group in self.active_auto_size_group_specs():
+                if candidate_group == group:
+                    evaluated = self.column_flybrace_evaluation(self.selected_profile(combo), envelope, group)
+                    if evaluated is not None:
+                        automatic_plan = evaluated[2]
+                        restraint.update({'major_mm': automatic_plan['in_plane_length_mm'],
+                                          'minor_mm': actions.effective_length_y_mm,
+                                          'ke': 1.0, 'am': actions.moment_modifier})
+                    break
         physical_lengths = [
             float(item.get("length_mm") or 0.0)
             for item in envelope.values()
@@ -3997,7 +4016,9 @@ class MainWindow(QMainWindow):
         mid_demand = max(float(mid_item.get("value") or 0.0), 0.0)
         is_lean = group in {"LEFT_LEAN_COLUMN", "RIGHT_LEAN_COLUMN"}
         clad = bool(restraint.get("clad"))
-        if is_lean and clad:
+        if automatic_plan is not None:
+            assumption = automatic_plan['restraint']
+        elif is_lean and clad:
             assumption = (
                 "Clad lean-to outer wall: one mid-height flybrace is assumed; "
                 "major- and minor-axis restraint lengths are half the column height."
@@ -4014,6 +4035,7 @@ class MainWindow(QMainWindow):
             "physical_member_length_mm": max(physical_lengths, default=None),
             "wall_clad": clad,
             "restraint_assumption": assumption,
+            "flybrace_schedule": copy.deepcopy(automatic_plan),
             "major_restraint_length_mm": restraint.get("major_mm"),
             "minor_restraint_length_mm": restraint.get("minor_mm"),
             "effective_length_factor_ke": restraint.get("ke", 1.0),
@@ -4084,6 +4106,10 @@ class MainWindow(QMainWindow):
                     "unit": check.unit,
                     "notes": check.notes,
                 })
+            evaluated = self.column_flybrace_evaluation(profile, envelope, group)
+            if evaluated is not None:
+                for check in checks:
+                    check['source'] = copy.deepcopy(evaluated[2]['sources'].get(check['key'], {}))
             action_sources = {}
             for action_key in ("compression_kn", "tension_kn", "shear_kn", "moment_knm"):
                 item = envelope.get(action_key) if isinstance(envelope, dict) else None
@@ -4142,6 +4168,7 @@ class MainWindow(QMainWindow):
             },
             "member_checks": member_checks,
             "column_stability_context": self.column_stability_context_rows(),
+            "column_flybraces": self.column_flybrace_schedule(),
             "serviceability_checks": serviceability,
             "purlin_check": self.purlin_check,
             "wall_girt_check": self.wall_girt_check,
@@ -8377,6 +8404,7 @@ class MainWindow(QMainWindow):
         bracing = data.get("bracing", {})
         self.bracing_location_layout = copy.deepcopy(bracing.get("layout"))
         self.bracing_3d_settings = copy.deepcopy(bracing.get("analysis_3d"))
+        self.bracing_3d_calculation_cache = copy.deepcopy(bracing.get('calculation_3d'))
         self.longitudinal_bracing_enabled_checkbox.setChecked(bool(bracing.get("enabled", False)))
         self.set_combo_text_if_present(self.longitudinal_wall_sides_combo, bracing.get("wall_sides", "Both sides"))
         try:
@@ -8803,8 +8831,13 @@ class MainWindow(QMainWindow):
         path = str(path)
         if not path.lower().endswith(".json"):
             path += ".json"
+        data = self.collect_preset_data()
+        if self.bracing_3d_calculation_cache is not None:
+            # Optional result data is saved with the job, but never included in
+            # source-input hashes, model history or another calculation's inputs.
+            data.setdefault('bracing',{})['calculation_3d'] = self.bracing_3d_calculation_cache
         with open(path, "w", encoding="utf-8") as file:
-            json.dump(self.collect_preset_data(), file, indent=2)
+            json.dump(data, file, indent=2)
         self.current_preset_path = path
         self.add_recent_preset_path(path)
         self.mark_model_clean()
@@ -9250,6 +9283,7 @@ class MainWindow(QMainWindow):
         selected["doubledChordZones"] = copy.deepcopy(
             (self.design_envelope_actions or {}).get("doubled_chord_zones", [])
         )
+        selected['columnFlybraces'] = self.column_flybrace_schedule()
         return calculation_json_safe(selected)
 
     def _configurator_review_dossier(self, final_inputs):
@@ -9764,8 +9798,10 @@ class MainWindow(QMainWindow):
             return {
                 "major_mm": major_length,
                 "minor_mm": minor_length,
-                "ke": 0.85,
-                "am": 1.75,
+                # Fallback factors for dedicated crane/storage checks. Ordinary
+                # clad columns resolve automatic segments from solved ULS cases.
+                "ke": 1.0 if clad else 0.85,
+                "am": 1.3 if clad else 1.75,
                 "kt": 1.0,
                 "kl": 1.0,
                 "kr": 1.0,
@@ -10290,15 +10326,27 @@ class MainWindow(QMainWindow):
             return
         read_only = self.configurator_review is not None
         dialog = BracingAnalysisDialog(context, self.catalog, saved=copy.deepcopy(self.bracing_3d_settings),
-                                       parent=self, read_only=read_only)
-        if dialog.exec() == QDialog.Accepted and not read_only:
+                                       parent=self, read_only=read_only,
+                                       cached_calculation=self.bracing_3d_calculation_cache)
+        opening_settings, opening_layout = dialog.snapshot(), dialog.layout_snapshot()
+        accepted = dialog.exec() == QDialog.Accepted
+        if accepted and not read_only:
+            if (dialog.result and dialog.result.get('mullion_basis') and not dialog.result.get('sizing_failure')
+                    and dialog.result['design']['taut_tangent_verified']):
+                posts=[check for key,check in dialog.result['section_checks'].items() if key.startswith('post/')]
+                if posts and all(check['passes'] for check in posts):
+                    dialog.adopted_mullion_section=dialog.selections()['end_post'].name
             settings = dialog.snapshot()
             location_layout = dialog.layout_snapshot()
             if settings != self.bracing_3d_settings or location_layout != self.bracing_location_layout:
                 self.bracing_3d_settings = settings
                 self.bracing_location_layout = location_layout
                 self.update_bracing_layout_summary()
+                if settings.get('adopted_mullion_section'):
+                    self.generate_and_solve()
                 self.record_model_snapshot()
+        if accepted or (dialog.snapshot()==opening_settings and dialog.layout_snapshot()==opening_layout):
+            self.bracing_3d_calculation_cache = dialog.calculation_cache()
 
     def calculate_longitudinal_bracing_design(self, wind_inputs, span_mm, eave_height_mm, pitch_deg, roof_shape, bay_size_m):
         if not self.longitudinal_bracing_enabled_checkbox.isChecked():
@@ -10681,9 +10729,11 @@ class MainWindow(QMainWindow):
             inward_uls_kpa=inward_kpa,
             service_kpa=service_kpa,
             profiles=self.catalog.end_wall_mullion_profiles(),
+            selected_profile=self.catalog.profile_by_name.get((self.bracing_3d_settings or {}).get('adopted_mullion_section')),
             spacing_override_mm=spacing_override_mm,
             end_wall_count=end_wall_count,
         )
+        self.end_wall_mullion_design['section_source']=('Adopted from the aligned 3D bracing mullion check' if (self.bracing_3d_settings or {}).get('adopted_mullion_section') else 'Automatic main wall-wind sizing')
         if end_wall_count > 0:
             self.end_wall_girt_check = self.wall_girt_check_from_inputs(
                 wind_inputs,
@@ -10731,7 +10781,9 @@ class MainWindow(QMainWindow):
             self.end_wall_mullion_check_label.setText(
                 f"{mullion_status} - {selected.get('section', '-')} | strength {selected.get('strength_ratio', float('inf')):.3f}, "
                 f"deflection {selected.get('deflection_ratio', float('inf')):.3f}"
+                + (' | 3D-adopted' if design.get('section_source','').startswith('Adopted') else '')
             )
+            self.end_wall_mullion_check_label.setToolTip(design.get('section_source','')+'. These ratios are the main wind check; the added bracing axial/combined check is shown in the 3D workspace.')
         else:
             self.end_wall_mullion_check_label.setText(
                 f"{mullion_status} - {design.get('message', 'No intermediate mullion section required')}"
@@ -12281,8 +12333,8 @@ class MainWindow(QMainWindow):
             self.member_check_restraints[group].update({
                 "major_mm": major_length,
                 "minor_mm": minor_length,
-                "ke": 0.85,
-                "am": 1.75,
+                "ke": 1.0 if is_clad else 0.85,
+                "am": 1.3 if is_clad else 1.75,
                 "kt": 1.0,
                 "kl": 1.0,
                 "kr": 1.0,
@@ -12304,6 +12356,11 @@ class MainWindow(QMainWindow):
             wall_cladding_segments.append({"x": left_lean_base.x, "y1": left_lean_base.y, "y2": left_canopy_top_nodes[-1].y, "label": "Left lean-to wall"})
         if right_lean_outer_wall_clad and right_lean_base is not None and right_canopy_top_nodes:
             wall_cladding_segments.append({"x": right_lean_base.x, "y1": right_lean_base.y, "y2": right_canopy_top_nodes[-1].y, "label": "Right lean-to wall"})
+        from column_flybracing import girt_levels
+        for segment in wall_cladding_segments:
+            segment['girt_levels_mm'] = girt_levels(min(segment['y1'], segment['y2']),
+                                                   max(segment['y1'], segment['y2']),
+                                                   self.wall_girt_spacing_mm(wind_inputs.wind_region))
 
         # A non-free lean-to on a skillion is part of the continuous roof for
         # external wind.  Use the full plan width and the average height of the
@@ -13815,6 +13872,35 @@ class MainWindow(QMainWindow):
         self.refresh_plot()
 
     def member_check_envelope_lines(self, structure, combinations, apply_combination_loads, top_nodes, span, foundation_nodes=None, canopy_tip_checks=None, side_midspan_checks=None, storage_check_cases=None, crane_deflection_nodes=None, storage_rail_deflection_nodes=None, rafter_haunch_length_mm=0.0):
+        from column_flybracing import COLUMN_GROUPS, capture_case, girt_levels
+        self._column_flybrace_models = {}
+        flybrace_bases = {}
+        column_cases = {}
+        roof_coordinates = {(round(n.x, 6), round(n.y, 6)) for e in structure.elements
+                            if e.group in {'TOP', 'BOTTOM', 'LEFT_CANOPY_TOP', 'LEFT_CANOPY_BOTTOM',
+                                           'RIGHT_CANOPY_TOP', 'RIGHT_CANOPY_BOTTOM'}
+                            for n in (e.start, e.end)}
+        for group in COLUMN_GROUPS:
+            restraint = (self.member_check_restraints or {}).get(group, {})
+            members = [e for e in structure.elements if e.group == group]
+            # Crane/storage restraints retain their existing dedicated treatment.
+            if not members or not restraint.get('clad') or restraint.get('crane_minor') or restraint.get('storage_restraint'):
+                continue
+            nodes = {n.id: n for e in members for n in (e.start, e.end)}
+            base = min(nodes.values(), key=lambda n: n.y)
+            top = max(nodes.values(), key=lambda n: n.y)
+            if any(abs(n.x-base.x) > 1e-6 for n in nodes.values()):
+                continue
+            roof = [n.y for n in nodes.values() if n.y > base.y+1e-6
+                    and (round(n.x, 6), round(n.y, 6)) in roof_coordinates]
+            roof_node = min(roof) if roof else top.y
+            flybrace_bases[group] = {
+                'base_mm': base.y or 0.0, 'top_mm': top.y, 'roof_node_mm': roof_node,
+                'x_mm': base.x, 'in_plane_length_mm': roof_node-base.y,
+                'fixed_levels_mm': [roof_node] if roof_node < top.y-1e-6 else [],
+                'girt_levels_mm': girt_levels(base.y, top.y, self.wall_girt_spacing_mm(self.wind_region_combo.currentText())),
+            }
+            column_cases[group] = []
         capture_computations = bool(getattr(self, "_capture_computation_report", False))
         computation_cases = []
         computation_load_lines = {}
@@ -14140,6 +14226,8 @@ class MainWindow(QMainWindow):
                     target[key] = zone
 
         def merge_combination_result(result):
+            for group, case in result.get('column_flybrace_cases', {}).items():
+                column_cases[group].append(case)
             if result.get("computation_case") is not None:
                 computation_cases.append(result["computation_case"])
             nonlocal sls_column_top_deflection, sls_column_top_deflections, sls_crane_rail_deflection, sls_column_midspan_ws_deflection, sls_column_midspan_ws_deflections, sls_truss_midspan_deflections, sls_side_midspan_deflections, sls_canopy_tip_deflections, uls_count, sls_count
@@ -14842,6 +14930,8 @@ class MainWindow(QMainWindow):
                                                 d, reactions, case_forces, case_analysis, case_load_lines)
             return {
                 "computation_case": computation_case,
+                "column_flybrace_cases": capture_case(candidate_structure, d, flybrace_bases, display_combination.name)
+                    if combination.is_ultimate and flybrace_bases else {},
                 "column_envelopes": local_column_envelopes,
                 "column_envelope": local_column_envelope,
                 "chord_envelopes": local_chord_envelopes,
@@ -15254,6 +15344,8 @@ class MainWindow(QMainWindow):
                 ),
             )
             envelope_actions[web_group]["connection"] = governing_connection_demand.get("connection", {})
+        for group, basis in flybrace_bases.items():
+            envelope_actions[group]['column_flybrace_basis'] = {**basis, 'cases': column_cases[group]}
         if capture_computations:
             envelope_actions["computation_cases"] = computation_cases
         return lines, envelope_actions
@@ -15298,7 +15390,42 @@ class MainWindow(QMainWindow):
     def member_envelope_effective_length(self, envelope, key, fallback=0.0):
         return envelope[key].get("length_mm") or fallback
 
+    def column_flybrace_evaluation(self, profile, envelope, group):
+        basis = envelope.get('column_flybrace_basis') if isinstance(envelope, dict) else None
+        if not basis or not basis.get('cases'):
+            return None
+        from column_flybracing import FlybraceColumn
+        cache = getattr(self, '_column_flybrace_models', None)
+        if cache is None:
+            cache = self._column_flybrace_models = {}
+        key = id(envelope)
+        if key not in cache:
+            # Retain the envelope to prevent identity reuse during sizing trials.
+            cache[key] = (envelope, FlybraceColumn(basis))
+        return cache[key][1].choose(profile.check_properties())
+
+    def column_flybrace_schedule(self):
+        rows = []
+        for _, combo, group in self.active_auto_size_group_specs():
+            envelope = (self.design_envelope_actions or {}).get(group, {})
+            profile = self.selected_profile(combo)
+            evaluated = self.column_flybrace_evaluation(profile, envelope, group)
+            if evaluated is not None:
+                basis = envelope['column_flybrace_basis']
+                rows.append({'group': group, 'profile': profile.name, 'x_mm': basis['x_mm'],
+                             'base_mm': basis['base_mm'], 'roof_node_mm': basis['roof_node_mm'],
+                             **copy.deepcopy(evaluated[2])})
+        return rows
+
     def member_actions_from_envelope(self, envelope, group, restraint_override=None):
+        if not restraint_override and isinstance(envelope, dict) and envelope.get('column_flybrace_basis'):
+            combos = {'LEFT_COLUMN': 'left_column_profile_combo', 'RIGHT_COLUMN': 'right_column_profile_combo',
+                      'LEFT_LEAN_COLUMN': 'left_lean_column_profile_combo', 'RIGHT_LEAN_COLUMN': 'right_lean_column_profile_combo'}
+            combo = getattr(self, combos.get(group, ''), None)
+            if combo is not None:
+                evaluated = self.column_flybrace_evaluation(self.selected_profile(combo), envelope, group)
+                if evaluated is not None:
+                    return evaluated[1]
         restraint = dict((self.member_check_restraints or {}).get(group, {}))
         if restraint_override:
             restraint.update(restraint_override)
@@ -15328,6 +15455,19 @@ class MainWindow(QMainWindow):
 
     def resolved_member_check(self, profile, envelope, group):
         base_restraint = dict((self.member_check_restraints or {}).get(group, {}))
+        evaluated = self.column_flybrace_evaluation(profile, envelope, group)
+        if evaluated is not None:
+            result, actions, plan = evaluated
+            restraint = {**base_restraint, 'major_mm': plan['in_plane_length_mm'],
+                         'minor_mm': actions.effective_length_y_mm, 'ke': 1.0,
+                         'am': actions.moment_modifier, 'flybraces': plan}
+            positions = ', '.join(f'{y:.0f}' for y in plan['heights_above_base_mm']) or 'none'
+            return result, actions, restraint, [
+                f'Automatic girt flybraces: {positions} mm above base; calculated am by segment and ULS case.',
+                'Flybraces provide assumed weak-axis lateral/twist restraint; no in-plane support is added.',
+            ] + [f"Segment {row['from_mm']:.0f}-{row['to_mm']:.0f} mm | LTB {row['actions']['ltb_length_mm']:.0f} mm | "
+                 f"am {row['actions']['moment_modifier']:.3f} | ratio {row['ratio']:.3f} | {row['combo']}"
+                 for row in plan['segments']]
         base_actions = self.member_actions_from_envelope(envelope, group)
         base_result = self.member_check_result(profile, envelope, group)
         if group == "BOTTOM" and not self.design_utilization_ok(base_result.governing_ratio):
@@ -15345,6 +15485,10 @@ class MainWindow(QMainWindow):
 
 
     def member_check_result(self, profile, envelope, group, restraint_override=None):
+        if not restraint_override:
+            evaluated = self.column_flybrace_evaluation(profile, envelope, group)
+            if evaluated is not None:
+                return evaluated[0]
         return check_member(profile.check_properties(), self.member_actions_from_envelope(envelope, group, restraint_override))
 
     def doubled_chord_zone_ratio(self, profile, envelope, group):
@@ -19995,7 +20139,10 @@ class MainWindow(QMainWindow):
                 check = result.checks[key]
                 unit = f" {check.unit}" if check.unit else ""
                 check_status = "OK" if self.design_utilization_ok(check.ratio) else "NOT OK"
-                if key == "bending" and group in {"TOP", "BOTTOM", "LEFT_CANOPY_TOP", "LEFT_CANOPY_BOTTOM", "RIGHT_CANOPY_TOP", "RIGHT_CANOPY_BOTTOM"}:
+                if restraint.get('flybraces'):
+                    source = restraint['flybraces']['sources'][key]
+                    source_text = f"{source['from_mm']:.0f}-{source['to_mm']:.0f} mm | {source['combo']} | am {source['am']:.3f}"
+                elif key == "bending" and group in {"TOP", "BOTTOM", "LEFT_CANOPY_TOP", "LEFT_CANOPY_BOTTOM", "RIGHT_CANOPY_TOP", "RIGHT_CANOPY_BOTTOM"}:
                     source = envelope["compression_kn"]
                     source_member = source.get("coincident_moment_member", f"{group} average")
                     source_text = f"{source_member} | {source['combo']} | compression case"
@@ -20819,8 +20966,8 @@ class MainWindow(QMainWindow):
         lines = [
             "SECTION CHECKS",
             "Uses ULS envelope demands from the Results tab.",
-            "Column restraints: clad walls assume one mid-height flybrace, so major and minor effective lengths are half the clad column height; unclad walls use base to bottom of truss/rafter, with rafter haunches deducting rafter depth plus haunch depth. Lean-to outer columns follow the lean-to outer wall cladding state.",
-            "Storage rail nodes restrain side columns at the rail level and cap side-column restraint length to the longest segment between base, rail and column top. When crane loads are active, side-column minor-axis length also considers base to crane height with the same 0.85 effective-length factor.",
+            "Column restraints: clad main/lean-to columns automatically select girt flybraces, starting near three-quarter height and adding braces to governing segments when needed. am is calculated from each segment's same-case quarter-point moments. Flybraces provide assumed weak-axis lateral/twist restraint; the in-plane compression length remains base to roof connection (ke=1.00). LTB uses the physical segment length separately. Unclad columns retain ke=0.85 and am=1.75. Crane/storage columns retain their existing dedicated restraint checks.",
+            "Storage rail nodes restrain side columns at the rail level and cap side-column restraint length to the longest segment between base, rail and column top. When crane loads are active, side-column minor-axis length also considers base to crane height, using the column's adopted ke (1.00 clad; 0.85 unclad).",
             f"{'Rafter' if is_rafter else 'Chord'} restraints: major length uses node spacing; top/rafter minor length uses purlin spacing {((self.member_check_restraints or {}).get('TOP', {}).get('minor_mm') or 0.0):.0f} mm; bottom minor length defaults to every second girt/flybrace {((self.member_check_restraints or {}).get('BOTTOM', {}).get('minor_mm') or 0.0):.0f} mm, with automatic every-purlin retry if required.",
             "Checks include axial, Clause 5.11-style shear, member bending, and axial plus bending interaction.",
             "Compactness/effective section modulus refinements are still to be verified against worked examples.",
@@ -21409,6 +21556,7 @@ class MainWindow(QMainWindow):
             doubled_chord_zones=(self.design_envelope_actions or {}).get("doubled_chord_zones", []),
             governing_deflection=governing_deflection,
             analysis_structure=self.structure,
+            column_flybraces=self.column_flybrace_schedule(),
         )
 
 

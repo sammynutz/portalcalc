@@ -1,6 +1,7 @@
 """Rated wire ropes and per-location purlin/steel strut assemblies.
 
-Diameter is not a rope stiffness or design capacity. Cold-formed axial ratings
+Rope stiffness is declared EA or an explicitly adopted interim assumption.
+Diameter is not a rope design capacity. Cold-formed axial ratings
 must match the section/span/restraint basis; hot-rolled capacity approximations
 are deliberately not substituted for missing supplier data.
 """
@@ -8,24 +9,63 @@ from dataclasses import dataclass
 import math
 
 from bracing_analysis import AnalysisError
-from bracing_schedule import WIRE_SCHEDULE, SOURCE, SOURCE_SHA256, fitting_price
-from purlin_combined import METHOD, method, installed_check, properties
+from bracing_schedule import (WIRE_SCHEDULE, SOURCE, SOURCE_SHA256, wire_cost_defaults,
+                              WIRE_PRICE_SCHEMA, WIRE_PRICE_SOURCE)
+from purlin_combined import METHOD, method, installed_check, properties, same_profile_size
 
 
 WIRE_DIAMETERS_MM = tuple(WIRE_SCHEDULE)
+WIRE_ASSUMED_STIFFNESS = 'assumed_solid_steel_200gpa'
+WIRE_ASSUMED_SOURCE = ('Project-adopted interim assumption, 2026-10-31: E = 200 GPa with nominal '
+                       'circular area pi*d^2/4; not supplier-verified rope EA')
+
+
+def assumed_wire_stiffness(diameter_mm):
+    area = math.pi*diameter_mm**2/4
+    return {'stiffness_basis': WIRE_ASSUMED_STIFFNESS, 'modulus_mpa': 200000.,
+            'stiffness_area_mm2': area, 'stiffness_area_basis': 'Nominal circular area pi*d^2/4',
+            'ea_kn': 200000.*area/1000., 'ea_source': WIRE_ASSUMED_SOURCE}
 
 
 def wire_options(data=None):
     data = data or {}
     options = []
     for d, (capacity, forged, grade_s) in WIRE_SCHEDULE.items():
-        rating = {"design_tension_kn": capacity, "construction": "Grade 1570; construction not specified",
-                  "source": SOURCE, "capacity_basis": "project_schedule", "fittings_per_run": fitting_price(forged)}
+        rating = {"design_tension_kn": capacity, "construction": "Austlift 6x24 fibre core G1570",
+                  'supplier': 'Austlift',
+                  'product_reference_url': 'https://www.austlift.com.au/lifting/products/category/441/1/austlift/fibre-core-wire-rope',
+                  "source": SOURCE, "capacity_basis": "project_schedule", **wire_cost_defaults(d, forged)}
         rating.update({key: value for key, value in (data.get(str(d), {}) or {}).items() if value is not None and value != ""})
+        supplied = data.get(str(d), {}) or {}
+        # Old blank prices adopt the new project schedule. Once migrated, a
+        # deliberately cleared field stays missing and cannot become free/default.
+        if supplied.get('pricing_schema') == WIRE_PRICE_SCHEMA:
+            for key in ('price_per_m', 'fittings_per_run'):
+                if key in supplied:
+                    rating[key] = supplied[key]
+        defaults = wire_cost_defaults(d, forged)
+        if rating['price_per_m'] != defaults['price_per_m']:
+            if rating.get('rope_price_source') == WIRE_PRICE_SOURCE:
+                rating['rope_price_source'] = 'Project-entered rope rate override'
+            rating['rope_price_adoption'] = 'Project-entered rate' if rating['price_per_m'] is not None else 'Missing rate'
+        if rating['fittings_per_run'] != defaults['fittings_per_run']:
+            if rating.get('fitting_price_source') == defaults['fitting_price_source']:
+                rating['fitting_price_source'] = 'Project-entered fitting allowance per diagonal'
+        # Preserve declared/invalid existing EA rather than replacing it with a
+        # passing assumption. Older blank ratings adopt the approved interim mode.
+        basis = supplied.get('stiffness_basis') or ('declared_ea' if supplied.get('ea_kn') not in (None, '') else WIRE_ASSUMED_STIFFNESS)
+        rating['stiffness_basis'] = basis
+        if basis == WIRE_ASSUMED_STIFFNESS:
+            rating.update(assumed_wire_stiffness(d))
+        else:
+            for key in ('modulus_mpa', 'stiffness_area_mm2', 'stiffness_area_basis'):
+                rating.pop(key, None)
+        if rating['construction'] in {'Grade 1570; construction not specified', 'Austlift; Grade 1570; construction not confirmed'}:
+            rating['construction'] = 'Austlift 6x24 fibre core G1570'
         if rating.get("source") != SOURCE:
             rating["capacity_basis"] = "declared"
         options.append({"label": f"{d} mm WIRE ROPE", "component_type": "wire_rope", "diameter_mm": d,
-                        "area_mm2": math.pi*d*d/4, "description": "Tension-only wire rope; nominal area is a reference only",
+                        "area_mm2": math.pi*d*d/4, "description": "Tension-only wire rope; stiffness basis recorded separately from strength",
                         "grade_mpa": 1570., "forged_turnbuckle": forged, "grade_s_turnbuckle": grade_s,
                         "source_image_sha256": SOURCE_SHA256, "rating": rating})
     return options
@@ -46,6 +86,8 @@ def positive_rating(row, name):
 
 def wire_modulus(option):
     rating = option.get("rating", {})
+    if rating.get('stiffness_basis', 'declared_ea') not in {WIRE_ASSUMED_STIFFNESS, 'declared_ea'}:
+        raise AnalysisError('Unknown rope stiffness basis')
     ea = positive_rating(rating, "ea_kn")
     if rating.get("capacity_basis") == "project_schedule" and not str(rating.get("ea_source", "")).strip():
         raise AnalysisError("Rope EA source is required; the bracing schedule contains strength, not stiffness")
@@ -67,6 +109,8 @@ def wire_check(option, force_kn, name):
     return {"case": name, "mode": "Project-schedule wire-rope tension" if scheduled else "Declared wire tension rating", "ratio": max(force_kn, 0)/capacity,
             "capacity_kn": capacity, "tension_kn": max(force_kn, 0),
             "source": rating.get("source"), "ea_source": rating.get("ea_source", rating.get("source")),
+            'stiffness_basis': rating.get('stiffness_basis', 'declared_ea'), 'ea_kn': rating['ea_kn'],
+            'modulus_mpa': wire_modulus(option), 'stiffness_area_mm2': option['area_mm2'],
             "forged_turnbuckle": option.get("forged_turnbuckle"), "grade_s_turnbuckle": option.get("grade_s_turnbuckle"),
             "basis": "Supplied factored brace capacity, not MBL; turnbuckle, termination, net/thread and anchor checks remain separate"}
 
@@ -82,7 +126,13 @@ def wire_price(option, length_m, count):
         raise AnalysisError("Wire-rope fittings price per diagonal must be entered (zero is explicit)")
     return {"material_cost": length_m*per_m, "listed_fittings_cost": count*fitting,
             "total": length_m*per_m+count*fitting, "price_per_m": per_m,
-            "fittings_per_run": fitting, "allowance": "Declared rope $/m and end-fitting cost per physical diagonal"}
+            "fittings_per_run": fitting, 'turnbuckle': option['forged_turnbuckle'],
+            'turnbuckle_count': count, 'rope_price_source': rating.get('rope_price_source'),
+            'rope_price_adoption': rating.get('rope_price_adoption'),
+            'quoted_rope_price_range_per_m': rating.get('quoted_rope_price_range_per_m'),
+            'rope_price_source_sha256': rating.get('rope_price_source_sha256'),
+            'fitting_price_source': rating.get('fitting_price_source'),
+            "allowance": rating.get('fitting_cost_basis', 'Declared rope $/m and end-fitting cost per physical diagonal')}
 
 
 @dataclass(frozen=True)
@@ -133,10 +183,11 @@ def purlin_check(component, force_kn, case_name, level, sls_divisor=150., criter
         try:
             nc = positive_rating(rating, prefix+"_compression_kn")
             nt = positive_rating(rating, prefix+"_tension_kn")
-            raw_deflection = rating.get(prefix+"_sls_deflection_mm")
-            delta = float(raw_deflection)
-            if not math.isfinite(delta) or delta < 0:
-                raise ValueError()
+            delta = None
+            if level=='SLS' or criteria is None or criteria.include_serviceability:
+                delta = float(rating.get(prefix+"_sls_deflection_mm"))
+                if not math.isfinite(delta) or delta < 0:
+                    raise ValueError()
             if rating.get("extra_bending_key") != data.get("bending_key") or not str(rating.get("source", "")).strip():
                 raise AnalysisError("Added-ply residual rating must match the current bending/restraint basis")
         except AnalysisError as error:
@@ -185,6 +236,18 @@ def purlin_check(component, force_kn, case_name, level, sls_divisor=150., criter
             "basis": "N/Nc + bending/(1-N/Ne); N/Nt + bending; independent envelope, conservative coincidence"}
 
 
+def scoped_case_checks(result, rows, criteria):
+    """Retain every computed row; select the governing included check only."""
+    levels = {case['case']['name']:case['case']['level'] for case in result['cases']}
+    rows = [{**row,'level':row.get('level',levels.get(row['case'])),
+             'included_in_design':bool(row.get('required_baseline')) or criteria.include_serviceability or row.get('level',levels.get(row['case']))!='SLS'} for row in rows]
+    active = [row for row in rows if row['included_in_design']]
+    if not active:
+        raise AnalysisError('No included strength checks are available')
+    governing = next((row for row in active if row['ratio'] is None),None) or max(active,key=lambda row:row['ratio'])
+    return rows,governing
+
+
 def assembly_assessment(result, index, assembly, criteria, steel_assessor):
     rows = []
     total = assembly.A
@@ -207,15 +270,14 @@ def assembly_assessment(result, index, assembly, criteria, steel_assessor):
                 identifier = assembly.location["id"]
                 row = beam_check(result, identifier, component, case["members"][index]["axial_n"]*share/1000,
                                  case["case"]["name"], case["case"]["level"], criteria.sls_divisor, criteria) if component["existing"] or component.get("sheeted_beam") or component.get('shared_beam') else None
-                if row is None and assembly.arrangement in {ARRANGEMENT, 'shared_purlin'}:
+                if row is None and assembly.arrangement in {ARRANGEMENT, 'shared_purlin', 'shared_purlin_pair'}:
                     row = {"case": case["case"]["name"], "mode": "Coupled roof-run beam analysis required", "ratio": None, "passes": False}
                 if row is None:
                     row = purlin_check(component, case["members"][index]["axial_n"]*share/1000,
                                        case["case"]["name"], case["case"]["level"], criteria.sls_divisor, criteria)
                 rows.append({**row, "component": part_index, "load_share": share,
                              "existing": component["existing"]})
-    unknown = next((row for row in rows if row["ratio"] is None), None)
-    governing = unknown or max(rows, key=lambda row: row["ratio"])
+    rows,governing = scoped_case_checks(result,rows,criteria)
     ratio = governing["ratio"]
     return {"id": result["cases"][0]["members"][index]["id"], "section": assembly.name,
             "ratio": ratio, "mode": governing["mode"], "case": governing["case"],
@@ -228,9 +290,32 @@ def assembly_properties(assembly):
     return {"type": "strut_assembly", "name": assembly.name, "arrangement": assembly.arrangement,
             "area_mm2": assembly.A, "modulus_mpa": assembly.E, "location": {k:v for k,v in assembly.location.items() if k != 'added_purlins'},
             "components": [{"type": c["type"], "existing": c["existing"],
-                            **({"purlin": c["data"], 'shared_beam': c.get('shared_beam', False), "sheeted_beam": c.get("sheeted_beam", False), "rating_prefix": c.get("rating_prefix"), "roof_bending_share": c.get("roof_bending_share", 1. if c["existing"] else 0.)} if c["type"] == "purlin" else
+                            **({"purlin": c["data"], 'pair_ply': c.get('pair_ply'), 'shared_beam': c.get('shared_beam', False), "sheeted_beam": c.get("sheeted_beam", False), "rating_prefix": c.get("rating_prefix"), "roof_bending_share": c.get("roof_bending_share", 1. if c["existing"] else 0.)} if c["type"] == "purlin" else
                                {"section": c["profile"].name, "area_mm2": c["profile"].A})}
                            for c in assembly.components]}
+
+
+def rating_for_roof_duty(ratings, key, bending_key):
+    """Migrate legacy entries only when their frozen roof duty still matches."""
+    if key in ratings:
+        return dict(ratings[key])
+    legacy_key = key.split('|roof_duty_sha256=')[0]
+    legacy = ratings.get(legacy_key, {})
+    if bending_key and bending_key in (legacy.get('beam_capacity_key'), legacy.get('extra_bending_key')):
+        return {**legacy, 'basis_key': key}
+    # Transfer stiffness and modelling choices do not depend on the bending
+    # demand envelope. Preserve them across a load-only change when all old
+    # entries for this section/restraint/span agree. Strength/residual ratings
+    # and their frozen keys still require review against the new roof duty.
+    previous = [value for old_key,value in ratings.items()
+                if old_key==legacy_key or old_key.startswith(legacy_key+'|roof_duty_sha256=')]
+    fields = ('cladding_coupling_kn_m_per_mm','cladding_coupling_source',
+              'beam_lap_ratio','beam_direct_roof_pickup_fraction','beam_roof_releases',
+              'compression_method','purlin_shape','tension_method',
+              'shared_cladding_fixed','shared_bridging_rows')
+    retained = {name:previous[0][name] for name in fields if previous and name in previous[0]
+                and all(name in value and value[name]==previous[0][name] for value in previous)}
+    return {**retained, 'basis_key':key} if retained else {}
 
 
 def strut_locations(context, ratings=None, counts=None):
@@ -249,13 +334,16 @@ def strut_locations(context, ratings=None, counts=None):
             # Exact span/bending/restraint snapshot key protects against reuse
             # after a geometry, profile or bridging change.
             key = f"{source['basis_key']}|bay_span_mm={b-a:.6f}"
-            data.update(basis_key=key, analysis_span_mm=b-a, axial_rating=dict(ratings.get(key, {})))
+            if source.get('bending_key'):
+                key += f"|roof_duty_sha256={source['bending_key']}"
+            data.update(basis_key=key, analysis_span_mm=b-a,
+                        axial_rating=rating_for_roof_duty(ratings,key,source.get('bending_key')))
             if method(data["axial_rating"]) == METHOD:
                 try:
                     data["compression_properties"] = properties(data["section"], data["axial_rating"].get("purlin_shape", "Z"))
                 except AnalysisError as error:
                     data["compression_properties_error"] = str(error)
-            count = counts.get(identifier, counts.get(str(line), 1))
+            count = counts.get(identifier, counts.get(str(line), source.get('installed_count', 1)))
             if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 8:
                 raise AnalysisError("Connected existing purlins must be an integer from 1 to 8")
             is_braced = any(("/bay/"+str(bay)+"/") in (p+"/") for p in context["layout"].pinned)
@@ -273,9 +361,14 @@ def location_options(location, steel_profiles):
     prefix = f"{n} existing {data['section']}"
     options = [StrutAssembly(prefix, existing, "existing_purlins", location)]
     for added in location.get('added_purlins', []):
+        if not same_profile_size(added['section'], data['section']):
+            continue
         display = added['section'].replace('C/Z ', 'C ')
         options.append(StrutAssembly(prefix+' + '+display+' (50/50 roof load)',
             existing+({'type': 'purlin', 'existing': False, 'data': added, 'shared_beam': True},), 'shared_purlin', location))
+        pair = tuple({'type': 'purlin', 'existing': False, 'data': added, 'shared_beam': True, 'pair_ply': i+1} for i in range(2))
+        options.append(StrutAssembly(prefix+' + 2 x '+display+' (added back-to-back pair; equal roof load per ply)',
+            existing+pair, 'shared_purlin_pair', location))
     extra = {"type": "purlin", "existing": False, "data": data, "rating_prefix": "extra"}
     options.append(StrutAssembly(prefix+" + sheeted single-span purlin", existing+({**extra, "sheeted_beam": True},), "sheeted_purlin", location))
     options.append(StrutAssembly(prefix+" + extra purlin", existing+(extra,), "additional_purlin", location))
