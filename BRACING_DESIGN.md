@@ -1,8 +1,19 @@
 # Combined 3D bracing workspace
 
-Open **Bracing > Open 3D bracing workspace**. Edit exclusions and pinned X panels
-on the left, choose sections/criteria on the right, then Analyse and check or
-Auto size for lowest checked cost. Unmarked panels are not installed braces.
+Open **Bracing > Open 3D bracing workspace**. Block excluded panels on the left,
+choose section/criteria settings on the right, then **Find layout and size**.
+This selects and sizes braces from unblocked panels; optionally enable **Keep
+selected panels as required**. The default **Practical layout (fast)** uses end
+load paths, adds end-wall restraint for eccentric wide arrangements, and finds
+a passing demand-sized solution. Cost-ordered local strut screening and
+targeted brace-only sway adjustments avoid repeated whole-catalogue/cost-polish
+work. An editable allowance defaults to $50 per physical X panel; practical mode
+tries up to four compact load paths when the allowance is positive and budget
+permits, stopping at the first cheaper passing layout. Continuous eave roof-girder
+depth and end restraint adapt to the geometry. **Detailed cost search** remains an explicit broader alternative. See
+`BRACING_LAYOUT.md` for budgets and acceptance rules. **Analyse and check** and **Size selected layout**
+also operate on exactly the selected/pinned panels. Unmarked panels are available
+search locations, not installed braces.
 Save and close records layout, analysis settings and current calculations together;
 the window X does the same. Cancel discards edits.
 The production portal, Phase 1 checks, legacy springs and cost totals are not
@@ -83,6 +94,25 @@ material rules and taut-brace stability remain mandatory in either mode.
 The pre-existing main mullion strength/deflection requirements remain mandatory
 for mullion replacements in both modes; the toggle applies to additional bracing
 serviceability, not to downgrading the main building's mullion design.
+
+## Global sway and local deflection limits
+
+The project-adopted default for IL1 **in-plane eave sway and global 3D
+longitudinal sway is H/100**; IL2+ retains H/150. Global bracing sway follows
+the actual main in-plane eave criterion, including explicit main overrides.
+At a 6 m eave, H/100 permits 60 mm. This is an adopted project criterion, not
+a claim of a universal code limit.
+
+Global sway is separate from local member/purlin L/n (default **L/150**), and
+does not alter the main mullion's separate local wind-deflection prerequisite.
+Sections / criteria exposes **Global sway: follow main in-plane criterion**
+and a manual global H/n override. Saved `criteria.global_sls_divisor=null`
+means automatic; a positive number means an explicit global override.
+`criteria.sls_divisor` continues to control local L/n. Legacy default 150
+migrates to automatic global sway; legacy non-default combined limits are
+retained as explicit global overrides. TXT/JSON record the adopted global
+divisor, source and importance level. Criterion changes invalidate cached
+results and exports before another checked result can be used.
 
 ## Aligned mullions
 
@@ -377,7 +407,8 @@ for older saved 250 MPa defaults and displays it read-only. The existing
 Fu=410 MPa assumption remains editable; this change does not infer a new Fu.
 Scheduled Grade 300 rod strengths and G1570 rope strengths remain unchanged.
 Other editable assumptions default to An/Ag=0.70,
-kt=0.85, strut/post effective K=1.0 and SLS H/150 or L/150. Catalogue steel
+kt=0.85, strut/post effective K=1.0 and local SLS L/150. Global sway follows
+the main criterion (project IL1 H/100; IL2+ H/150). Catalogue steel
 sections retain their own material properties. Project holes/threads,
 connections and restraints must establish the appropriate net-area, distribution
 and effective-length values; defaults do not verify connection details.
@@ -489,21 +520,21 @@ TXT/JSON freeze the project rule, active faces, rod-required faces, selected
 family and preference rank alongside the existing member/cost evidence.
 
 **Analyse and check** evaluates the current selections and may show failures.
-**Auto size for lowest checked cost** screens alternatives, recalculates their
+**Size selected layout** screens alternatives, recalculates their
 loads and adopts a selection only after all scoped member and SLS checks pass.
-SLS stiffness growth is capped at the largest eligible, priced section in each
-group (and each location's strut alternatives). A saturated group may remain at
-its maximum while other groups increase; the search does not demand an impossible
-further increase and stop prematurely. At a strut location, an EA target above
-every locally passing, priced arrangement is capped at the strongest checked
-alternative; other groups can still increase. A very large steel addition that
-fails the existing purlin's local bending must not prevent a checked purlin pair
-from being tried. Every combined proposal still requires exact reanalysis.
+Global-sway stiffness growth applies to brace/post groups and is capped at the
+largest eligible, priced option. **Struts have no global-SLS EA/area floor.**
+Uniform and per-location struts are chosen by ULS interaction and required local
+member/roof serviceability checks. Existing purlins remain candidates even when
+global drift fails. Their actual EA still participates in the exact 3D analysis;
+this selection rule does not suppress the physical influence of strut stiffness.
+A passing member plan with excessive building drift still fails overall SLS.
+Every combined proposal requires exact reanalysis.
 Once a passing design is found, remaining
 analysis budget is used for lower-cost/preferred grouped alternatives. Every
 change is exactly reanalysed and must pass all scoped member, stability and SLS
 checks before adoption. Before the final grouped pass, up to four coupled trials
-compare the strongest matching single/pair purlin additions with current braces
+compare the cheapest locally checked existing/single/pair purlin paths with current braces
 or the stiffest eligible priced braces. This permits cheaper purlin struts to be
 traded against brace stiffness; it does not force a material family or alter any
 pinned panels. The current per-location strut plan then stays fixed during the
@@ -553,7 +584,9 @@ Different rates and waste/stock allowances can make a heavier section cheaper.
 
 Sizing screens catalogue candidates against successive demand envelopes,
 chooses the cheapest passing group candidates, reanalyses their stiffnesses and
-checks the resulting member/SLS design. SLS failure can raise stiffness floors.
+checks the resulting member/SLS design. Global SLS failure can raise brace/post
+stiffness floors, never strut stiffness floors. Required local purlin/member
+deflections remain active when serviceability is included.
 A bounded search of up to 18 solves retains the lowest-cost passing candidate
 actually found. Infeasibility, cycles and cancellation do not adopt an unchecked
 candidate or change the layout constraints. Candidate screens and analysed
@@ -569,8 +602,8 @@ rejected alternatives are listed in Full results and frozen under
 an input clears this retained analysis and diagnosis as usual. Cancellation and
 solver errors remain separate from missing-data/capacity stops.
 
-When global longitudinal SLS movement is still over limit and stiffness floors
-exhaust the eligible strut alternatives, the stop reports both original-input
+When global longitudinal SLS movement is still over limit and available brace/post
+stiffness or the solve budget is exhausted, the stop reports both original-input
 and screening SLS ratios, movement/limit and governing node/case. Review sizing
 issue opens the retained SLS deformed shape at scale 1. A fixed-layout sizing
 search does not add wall/roof braces or prove that further member increases can
@@ -578,10 +611,13 @@ resolve a load-path deficiency; layout alternatives must be reviewed separately.
 
 ## Boundaries and verification
 
-The optional SLS stressed-skin model in `BRACING_ANALYSIS.md` participates in
+The optional roof/side-wall/end-wall SLS stressed-skin model in `BRACING_ANALYSIS.md` participates in
 exact serviceability reanalysis and sizing. Its surrogate diagonals are not
 physical brace candidates, costs or strength checks. Conventional ULS and bare
-SLS stability remain independent prerequisites.
+SLS stability remain independent prerequisites. Wall families have separate
+trial c inputs, apply only to clad faces and retain fixed-anchor/collector
+assumptions for sensitivity testing. End-wall in-plane shear is transverse,
+with no direct longitudinal resistance.
 
 The actual purlin offset from the idealised roof interface is recorded;
 collector connection stiffness/capacity remains assumed.

@@ -23,6 +23,34 @@ class StrengthModeTests(unittest.TestCase):
         from main import ShapeCatalog
         cls.catalog=ShapeCatalog('Shape_Catalog.xlsx')
 
+    def test_il1_global_h100_is_separate_from_local_l150_and_other_importance_levels(self):
+        c,s,_=design_fixtures.DesignMechanicsTests.small_context(SimpleNamespace(catalog=self.catalog))
+        rates={'shs':3.,'ub':4.,'wb':5.};criteria=DesignCriteria()
+        il1={**c,'source_preset':{'wind':{'importance_level':'1'}}}
+        result=solve_selection(il1,s,criteria,rates)
+        old=solve_selection(il1,s,replace(criteria,global_sls_divisor=150.),rates)
+        self.assertEqual(result['design']['global_sls']['divisor'],100.)
+        self.assertEqual(result['design_request']['criteria']['sls_divisor'],150.)
+        self.assertAlmostEqual(result['design']['global_sls']['limit_mm'],old['design']['global_sls']['limit_mm']*1.5)
+        self.assertAlmostEqual(result['design']['global_sls']['ratio'],old['design']['global_sls']['ratio']*2/3)
+        for key,checked in result['section_checks'].items():
+            self.assertEqual(checked['case_checks'],old['section_checks'][key]['case_checks'])
+        for level in ('2','3','4'):
+            other=solve_selection({**c,'source_preset':{'wind':{'importance_level':level}}},s,criteria,rates)
+            self.assertEqual(other['design']['global_sls']['divisor'],150.)
+        strict=solve_selection(il1,s,replace(criteria,global_sls_divisor=250.),rates)
+        self.assertEqual(strict['design']['global_sls']['divisor'],250.)
+        for invalid in (True,0,-1.,float('inf'),float('nan'),'100'):
+            with self.assertRaises(AnalysisError):replace(criteria,global_sls_divisor=invalid).validate()
+
+    def test_global_sway_uses_frozen_main_overrides(self):
+        from bracing_design import global_sway_basis
+        criteria=DesignCriteria()
+        r={'source_preset':{'wind':{'importance_level':'1'},'display':{'serviceability_limit_overrides':{'column_il1':125.}}}}
+        self.assertEqual(global_sway_basis(r,criteria)['divisor'],125.)
+        r['source_preset']['display']['eave_deflection_limit_override']=200.
+        self.assertEqual(global_sway_basis(r,criteria)['divisor'],200.)
+
     def test_default_validation_and_generic_local_deflection_scope(self):
         self.assertTrue(DesignCriteria().include_serviceability)
         for invalid in ('false',0,1,None):
@@ -96,6 +124,59 @@ class StrengthModeTests(unittest.TestCase):
 
 
 class StrengthModeWorkspaceTests(unittest.TestCase):
+    def test_main_and_bracing_il1_h100_follow_overrides_preserve_local_limits_and_cache(self):
+        os.environ['QT_QPA_PLATFORM']='offscreen';os.environ['PORTALCALC_LICENSE_ENFORCED']='0'
+        from PySide6.QtWidgets import QApplication
+        from main import MainWindow,SERVICEABILITY_LIMIT_DEFAULTS
+        from bracing_analysis_desktop import prepare_context
+        from bracing_analysis_regression import fixed_layout
+        from bracing_workspace_ui import BracingAnalysisDialog
+        app=QApplication.instance() or QApplication([])
+        self.assertEqual(SERVICEABILITY_LIMIT_DEFAULTS['column_il1'],100.)
+        with tempfile.TemporaryDirectory() as settings:
+            os.environ['APPDATA']=settings
+            w=MainWindow();w.confirm_on_close=False
+            try:
+                w.importance_combo.setCurrentText('1')
+                w.bracing_location_layout=fixed_layout(w.current_bracing_layout_geometry()).to_dict()
+                w.generate_and_solve();context=prepare_context(w)
+                self.assertEqual(w.eave_deflection_divisor(),100.)
+                d=BracingAnalysisDialog(context,w.catalog,{'mixed_struts':False,'criteria':{'sls_divisor':150.}})
+                try:
+                    self.assertTrue(d.global_sls_auto.isChecked());self.assertEqual(d.global_sls_input.value(),100.)
+                    self.assertEqual(d.criteria_inputs['sls_divisor'].value(),150.)
+                    d.run_analysis();self.assertEqual(d.result['design']['global_sls']['divisor'],100.)
+                    self.assertIn('H/100',d.result_summary_label.text())
+                    self.assertIn('Local member/purlin deflection divisor: L/150',d.report_text)
+                    saved=d.snapshot();cache=d.calculation_cache()
+                    restored=BracingAnalysisDialog(context,w.catalog,saved,cached_calculation=cache)
+                    try:self.assertIsNotNone(restored.result)
+                    finally:restored.reject()
+                    changed={**context,'global_sls_basis':{**context['global_sls_basis'],'divisor':125.}}
+                    stale=BracingAnalysisDialog(changed,w.catalog,saved,cached_calculation=cache)
+                    try:self.assertIsNone(stale.result)
+                    finally:stale.reject()
+                    d.global_sls_auto.setChecked(False);d.global_sls_input.setValue(200.)
+                    self.assertIsNone(d.result);d.run_analysis()
+                    self.assertEqual(d.result['design']['global_sls']['divisor'],200.)
+                    self.assertEqual(d.criteria_inputs['sls_divisor'].value(),150.)
+                    d.global_sls_auto.setChecked(True)
+                    self.assertIsNone(d.result);self.assertEqual(d.global_sls_input.value(),100.)
+                    locked=BracingAnalysisDialog(context,w.catalog,saved,read_only=True)
+                    try:self.assertFalse(locked.global_sls_auto.isEnabled());self.assertFalse(locked.global_sls_input.isEnabled())
+                    finally:locked.reject()
+                finally:d.reject()
+                legacy=BracingAnalysisDialog(context,w.catalog,{'mixed_struts':False,'criteria':{'sls_divisor':250.}})
+                try:
+                    self.assertFalse(legacy.global_sls_auto.isChecked())
+                    self.assertEqual(legacy.global_sls_input.value(),250.)
+                finally:legacy.reject()
+                w.importance_combo.setCurrentText('2');w.generate_and_solve()
+                self.assertEqual(prepare_context(w)['global_sls_basis']['divisor'],150.)
+                w.eave_deflection_limit_override=175.
+                self.assertEqual(prepare_context(w)['global_sls_basis']['divisor'],175.)
+            finally:w.close()
+
     def test_toggle_invalidates_restores_and_exports_the_selected_design_scope(self):
         os.environ['QT_QPA_PLATFORM']='offscreen';os.environ['PORTALCALC_LICENSE_ENFORCED']='0'
         from PySide6.QtWidgets import QApplication
@@ -116,6 +197,8 @@ class StrengthModeWorkspaceTests(unittest.TestCase):
                     d.strut_combo.setCurrentIndex(d.strut_combo.findData('250*12.5 SHS'))
                     d.post_combo.setCurrentIndex(d.post_combo.findData(max(d.post_profiles,key=lambda p:p.A).name))
                     d.criteria_inputs['sls_divisor'].setValue(2000.)
+                    d.global_sls_auto.setChecked(False)
+                    d.global_sls_input.setValue(2000.)
                     d.run_analysis();self.assertIsNotNone(d.result)
                     self.assertFalse(d.result['design']['passes'])
                     d.serviceability_check.setChecked(False)

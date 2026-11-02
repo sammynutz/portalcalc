@@ -3,16 +3,18 @@
 This is a small-displacement, wind-only demand model for a fixed layout. The
 combined workspace adds scoped member checks and section sizing described in
 `BRACING_DESIGN.md`. A solved model is **not a passing structural design**.
-Automatic layout selection and restraint feedback into the production 2D portal
-remain separate work.
+The workspace can now search layouts built from unblocked panels, using this
+fixed-layout solver for every candidate (see `BRACING_LAYOUT.md`). Restraint
+feedback into the production 2D portal remains separate work.
 
 ## Desktop workflow
 
 1. Establish the portal sections in the normal 2D workflow.
-2. In **Bracing > Open 3D bracing workspace**, block unavailable panels and
-   pin the X-braced panels to analyse. Unmarked panels are not installed braces.
+2. In **Bracing > Open 3D bracing workspace**, block unavailable panels. Unmarked
+   panels are available search locations, not installed braces. Optionally select
+   panels for fixed-layout checks or as required locations during search.
 3. Select the five section groups and check assumptions in Sections / criteria.
-4. Use **Analyse and check** or **Auto size for lowest checked cost**. These
+4. Use **Find layout and size**, **Analyse and check**, or **Size selected layout**. These
    choices are independent of Phase 1 and legacy portal-restraint controls.
 5. Read the assumptions, ULS member envelopes, SLS movement and per-case
    reactions/equilibrium checks. Select forces, governing utilisation or displaced
@@ -31,6 +33,12 @@ preset and its SHA256, actual analysis geometry, sections, load workings and
 case results. Cancel discards unsaved edits; Save and close or the window X retains
 the current workspace and calculations. Configurator Review locks inputs and automatic
 sizing while allowing analysis and visual inspection.
+
+Global longitudinal sway follows the main in-plane eave criterion: project
+default **H/100 for IL1**, H/150 for IL2+, with explicit main limits retained.
+A separate bracing global H/n override is available. Local member/purlin
+deflection keeps its independent L/n limit (default L/150). The adopted global
+criterion and source are frozen in JSON and shown in Result summary/TXT.
 
 The production portal is rebuilt once before opening the dialog. The 3D adapter
 then works on a private unloaded copy: it removes legacy eave springs/restraints,
@@ -58,33 +66,75 @@ Identical portal sections repeat at each longitudinal station, including ends.
 - Sheet/diaphragm stiffness is excluded by default. The optional SLS-only roof
   model is described below. There is no weak-axis portal column bending.
 
-## Optional SLS stressed-skin roof contribution
+## Optional SLS stressed-skin roof and wall contribution
 
-In **Sections / criteria > SLS stressed-skin roof contribution**, enable the
-technical-note option to add equivalent roof diagonals for serviceability.
-It saves under `analysis_3d.stressed_skin`; legacy jobs default to disabled.
-The adopted panel flexibility starts at **1.8 mm/kN**. The supplied technical
-note's 1.5-1.8 range relates to its particular crest-fixed assembly and panel;
-0.72 is a stiffer sensitivity case. Geometry determines the equivalent member
-area from an entered flexibility, never the flexibility itself.
+In **Sections / criteria > SLS stressed-skin roof and wall contribution**, enable
+roof, clad side walls and clad end walls independently for serviceability.
+Each family has an editable flexibility c in mm/kN; **smaller c gives greater
+stiffness**. New settings use the supplied technical note **Revision B, 2 November
+2026**: roof reference c = **3.0 mm/kN** at a = 8.500 m across ribs and b = 12.104 m
+along the roof slope; wall reference c = **6.0 mm/kN** at a = 7.000 m horizontal
+width and b = 6.000 m rib-parallel height. These are provisional engineering trial
+inputs, not characteristic test values or demonstrated conservative bounds.
+
+The **Rev B reference c + panel geometry** mode calculates each panel's actual
+flexibility using the explicitly documented empirical profile-distortion proxy:
+
+`c_panel = c_reference * (a_panel/b_panel^2) / (a_reference/b_reference^2)`
+
+Roof a/b are actual bay length/sloping roof length. Wall a/b are actual panel
+width/height; sloping end panels use mean corner height for this calibration.
+The model uses its analysis attachment geometry, with collector offsets and
+connection slip remaining separate assumptions. The proxy is applied to total
+panel flexibility as an engineering screening assumption, **not** a validated
+whole-panel law or a complete ECCS component calculation. Different profiles,
+fixings, support spacing or materially different panels require renewed review.
+
+**Direct panel c** retains a geometry-independent sensitivity override. The
+roof shear direction can be changed only in that mode; Rev B defines roof c
+for along-slope shear. Existing saved direct values are migrated into direct-c
+mode, preserving their meaning. **Apply Rev B roof + walls (3 / 6)** enables
+roof and clad side/end-wall options, sets their reference values to 3/6 and
+selects geometry calculation. Individual families can then be disabled. Controls
+save under `analysis_3d.stressed_skin`, including `calibration_mode`.
 
 Each bay gets one panel across each complete roof slope (one across a skillion),
 independent of the mullion/brace strip mesh. Each panel has two crossed
 tension-only diagonals, each assigned the full area
 `Aeq = Ld^3 / (E c s^2)`, where E = 200 kN/mm2 and Ld = sqrt(s^2+n^2).
 The initial shear-displacement direction defining s is **along the roof slope**,
-matching the note. The current applied wind is longitudinal. The report therefore
+matching Rev B. The current applied wind is longitudinal. The report therefore
 also gives the equivalent model's implied longitudinal flexibility; it is not a
 separately validated directional test value. A longitudinal definition of c can
 be selected when adopting a directional flexibility. The note's range must not
 be assumed to validate that direction or another installed assembly.
 
+**Wall sensitivity inputs:** side-wall and end-wall reference c values are
+independent, initially 6.0 mm/kN; direct mode instead applies the entered value
+to every panel in that family. Only faces marked clad in the building
+inputs receive wall panels. Side-wall panels span one bay and use horizontal
+longitudinal shear (s = bay width, n = wall height). End-wall panels span adjacent
+mullion stations and use horizontal transverse shear. They provide zero direct
+Y resistance but can influence the coupled X/Z and roof-brace response.
+
+For sloping end panels, each actual corner-to-base diagonal gets its own area
+from its actual length, s and height. This calibrates each load direction to
+1/c for horizontal top-edge slip, rather than assigning a mean-height rod to
+both diagonals. Panel tables give mean-height reference geometry and list both
+actual diagonal properties. Gable infill above the line between top corners is
+not assigned additional stiffness. Roof and wall panels share existing structural
+collector nodes. Side-wall ground nodes are fixed anchor assumptions; unused
+anchors have no links or stiffness in the bare/ULS model. Continuous wall sheets,
+collectors and anchorage are assumed. Partial wall openings, connection slip and
+sheet/fastener/collector/anchor capacities require separate assessment.
+
 Conventional members remain installed. Every ULS case uses the bare network;
 every SLS case solves both the bare and enhanced networks. Bare-model mechanisms
 still fail, and a neutral bare tangent still prevents checked acceptance. Panels
-do not cross the ridge or add ridge-flashing links. They connect only to existing
-structural roof nodes; collector and boundary connections are assumed. No wall
-diaphragm, screw/collector strength or connection-slip acceptance is added.
+do not cross the ridge or add ridge-flashing links. Roof panels connect to existing
+structural roof nodes; collector and boundary connections are assumed. Wall
+options add stiffness only; screw/collector strength and connection-slip acceptance
+remain separate.
 This option does not add transverse wind or alter the production portal model.
 
 TXT/JSON retain c, its direction, s/n/Ld, Aeq, EA, equivalent diameter, bare and
@@ -94,10 +144,21 @@ lines. Per-case net panel shear sums the signed contributions of opposite
 diagonals, so equal tensions due to panel extension do not become net shear.
 Individual diagonal forces remain available for boundary/collector checks. The
 surrogates appear as separate stiffness-only table rows and are excluded from
-physical member sizing and purchased quantities. Changing the option, c or direction
+physical member sizing and purchased quantities. Wall base reactions are also
+separated from conventional member reactions in the load-path evidence. Changing any option, c or direction
 invalidates the calculation/export cache. `bracing_diaphragm_regression.py`
 checks independent racking stiffness and reversal, directional conversion,
 ULS independence, recovery, sizing and saved-workspace behavior.
+
+TXT/JSON include the Revision B calibration records: roof test c = 4.5 mm/kN on
+a 6 x 6 m specimen, geometry adjustment to the reference roof, judgement factors
+1.50 and 1.20, raw c about 2.820 and rounded reference 3.0; wall LTP20/LTP45 test
+maxima 2.753/4.854, depths 17.4/43 mm, interpolation to 29 mm (3.705), reference
+geometry, thickness/pitch exponents and assumed 175.1 mm reference pitch, judgement
+factors 1.20/1.20, raw c about 5.941 and rounded reference 6.0. Every panel retains
+its actual a/b, geometry factor, adopted c and equivalent diagonal properties.
+Measured source inputs are distinguished from empirical interpolation/allowances.
+The note's 0.42 BMT five-rib fixing/support assumptions remain explicit.
 
 Eight wind cases cover front-to-back/back-to-front, Cpi +/- and ULS/SLS. Each
 uses simultaneous windward/leeward pressures from the existing wind module,

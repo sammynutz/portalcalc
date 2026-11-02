@@ -89,7 +89,7 @@ class BracingLayoutCanvas(QWidget):
             return ""
         case = self.result['cases'][self.case_index]
         member = next(m for m in case['members']+case.get('diaphragm_members', []) if m['id'] == identifier)
-        if member['kind'] == 'roof_diaphragm':
+        if member['kind'].endswith('_diaphragm'):
             return (f"{identifier}\nSLS equivalent diaphragm: {member['axial_n']/1000:.3f} kN ({member['state']})"
                     f"\nPhysical panel shear component ({member['shear_direction']}): {member['panel_shear_kn']:.3f} kN; "
                     f"boundary flow component {member['shear_flow_kn_per_m']:.3f} kN/m. Net panel shear is in Full results."
@@ -190,7 +190,7 @@ class BracingLayoutCanvas(QWidget):
                     color = "#a43db2"
                 else:
                     color = "#c1c8ce" if member["state"] == "slack" else "#ce4d43" if member["axial_n"] >= 0 else "#287bb4"
-                if member['kind'] == 'roof_diaphragm':
+                if member['kind'].endswith('_diaphragm'):
                     color = '#8bbab5' if member['state'] == 'slack' else '#008c82'
                 width = 1.5+2*abs(member["axial_n"])/maximum
                 draw.append(((a[1]+b[1])/2, a[0], b[0], color, width, member))
@@ -200,7 +200,7 @@ class BracingLayoutCanvas(QWidget):
                     painter.drawLine(project(original[member["start"]])[0], project(original[member["end"]])[0])
                 selected = member["id"] == self.member_selected
                 painter.setPen(QPen(QColor("#e69b18" if selected else color), 4.5 if selected else width,
-                                    Qt.DashLine if member['kind'] == 'roof_diaphragm' else Qt.SolidLine))
+                                    Qt.DashLine if member['kind'].endswith('_diaphragm') else Qt.SolidLine))
                 painter.drawLine(a, b)
                 self.hit_members.append((a, b, member["id"], depth))
             sls = self.result.get('design', {}).get('global_sls', {})
@@ -329,7 +329,7 @@ class BracingLayoutDialog(QDialog):
         self._history = [self.model.to_dict()]
         self._history_index = 0
         layout = QVBoxLayout(self)
-        intro = QLabel("Mark where bracing cannot go. All other panels remain available for the future layout search. Pin the braces to include in a fixed-layout analysis or retain in a future search. This view covers the main building; canopies and lean-tos are not included.")
+        intro = QLabel("Mark where bracing cannot go. All other panels remain available for layout search. Pin panels for fixed-layout analysis; Keep selected panels as required retains them during search. This view covers the main building; canopies and lean-tos are not included.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
         controls = QHBoxLayout()
@@ -382,7 +382,7 @@ class BracingLayoutDialog(QDialog):
         layout.addWidget(self.geometry_note)
         self.reset_geometry_button = QPushButton("Use current dimensions and clear saved locations")
         layout.addWidget(self.reset_geometry_button)
-        note = QLabel("Saving locations does not change the Phase 1 checks or portal eave spring. Use Analyse fixed bracing layout in 3D on the Bracing tab to calculate wind-only demands for the pinned panels. Automatic layout selection and restraint coupling remain separate.")
+        note = QLabel("Saving locations does not change the Phase 1 checks or portal eave spring. The 3D bracing workspace can search unblocked panels or check a selected layout. Production portal restraint coupling remains separate.")
         note.setWordWrap(True)
         note.setStyleSheet("color: #697b87;")
         layout.addWidget(note)
@@ -460,7 +460,7 @@ class BracingLayoutDialog(QDialog):
         self.reset_geometry_button.setVisible(changed or bool(self.load_error))
         self.reset_geometry_button.setEnabled(not self.read_only)
         self.save_button.setEnabled(not self.read_only and not changed)
-        self.save_button.setVisible(not self.read_only)
+        self.save_button.setVisible(not self.read_only and not getattr(self, 'embedded', False))
         self.undo_button.setEnabled(not self.read_only and self._history_index > 0)
         self.redo_button.setEnabled(not self.read_only and self._history_index < len(self._history) - 1)
 

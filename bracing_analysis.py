@@ -475,7 +475,7 @@ def load_path_evidence(nodes, result, workings):
     braces have no Y projection. Include direct end-post base load separately
     so the ground-applied half of end-wall pressure is not counted as bracing.
     """
-    peaks, ground = {}, {}
+    peaks, ground, diaphragm_ground = {}, {}, {}
     for member in result['members']:
         kind = member['kind']
         if kind.endswith('brace'):
@@ -486,6 +486,10 @@ def load_path_evidence(nodes, result, workings):
         for point,sign in ((a,-1.),(b,1.)):
             if abs(point[2])<1e-6:
                 face = member.get('panel_id','').split('/')[0] or kind
+                if kind == 'wall_diaphragm':
+                    face = member['panel_id'].split('/')[1]
+                    diaphragm_ground.setdefault(face,np.zeros(3))
+                    diaphragm_ground[face] += sign*vector
                 ground.setdefault(face,np.zeros(3))
                 ground[face] += sign*vector
     roof_y = sum(w['roof_resultant_n'] for w in workings)
@@ -496,7 +500,8 @@ def load_path_evidence(nodes, result, workings):
             'member_base_reactions_n':{face:v.tolist() for face,v in ground.items()},
             'roof_to_member_base_y_residual_n':float(roof_y+member_y),
             'peak_brace_tension_n':peaks,
-            'basis':'End-wall pressure and any external roof friction act along Y. Roof/struts transfer the roof-applied forces to side-wall bracing. Front/back end-wall braces lie in X/Z and have zero direct Y resistance. Transverse-wind cases are not included in this analysis.'}
+            **({'diaphragm_base_reactions_n':{face:v.tolist() for face,v in diaphragm_ground.items()}} if diaphragm_ground else {}),
+            'basis':'End-wall pressure and any external roof friction act along Y. Roof/struts transfer the roof-applied forces to side-wall bracing and any enabled SLS side-wall diaphragms. Front/back end-wall braces/diaphragms lie in X/Z and have zero direct Y resistance. Transverse-wind cases are not included in this analysis.'}
 
 
 def solve_building_case(model, layout, portal, portal_dofs, point_nodes, case):

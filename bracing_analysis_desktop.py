@@ -296,6 +296,9 @@ def prepare_context(window, allow_unconfigured=False):
         "source_preset": source,
         "source_hash": hashlib.sha256(json.dumps(source, sort_keys=True, allow_nan=False).encode()).hexdigest(),
         "default_end_post": profile.get("section"),
+        'global_sls_basis':{'divisor':window.eave_deflection_divisor(),
+            'importance_level':wind_inputs.importance_level,
+            'source':'Main in-plane eave sway criterion; project default IL1 H/100, IL2+ H/150; main overrides retained'},
         'mullion_basis':mullion_basis,
         "front_clad": wind_inputs.front_wall_clad, "back_clad": wind_inputs.back_wall_clad,
         'face_cladding': {'left_wall': wind_inputs.left_wall_clad, 'right_wall': wind_inputs.right_wall_clad,
@@ -303,7 +306,8 @@ def prepare_context(window, allow_unconfigured=False):
         "cost_rates": {"shs": window.costing_rate_from_input(window.shs_cost_input, "shs_rate_per_kg"),
                        "ub": window.costing_rate_from_input(window.ub_cost_input, "ub_rate_per_kg"),
                        "wb": window.costing_rate_from_input(window.wb_cost_input, "wb_rate_per_kg"),
-                       "purlin": window.costing_rate_from_input(window.purlin_cost_input, "purlin_rate_per_kg")},
+                       "purlin": window.costing_rate_from_input(window.purlin_cost_input, "purlin_rate_per_kg"),
+                       'braced_panel_installation': (window.bracing_3d_settings or {}).get('installation_cost_per_panel', 50.)},
         "installed_purlins": installed,
         'stressed_skin': copy.deepcopy((window.bracing_3d_settings or {}).get('stressed_skin')),
         "purlin_strut_tables": strut_table_snapshot(window.metroll_tables or {}),
@@ -346,17 +350,20 @@ def analyse_context(context, strut_profile, end_post_profile):
         end_post_faces=post_faces,
         strut_overrides=strut_profile.overrides() if isinstance(strut_profile, StrutPlan) else None,
         brace_moduli=moduli)
-    from bracing_diaphragm import DiaphragmSettings, roof_diaphragm_model, recover_diaphragm
+    from bracing_diaphragm import DiaphragmSettings, stressed_skin_model, align_fixed_nodes, recover_diaphragm
     diaphragm_settings = DiaphragmSettings.from_dict(context.get('stressed_skin'))
-    diaphragm = {'settings': vars(diaphragm_settings)}
+    diaphragm = {'settings': vars(diaphragm_settings), 'active':diaphragm_settings.active}
     sls_model = model
-    if diaphragm_settings.enabled:
-        sls_model, diaphragm = roof_diaphragm_model(model, layout, point_nodes, diaphragm_settings)
+    if diaphragm_settings.active:
+        cladding = {'front_end':context['front_clad'], 'back_end':context['back_clad'],
+                    **context.get('face_cladding',{})}
+        sls_model, diaphragm = stressed_skin_model(model, layout, point_nodes, diaphragm_settings, cladding)
+        align_fixed_nodes(model,sls_model)
     cases = []
     for case in context["cases"]:
         try:
             solved = solve_building_case(model, layout, portal, portal_dofs, point_nodes, case)
-            if diaphragm_settings.enabled and case['level'] == 'SLS':
+            if diaphragm_settings.active and case['level'] == 'SLS':
                 enhanced = solve_building_case(sls_model, layout, portal, portal_dofs, point_nodes, case)
                 solved = recover_diaphragm(enhanced, diaphragm['panels'], len(model.members), solved)
             cases.append(solved)
@@ -375,7 +382,7 @@ def analyse_context(context, strut_profile, end_post_profile):
            for case in cases if case["case"]["level"] == "SLS"
            for i, displacement in enumerate(case["displacements_mm"]) if i in roof_nodes]
     governing = max(sls, key=lambda item: item[0])
-    if diaphragm_settings.enabled:
+    if diaphragm_settings.active:
         bare = [(float(np.linalg.norm(d)), case['case']['name'], i)
                 for case in cases if 'bare_sls' in case
                 for i,d in enumerate(case['bare_sls']['displacements_mm']) if i in roof_nodes]
@@ -392,6 +399,7 @@ def analyse_context(context, strut_profile, end_post_profile):
     return {
         'face_cladding': dict(context.get('face_cladding', {})),
         'mullion_basis':copy.deepcopy(context.get('mullion_basis')),
+        'global_sls_basis':copy.deepcopy(context.get('global_sls_basis')),
         "schema": "portalcalc.fixed-bracing-analysis.v1", "status": "SOLVED_DEMANDS_ONLY",
         "created_utc": datetime.now(timezone.utc).isoformat(), "elapsed_seconds": time.perf_counter()-start,
         "source_hash": context["source_hash"], "source_preset": context["source_preset"],
@@ -406,8 +414,8 @@ def analyse_context(context, strut_profile, end_post_profile):
         "governing_sls_displacement": {"resultant_mm": governing[0], "case": governing[1],
                                        "node": governing[2], "components_mm": governing[3]},
         "limitations": ([line.replace('No diaphragm or sheeting stiffness.',
-                         'Equivalent roof diaphragm stiffness is included in SLS only.') for line in LIMITATIONS]
-                        + [diaphragm['basis']] if diaphragm_settings.enabled else list(LIMITATIONS)),
+                         'Enabled roof/wall diaphragm stiffness is included in SLS only.') for line in LIMITATIONS]
+                        + [diaphragm['basis']] if diaphragm_settings.active else list(LIMITATIONS)),
     }
 
 
@@ -431,17 +439,35 @@ def text_report(result):
             lines.append(f"{kind.replace('_', ' ').title()}: {section.get('section', section.get('label', '-'))}; A = {section['area_mm2']:.1f} mm2; E = 200000 MPa")
     lines += ["", "SCOPE AND ASSUMPTIONS"] + [f"- {item}" for item in result["limitations"]]
     diaphragm = result.get('stressed_skin', {})
-    if diaphragm.get('settings', {}).get('enabled'):
+    if diaphragm.get('active',diaphragm.get('settings', {}).get('enabled')):
         settings = diaphragm['settings']
         bare = diaphragm['bare_governing_sls']
-        lines += ['', 'SLS STRESSED-SKIN ROOF CONTRIBUTION', diaphragm['source'], diaphragm['basis'],
-                  f"Adopted c = {settings['flexibility_mm_per_kn']:g} mm/kN; shear-displacement direction = {settings['shear_direction']}.",
+        walls = settings.get('side_walls_enabled') or settings.get('end_walls_enabled')
+        title = 'SLS STRESSED-SKIN ROOF AND WALL CONTRIBUTION' if walls else 'SLS STRESSED-SKIN ROOF CONTRIBUTION'
+        geometry_mode = settings.get('calibration_mode')=='rev_b_geometry'
+        c_label = 'reference c' if geometry_mode else 'trial c'
+        lines += ['', title, diaphragm['source'], diaphragm['basis'],
+                  'Calibration mode: '+('Rev B empirical reference geometry; a across ribs / b along ribs; c_panel = c_reference * (a/b^2)/(a_ref/b_ref^2)' if geometry_mode else 'Direct panel c override; no geometry scaling'),
+                  f"Roof {'ON' if settings['enabled'] else 'OFF'}: {c_label} = {settings['flexibility_mm_per_kn']:g} mm/kN; direction = {settings['shear_direction']}.",
+                  f"Side walls {'ON' if settings.get('side_walls_enabled') else 'OFF'}: {c_label} = {settings.get('side_wall_flexibility_mm_per_kn',6.):g} mm/kN, longitudinal shear.",
+                  f"End walls {'ON' if settings.get('end_walls_enabled') else 'OFF'}: {c_label} = {settings.get('end_wall_flexibility_mm_per_kn',6.):g} mm/kN, transverse shear.",
+                  f"Included panels by family: {diaphragm.get('panel_counts',{})}; excluded open faces: {diaphragm.get('excluded_open_faces',[])}.",
                   'Aeq = Ld^3 / (E c s^2), E = 200 kN/mm2; Vpanel = Ndiag s/Ld. Equivalent diameters are stiffness surrogates, not installed rods.',
                   f"Bare conventional maximum SLS resultant: {bare['resultant_mm']:.4f} mm; {bare['case']}; node {bare['node']+1}.",
                   f"Maximum longitudinal SLS movement: bare {diaphragm['bare_max_longitudinal_mm']:.4f} mm; with stressed skin {diaphragm['enhanced_max_longitudinal_mm']:.4f} mm.",
-                  'Panel | s mm | n mm | Ld mm | Aeq mm2 per diagonal | equivalent diameter mm | implied longitudinal c mm/kN']
+                  'REV B REFERENCE CALIBRATION RECORDS (measured benchmarks separated from judgement factors)']
+        for family,reference in diaphragm.get('reference_calibrations',{}).items():
+            lines.append(family+': '+json.dumps(reference,sort_keys=True,ensure_ascii=False))
+        lines.append('Panel | adopted c mm/kN | s mm | n mm | Ld mm | reference Aeq mm2 | equivalent diameter mm | implied longitudinal c mm/kN')
         for panel in diaphragm['panels']:
-            lines.append(f"{panel['id']} | {panel['s_mm']:.3f} | {panel['n_mm']:.3f} | {panel['length_mm']:.3f} | {panel['area_mm2']:.4f} | {panel['equivalent_diameter_mm']:.3f} | {panel['implied_longitudinal_flexibility_mm_per_kn']:.4f}")
+            longitudinal = panel['implied_longitudinal_flexibility_mm_per_kn']
+            longitudinal_text = f'{longitudinal:.4f}' if longitudinal is not None else 'not in the wall plane'
+            lines.append(f"{panel['id']} | {panel['flexibility_mm_per_kn']:.5f} | {panel['s_mm']:.3f} | {panel['n_mm']:.3f} | {panel['length_mm']:.3f} | {panel['area_mm2']:.4f} | {panel['equivalent_diameter_mm']:.3f} | {longitudinal_text}")
+            calibration=panel.get('calibration',{})
+            if calibration:
+                lines.append(f"  {calibration['mode']}: a across ribs {calibration['a_perpendicular_to_ribs_mm']:.3f} mm; b along ribs {calibration['b_parallel_to_ribs_mm']:.3f} mm; geometry factor {calibration['geometry_factor']:.6f}; c input {calibration['reference_c_input_mm_per_kn']:g} -> adopted panel c {calibration['adopted_panel_c_mm_per_kn']:.5f} mm/kN. {calibration['status']}")
+            for member_id,props in panel.get('diagonal_properties',{}).items():
+                lines.append(f"  Actual {member_id}: s {props['s_mm']:.3f}; height {props['n_mm']:.3f}; Ld {props['length_mm']:.3f} mm; Aeq {props['area_mm2']:.4f} mm2; EA {props['ea_kn']:.3f} kN; c {props['flexibility_mm_per_kn']:g} mm/kN. Panel row uses mean-height reference geometry.")
     lines += ["", "ULS MEMBER DEMAND ENVELOPES (positive magnitudes, kN)", "Member | Type | Tension | Compression | Governing source"]
     for item in result["member_envelopes"]:
         source = item["tension_case"] if item["tension_n"] >= item["compression_n"] else item["compression_case"]
@@ -477,6 +503,8 @@ def text_report(result):
                       f"Roof-applied Y load {path['applied_roof_y_n']/1000:.3f} kN; direct-to-base end-wall load {path['direct_ground_y_n']/1000:.3f} kN (separate from bracing)."]
             for face,value in path['member_base_reactions_n'].items():
                 lines.append(f"{face}: member-to-ground reaction X/Y/Z kN = "+' / '.join(f'{v/1000:.3f}' for v in value))
+            for face,value in path.get('diaphragm_base_reactions_n',{}).items():
+                lines.append(f"  SLS diaphragm share at {face} anchors X/Y/Z kN = "+' / '.join(f'{v/1000:.3f}' for v in value))
             lines += [f"Roof Y + member base Y residual {path['roof_to_member_base_y_residual_n']:.6g} N.",
                       'Peak brace tension kN: '+', '.join(f"{g} {v/1000:.3f}" for g,v in path['peak_brace_tension_n'].items())]
         lines += ["", "MEMBER FORCES | N kN (+tension) | Extension mm | State"]

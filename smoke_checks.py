@@ -36,7 +36,7 @@ def compile_sources(root: Path) -> None:
         py_compile.compile(str(root / name), doraise=True)
     for name in ("bracing_analysis.py", "bracing_analysis_desktop.py", "bracing_analysis_ui.py", "bracing_analysis_regression.py"):
         py_compile.compile(str(root / name), doraise=True)
-    for name in ("bracing_design.py", "bracing_design_regression.py", "bracing_workspace_ui.py", 'bracing_policy.py', 'bracing_policy_regression.py', 'bracing_calculation_cache.py', 'bracing_cache_regression.py', 'bracing_serviceability_regression.py', 'bracing_mullion_design.py', 'bracing_alignment_regression.py'):
+    for name in ("bracing_design.py", "bracing_design_regression.py", "bracing_workspace_ui.py", 'bracing_policy.py', 'bracing_policy_regression.py', 'bracing_calculation_cache.py', 'bracing_cache_regression.py', 'bracing_serviceability_regression.py', 'bracing_mullion_design.py', 'bracing_alignment_regression.py', 'bracing_layout_search.py', 'bracing_layout_search_regression.py'):
         py_compile.compile(str(root / name), doraise=True)
     for name in ("bracing_components.py", "bracing_component_ui.py", "bracing_mixed_sizing.py", "bracing_sizing_diagnostics.py", "bracing_components_regression.py", "bracing_schedule.py", "purlin_combined.py", "purlin_beam.py", "purlin_beam_design.py", "purlin_beam_ui.py", "purlin_beam_regression.py", 'purlin_shared_design.py', 'purlin_strut_tables.py', 'purlin_strut_regression.py'):
         py_compile.compile(str(root / name), doraise=True)
@@ -1620,7 +1620,7 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
         item["value"] >= 0.0
         for item in window.design_envelope_actions["sls_column_top_deflections"].values()
     )
-    assert "H/80" in window.section_checks_box.toPlainText()
+    assert "H/100" in window.section_checks_box.toPlainText()
     assert "Wu Cpe Left +" in window.single_load_arrows
     assert "Wu Cpi + with Left +" in window.single_load_arrows
     assert "Ws Cpi - with End -" in window.single_load_arrows
@@ -2772,6 +2772,10 @@ def main() -> None:
         suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(test) for test in (DesignMechanicsTests, WorkspaceTests))
         result = unittest.TextTestRunner(verbosity=1).run(suite)
         assert result.wasSuccessful(), "Bracing design/workspace regression failed"
+    with timed_step('blocked-panel bracing layout search and transactional adoption'):
+        import bracing_layout_search_regression
+        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromModule(bracing_layout_search_regression))
+        assert result.wasSuccessful(), 'Bracing layout search regression failed'
     with timed_step('brace family preferences and unclad-wall rod rules'):
         import unittest
         import bracing_policy_regression

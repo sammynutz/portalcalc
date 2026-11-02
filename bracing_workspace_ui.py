@@ -8,17 +8,19 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QSignalBlocker
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
     QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-    QPlainTextEdit, QProgressDialog, QPushButton, QScrollArea, QSizePolicy, QSplitter, QTableWidget,
+    QPlainTextEdit, QProgressDialog, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTableWidget,
     QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
 from bracing_analysis import AnalysisError
 from bracing_analysis_desktop import text_report
-from bracing_design import DesignCriteria, auto_size, candidate_name, solve_selection
+from bracing_design import (DesignCriteria, auto_size, candidate_name, solve_selection,
+                           global_sway_basis, panel_installation_rate)
 from bracing_layout import BracingLayout, LayoutGeometry
 from bracing_layout_ui import BracingLayoutDialog
 from bracing_component_ui import ComponentEditor
 from bracing_components import StrutPlan
 from bracing_diaphragm import DiaphragmSettings
+from bracing_layout_search import find_layout, LayoutSearchCancelled, LayoutSearchStopped
 from purlin_beam_ui import PurlinBeamResults
 from bracing_sizing_diagnostics import (SizingStopped, diagnostic_text, result_summary,
                                        governing_check_row, check_type)
@@ -35,12 +37,12 @@ class BracingAnalysisDialog(QDialog):
         saved = saved if isinstance(saved, dict) else {}
         self.adopted_mullion_section = saved.get('adopted_mullion_section')
         layout = QVBoxLayout(self)
-        intro = QLabel("Block unavailable panels and pin the X braces to install. Analyse/check or size that fixed layout. Main building, end-wind analysis; production portal restraint and connections remain separate.")
+        intro = QLabel("Block panels where braces cannot go, then Find layout and size. Selected panels can also be checked or sized as a fixed layout. Main building, end-wind analysis; production portal restraint and connections remain separate.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
         toolbar = QHBoxLayout()
         self.run_button = QPushButton("Analyse and check")
-        self.auto_button = QPushButton("Auto size for lowest checked cost")
+        self.auto_button = QPushButton("Size selected layout")
         toolbar.addWidget(self.run_button)
         toolbar.addWidget(self.auto_button)
         self.serviceability_check = QCheckBox('Include serviceability')
@@ -68,6 +70,36 @@ class BracingAnalysisDialog(QDialog):
         self.deformation_scale.setPrefix("Shape x ")
         toolbar.addWidget(self.deformation_scale)
         layout.addLayout(toolbar)
+        search_bar = QHBoxLayout()
+        self.layout_search_button = QPushButton('Find layout and size')
+        self.layout_search_button.setEnabled(not read_only)
+        self.keep_current_panels = QCheckBox('Keep selected panels as required')
+        search_settings = saved.get('layout_search', {})
+        search_settings = search_settings if isinstance(search_settings, dict) else {}
+        self.layout_strategy = QComboBox()
+        self.layout_strategy.addItem('Practical layout (fast)', 'practical')
+        self.layout_strategy.addItem('Detailed cost search', 'cost')
+        self.layout_strategy.setCurrentIndex(max(0, self.layout_strategy.findData(search_settings.get('strategy', 'practical'))))
+        self.layout_strategy.setEnabled(not read_only)
+        self.layout_strategy.setToolTip('Practical: end collectors, end-wall restraint and continuous eave roof-girder patterns, trying up to four compact patterns until a cheaper passing layout is found. Detailed: broader bay-pattern and cost exploration.')
+        self.keep_current_panels.setChecked(search_settings.get('keep_selected') is True)
+        self.keep_current_panels.setToolTip('Unchecked: reconsider current selections; all unblocked panels are candidates. Checked: every currently selected panel must remain.')
+        self.layout_trial_budget = QSpinBox()
+        self.layout_trial_budget.setRange(1, 160)
+        default_budget = 6 if self.layout_strategy.currentData() == 'practical' else 48
+        budget = search_settings.get('max_trials', default_budget) if 'strategy' in search_settings else default_budget
+        self.layout_trial_budget.setValue(budget if isinstance(budget, int) and not isinstance(budget, bool) else default_budget)
+        self.layout_trial_budget.setPrefix('Layout trials: ')
+        self.layout_trial_budget.setToolTip('Practical mode: at most 12 exact analyses per sized layout, with feasibility first and optional brace balancing using remaining budget. Verifies the current layout, then tries up to four compact girder-depth/end-restraint patterns within the layout budget. Detailed mode explores more layouts.')
+        self.layout_strategy.currentIndexChanged.connect(lambda: self.layout_trial_budget.setValue(6 if self.layout_strategy.currentData() == 'practical' else 48))
+        self.keep_current_panels.setEnabled(not read_only)
+        self.layout_trial_budget.setEnabled(not read_only)
+        search_bar.addWidget(self.layout_search_button)
+        search_bar.addWidget(self.layout_strategy)
+        search_bar.addWidget(self.keep_current_panels)
+        search_bar.addWidget(self.layout_trial_budget)
+        search_bar.addStretch()
+        layout.addLayout(search_bar)
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -86,6 +118,7 @@ class BracingAnalysisDialog(QDialog):
         nominal = context.get("nominal_geometry") or LayoutGeometry.from_dict(context["nominal_layout"]["geometry"])
         self.layout_editor = BracingLayoutDialog(nominal, context["nominal_layout"], self, read_only)
         editor = self.layout_editor
+        editor.embedded = True
         editor.setWindowFlags(Qt.Widget)
         editor.layout().setContentsMargins(0, 0, 0, 0)
         editor.layout().itemAt(0).widget().hide()
@@ -163,9 +196,9 @@ class BracingAnalysisDialog(QDialog):
         group = QGroupBox("Section-check assumptions")
         grid = QGridLayout(group)
         stored = saved.get("criteria", {}) if isinstance(saved.get("criteria"), dict) else {}
-        labels = ("Angle / rod Fy (MPa)", "Brace Fu (not used in gross yield)", "Other member tension An/Ag", "Other member tension kt", "Strut effective K", "Post effective K", "SLS H/n or L/n")
+        labels = ("Angle / rod Fy (MPa)", "Brace Fu (not used in gross yield)", "Other member tension An/Ag", "Other member tension kt", "Strut effective K", "Post effective K", "Local member / purlin L/n")
         self.criteria_inputs = {}
-        numeric_criteria = {k:v for k,v in asdict(DesignCriteria()).items() if k!='include_serviceability'}
+        numeric_criteria = {k:v for k,v in asdict(DesignCriteria()).items() if k not in ('include_serviceability','global_sls_divisor')}
         for i, ((name, value), label) in enumerate(zip(numeric_criteria.items(), labels)):
             box = QDoubleSpinBox()
             box.setDecimals(2)
@@ -186,13 +219,50 @@ class BracingAnalysisDialog(QDialog):
             grid.addWidget(QLabel(label), i//2, 2*(i%2))
             grid.addWidget(box, i//2, 2*(i%2)+1)
             self.criteria_inputs[name] = box
+        auto_basis=global_sway_basis({'source_preset':context.get('source_preset',{})},DesignCriteria(),context)
+        explicit_global=stored.get('global_sls_divisor')
+        # A legacy non-default combined H/n/L/n was an explicit user choice.
+        # Preserve it globally; the legacy default 150 becomes automatic sway.
+        if 'global_sls_divisor' not in stored:
+            try:
+                old_divisor=float(stored.get('sls_divisor',150.))
+                if old_divisor>0 and old_divisor!=150.:
+                    explicit_global=old_divisor
+            except (TypeError,ValueError):
+                pass
+        self.global_sls_auto=QCheckBox('Global sway: follow main in-plane criterion')
+        self.global_sls_auto.setChecked(explicit_global is None)
+        self.global_sls_auto.setEnabled(not read_only)
+        self.global_sls_input=QDoubleSpinBox()
+        self.global_sls_input.setDecimals(2);self.global_sls_input.setRange(.01,1000000.)
+        self.global_sls_input.setValue(float(explicit_global if explicit_global is not None else auto_basis['divisor']))
+        self.global_sls_input.setToolTip('Global longitudinal H/n only. Project default IL1 H/100, IL2+ H/150. Local member/purlin deflection checks retain their separate L/n.')
+        grid.addWidget(self.global_sls_auto,4,0,1,4)
+        grid.addWidget(QLabel('Global longitudinal sway H/'),5,0)
+        grid.addWidget(self.global_sls_input,5,1)
+        def refresh_global_sls(*_args):
+            if self.global_sls_auto.isChecked():
+                self.global_sls_input.setValue(auto_basis['divisor'])
+            self.global_sls_input.setEnabled(not read_only and not self.global_sls_auto.isChecked())
+        refresh_global_sls()
+        self.global_sls_auto.toggled.connect(refresh_global_sls)
         inputs.addWidget(group)
-        diaphragm_group = QGroupBox('SLS stressed-skin roof contribution')
+        diaphragm_group = QGroupBox('SLS stressed-skin roof and wall contribution')
         diaphragm_form = QFormLayout(diaphragm_group)
         try:
             diaphragm_saved = DiaphragmSettings.from_dict(saved.get('stressed_skin'))
         except AnalysisError:
             diaphragm_saved = DiaphragmSettings()
+        self.diaphragm_calibration_mode = QComboBox()
+        self.diaphragm_calibration_mode.addItem('Rev B reference c + panel geometry','rev_b_geometry')
+        self.diaphragm_calibration_mode.addItem('Direct panel c (sensitivity override)','direct_c')
+        self.diaphragm_calibration_mode.setCurrentIndex(self.diaphragm_calibration_mode.findData(diaphragm_saved.calibration_mode))
+        self.diaphragm_calibration_mode.setEnabled(not read_only)
+        self.rev_b_button = QPushButton('Apply Rev B roof + walls (3 / 6)')
+        self.rev_b_button.setToolTip('Enable roof and clad side/end-wall SLS diaphragms, set reference c to 3/6 mm/kN and calculate actual panel c using the documented empirical geometry proxy.')
+        self.rev_b_button.setEnabled(not read_only)
+        diaphragm_form.addRow('Flexibility calculation',self.diaphragm_calibration_mode)
+        diaphragm_form.addRow(self.rev_b_button)
         self.stressed_skin_check = QCheckBox('Use technical-note equivalent roof diagonals for SLS')
         self.stressed_skin_check.setChecked(diaphragm_saved.enabled)
         self.stressed_skin_check.setEnabled(not read_only)
@@ -207,15 +277,54 @@ class BracingAnalysisDialog(QDialog):
         diaphragm_form.addRow(self.stressed_skin_check)
         diaphragm_form.addRow('Adopted panel c (mm/kN)', self.diaphragm_flexibility)
         diaphragm_form.addRow('Shear displacement defining c', self.diaphragm_direction)
-        diaphragm_note = QLabel('Technical note: c = 1.5-1.8 mm/kN is the preferred starting range for its specific 0.42 BMT crest-fixed assembly and along-slope shear. Default 1.8; c = 0.72 is a stiffer sensitivity case. Adopt c for each whole slope/bay panel; no geometry-based stiffness scaling. Current end wind is longitudinal: the reported implied longitudinal flexibility differs when c is defined along the slope. Assumes continuous roof sheeting and collectors in every bay. No wall diaphragm or ridge-flashing credit. Fasteners and transfer connections require separate checks.')
+        diaphragm_note = QLabel('Rev B roof baseline: 3.0 mm/kN at 8.5 m across ribs x 12.104 m along slope. Geometry mode calculates each panel c = c_reference x [(a/b²)/(a_reference/b_reference²)], with a across ribs and b along ribs. This is the note\'s provisional empirical screening proxy, not a validated whole-panel/ECCS law. Along-slope shear defines roof c; the current wind is longitudinal. Direct-c mode retains adjustable panel inputs. The baseline factors and actual dimensions are recorded in Full results.')
         diaphragm_note.setWordWrap(True)
         diaphragm_form.addRow(diaphragm_note)
+        self.side_wall_check = QCheckBox('Include clad side-wall diaphragms (SLS)')
+        self.side_wall_check.setChecked(diaphragm_saved.side_walls_enabled)
+        self.end_wall_check = QCheckBox('Include clad end-wall diaphragms (SLS)')
+        self.end_wall_check.setChecked(diaphragm_saved.end_walls_enabled)
+        self.side_wall_flexibility, self.end_wall_flexibility = QDoubleSpinBox(), QDoubleSpinBox()
+        for box,value in ((self.side_wall_flexibility,diaphragm_saved.side_wall_flexibility_mm_per_kn),
+                          (self.end_wall_flexibility,diaphragm_saved.end_wall_flexibility_mm_per_kn)):
+            box.setDecimals(4); box.setRange(.0001,1000000.); box.setValue(value)
+        for check in (self.side_wall_check,self.end_wall_check):
+            check.setEnabled(not read_only)
+        diaphragm_form.addRow(self.side_wall_check)
+        diaphragm_form.addRow('Trial side-wall c (mm/kN)',self.side_wall_flexibility)
+        diaphragm_form.addRow(self.end_wall_check)
+        diaphragm_form.addRow('Trial end-wall c (mm/kN)',self.end_wall_flexibility)
+        wall_note = QLabel('Rev B wall baseline: 6.0 mm/kN at 7 m width x 6 m height, for its assumed 0.42 BMT pan-fixed five-rib assembly. Geometry mode uses actual width and height (mean corner height for sloping ends); both wall references remain editable. Smaller c gives greater stiffness. Other profiles, fixings or supports need renewed calibration/review. Open faces are excluded; wall openings, slip, collector and fixed-anchor capacities remain separate. No ridge-flashing shear credit. Global sway does not upsize struts; ULS and required local deflection checks remain.')
+        wall_note.setWordWrap(True)
+        diaphragm_form.addRow(wall_note)
         def refresh_diaphragm(*_args):
+            geometry = self.diaphragm_calibration_mode.currentData()=='rev_b_geometry'
+            if geometry:
+                self.diaphragm_direction.setCurrentIndex(self.diaphragm_direction.findData('along_slope'))
+            prefix = 'Reference' if geometry else 'Direct panel'
+            diaphragm_form.labelForField(self.diaphragm_flexibility).setText(prefix+' roof c (mm/kN)')
+            diaphragm_form.labelForField(self.side_wall_flexibility).setText(prefix+' side-wall c (mm/kN)')
+            diaphragm_form.labelForField(self.end_wall_flexibility).setText(prefix+' end-wall c (mm/kN)')
             active = self.stressed_skin_check.isChecked() and not read_only
             self.diaphragm_flexibility.setEnabled(active)
-            self.diaphragm_direction.setEnabled(active)
+            self.diaphragm_direction.setEnabled(active and not geometry)
+            self.side_wall_flexibility.setEnabled(self.side_wall_check.isChecked() and not read_only)
+            self.end_wall_flexibility.setEnabled(self.end_wall_check.isChecked() and not read_only)
         refresh_diaphragm()
         self.stressed_skin_check.toggled.connect(refresh_diaphragm)
+        self.side_wall_check.toggled.connect(refresh_diaphragm)
+        self.end_wall_check.toggled.connect(refresh_diaphragm)
+        self.diaphragm_calibration_mode.currentIndexChanged.connect(refresh_diaphragm)
+        def use_rev_b():
+            self.diaphragm_flexibility.setValue(3.)
+            self.side_wall_flexibility.setValue(6.)
+            self.end_wall_flexibility.setValue(6.)
+            self.stressed_skin_check.setChecked(True)
+            self.side_wall_check.setChecked(True)
+            self.end_wall_check.setChecked(True)
+            self.diaphragm_calibration_mode.setCurrentIndex(self.diaphragm_calibration_mode.findData('rev_b_geometry'))
+            self.invalidate()
+        self.rev_b_button.clicked.connect(use_rev_b)
         inputs.addWidget(diaphragm_group)
         def refresh_tension(*_args):
             self.component_editor.refresh_tension_preview(self.criteria_inputs['net_area_factor'].value(),
@@ -223,13 +332,30 @@ class BracingAnalysisDialog(QDialog):
         refresh_tension()
         for field in ('net_area_factor', 'tension_distribution_factor'):
             self.criteria_inputs[field].valueChanged.connect(refresh_tension)
-        notes = QLabel("Per-location roof-purlin reuse is the default: use Components / ratings for connected counts, additions and supplier ratings. Uncheck that mode for the uniform dedicated-steel approximation. The supplied schedule sets Grade 300 rod and Grade 1570 wire strengths. Wire sizes 8/10/12/14/16 mm default to the interim 200 GPa / nominal-area stiffness assumption; declared EA/source can override it. Project rope rates and matching turnbuckle prices/allowances are loaded; grips and other terminations are excluded.\n\nSteel braces use the adopted 0.9 Ag fy member-only tension check; connections remain separate. Scheduled rods already include 0.9. Net-area/kt applies to other calculated member/purlin tension, not gross-yield braces or supplied factored strengths. Steel strut/post compression uses gross body area with local/global buckling; posts include end-wind bending. Purlins use the supplied simplified compression/bending method and G450 minima. Sizing reanalyses candidates; it is not a global optimum. Connections, labour and supplier availability remain separate.")
+        notes = QLabel("Per-location roof-purlin reuse is the default: use Components / ratings for connected counts, additions and supplier ratings. Uncheck that mode for the uniform dedicated-steel approximation. The supplied schedule sets Grade 300 rod and Grade 1570 wire strengths. Wire sizes 8/10/12/14/16 mm default to the interim 200 GPa / nominal-area stiffness assumption; declared EA/source can override it. Project rope rates and matching turnbuckle prices/allowances are loaded; grips and other terminations are excluded.\n\nSteel braces use the adopted 0.9 Ag fy member-only tension check; connections remain separate. Scheduled rods already include 0.9. Net-area/kt applies to other calculated member/purlin tension, not gross-yield braces or supplied factored strengths. Steel strut/post compression uses gross body area with local/global buckling; posts include end-wind bending. Purlins use the supplied simplified compression/bending method and G450 minima. Sizing reanalyses candidates; it is not a global optimum. Panel installation is allowed for below; other connections, labour and supplier availability remain separate.")
         notes.setWordWrap(True)
         inputs.addWidget(notes)
         rates = context["cost_rates"]
         rate_note = QLabel(f"Captured Costing rates ($/kg): hollow {rates['shs']:.2f}; rolled {rates['ub']:.2f}; welded {rates['wb']:.2f}.")
         rate_note.setWordWrap(True)
         inputs.addWidget(rate_note)
+        install_row = QHBoxLayout()
+        install_row.addWidget(QLabel('Installation per braced X panel'))
+        self.panel_installation_input = QDoubleSpinBox()
+        self.panel_installation_input.setRange(0., 1000000.)
+        self.panel_installation_input.setDecimals(2)
+        self.panel_installation_input.setSingleStep(10.)
+        self.panel_installation_input.setPrefix('$ ')
+        try:
+            installation_rate = panel_installation_rate({'braced_panel_installation': saved.get(
+                'installation_cost_per_panel', rates.get('braced_panel_installation', 50.))})
+        except AnalysisError:
+            installation_rate = 50.
+        self.panel_installation_input.setValue(installation_rate)
+        self.panel_installation_input.setEnabled(not read_only)
+        self.panel_installation_input.setToolTip('Once for each physical crossed-brace panel on roof or walls, including both diagonals. SLS diaphragm equivalents are excluded. Included in layout cost comparisons; not a complete installation quote.')
+        install_row.addWidget(self.panel_installation_input)
+        inputs.addLayout(install_row)
         inputs.addStretch()
         input_scroll = QScrollArea()
         input_scroll.setWidgetResizable(True)
@@ -271,6 +397,7 @@ class BracingAnalysisDialog(QDialog):
         layout.addLayout(footer)
         self.run_button.clicked.connect(self.run_analysis)
         self.auto_button.clicked.connect(self.run_auto_size)
+        self.layout_search_button.clicked.connect(self.run_layout_search)
         self.save_button.clicked.connect(self.accept)
         self.cancel_button.clicked.connect(self.reject)
         self.export_json_button.clicked.connect(lambda: self.export(True))
@@ -282,11 +409,19 @@ class BracingAnalysisDialog(QDialog):
             box.setEnabled(not read_only)
             box.valueChanged.connect(self.invalidate)
         self.serviceability_check.toggled.connect(self.invalidate)
+        self.global_sls_auto.toggled.connect(self.invalidate)
+        self.global_sls_input.valueChanged.connect(self.invalidate)
         self.stressed_skin_check.toggled.connect(self.invalidate)
         self.diaphragm_flexibility.valueChanged.connect(self.invalidate)
         self.diaphragm_direction.currentIndexChanged.connect(self.invalidate)
+        self.diaphragm_calibration_mode.currentIndexChanged.connect(self.invalidate)
+        self.side_wall_check.toggled.connect(self.invalidate)
+        self.end_wall_check.toggled.connect(self.invalidate)
+        self.side_wall_flexibility.valueChanged.connect(self.invalidate)
+        self.end_wall_flexibility.valueChanged.connect(self.invalidate)
         editor.layoutChanged.connect(self.invalidate)
         self.component_editor.changed.connect(self.invalidate)
+        self.panel_installation_input.valueChanged.connect(self.invalidate)
         self.visual_mode.currentIndexChanged.connect(self.change_visual_mode)
         self.case_combo.currentIndexChanged.connect(self.show_case)
         self.deformation_scale.valueChanged.connect(self.change_visual_mode)
@@ -303,6 +438,10 @@ class BracingAnalysisDialog(QDialog):
         # an explicit discard of edits, preserving the existing transaction.
         self.accept()
         event.accept()
+
+    def reject(self):
+        if not self._running:
+            super().reject()
 
     def calculation_cache(self):
         if self.result is None:
@@ -358,6 +497,7 @@ class BracingAnalysisDialog(QDialog):
 
     def criteria(self):
         return DesignCriteria(**{name: box.value() for name, box in self.criteria_inputs.items()},
+                              global_sls_divisor=None if self.global_sls_auto.isChecked() else self.global_sls_input.value(),
                               include_serviceability=self.serviceability_check.isChecked())
 
     def snapshot(self):
@@ -365,8 +505,15 @@ class BracingAnalysisDialog(QDialog):
                 "end_post_section": self.post_combo.currentData(),
                 **{f"{g}_label": (c.currentData() or {}).get("label") for g, c in self.brace_combos.items()},
                 "criteria": asdict(self.criteria()),
+                'installation_cost_per_panel': self.panel_installation_input.value(),
+                'layout_search': {'keep_selected': self.keep_current_panels.isChecked(),
+                                  'max_trials': self.layout_trial_budget.value(),
+                                  'strategy': self.layout_strategy.currentData()},
                 'stressed_skin': asdict(DiaphragmSettings(self.stressed_skin_check.isChecked(),
-                    self.diaphragm_flexibility.value(), self.diaphragm_direction.currentData())),
+                    self.diaphragm_flexibility.value(), self.diaphragm_direction.currentData(),
+                    self.side_wall_check.isChecked(),self.side_wall_flexibility.value(),
+                    self.end_wall_check.isChecked(),self.end_wall_flexibility.value(),
+                    self.diaphragm_calibration_mode.currentData())),
                 "invert_orbit_horizontal": self.canvas.invert_orbit_horizontal,
                 "invert_orbit_vertical": self.canvas.invert_orbit_vertical,
                 'show_cladding_overlay': self.cladding_overlay.isChecked(),
@@ -381,25 +528,26 @@ class BracingAnalysisDialog(QDialog):
         return (all(c.currentData() in self.catalog.profile_by_name for c in (self.strut_combo, self.post_combo))
                 and all(c.currentData() is not None for c in self.brace_combos.values()))
 
-    def selections(self):
+    def selections(self, context=None):
         fallback = self.catalog.profile_by_name[self.strut_combo.currentData()]
         wires = {option["label"]: option for option in self.component_editor.brace_candidates()}
-        strut = self.component_editor.plan(self.current_context(), fallback) if self.component_editor.mixed.isChecked() else fallback
+        strut = self.component_editor.plan(context if context is not None else self.current_context(), fallback) if self.component_editor.mixed.isChecked() else fallback
         return {"strut": strut,
                 "end_post": self.catalog.profile_by_name[self.post_combo.currentData()],
                 **{g: wires.get((c.currentData() or {}).get("label"), c.currentData()) for g, c in self.brace_combos.items()}}
 
-    def current_context(self):
+    def current_context(self, require_selected=True):
         editor = self.layout_editor
         if editor.model.geometry != editor.current_geometry:
             raise AnalysisError("Dimensions changed: update the saved layout geometry before analysis")
         payload = editor.snapshot()
-        if not payload["pinned_panels"]:
+        if require_selected and not payload["pinned_panels"]:
             raise AnalysisError("Pin the X-braced panels to install before running")
         actual = BracingLayout(self.context["layout"].geometry, payload["blocked_panels"], payload["pinned_panels"])
         source = copy.deepcopy(self.context["source_preset"])
         source.setdefault("bracing", {}).update(layout=payload, analysis_3d=self.snapshot())
         return {**self.context, "layout": actual, "nominal_layout": payload, "source_preset": source,
+                'cost_rates': {**self.context['cost_rates'], 'braced_panel_installation': self.panel_installation_input.value()},
                 'stressed_skin': self.snapshot()['stressed_skin'],
                 'brace_policy': self.component_editor.snapshot()['brace_policy'],
                 "source_hash": hashlib.sha256(json.dumps(source, sort_keys=True, allow_nan=False).encode()).hexdigest()}
@@ -423,21 +571,27 @@ class BracingAnalysisDialog(QDialog):
         self.change_visual_mode()
         self.export_json_button.setEnabled(False)
         self.export_text_button.setEnabled(False)
-        self.run_button.setEnabled(self.valid_settings())
+        self.run_button.setEnabled(self.valid_settings() and bool(self.layout_editor.model.pinned))
         self.strut_combo.setEnabled(not self.component_editor.mixed.isChecked() and not self.read_only)
-        self.auto_button.setEnabled(self.valid_settings() and not self.read_only)
-        self.auto_button.setText('Auto size for lowest checked cost' if self.component_editor.project_use.currentData() == 'unspecified'
-                                 else 'Auto size by brace preference / cost')
+        self.auto_button.setEnabled(self.valid_settings() and bool(self.layout_editor.model.pinned) and not self.read_only)
+        self.auto_button.setText('Size selected layout' if self.component_editor.project_use.currentData() == 'unspecified'
+                                 else 'Size selected: preference / cost')
+        self.layout_search_button.setEnabled(self.valid_settings() and bool(self.layout_editor.model.available) and not self.read_only)
         self.member_detail.setText("Click a member in the view or table for its governing check.")
-        self.status_label.setText(f"{len(self.layout_editor.model.pinned)} pinned X panels. Pin a fixed layout, then analyse/check or auto-size. Input changes clear previous results.")
+        self.status_label.setText(f"{len(self.layout_editor.model.blocked)} blocked; {len(self.layout_editor.model.pinned)} selected X panels. Find a layout from unblocked panels, or check/size the selected layout. Input changes clear previous results.")
 
     def set_busy(self, busy):
         self._running = busy
         self.layout_editor.setEnabled(not busy)
         self.input_page.setEnabled(not busy)
         self.component_editor.setEnabled(not busy)
-        self.run_button.setEnabled(not busy and self.valid_settings())
-        self.auto_button.setEnabled(not busy and self.valid_settings() and not self.read_only)
+        self.run_button.setEnabled(not busy and self.valid_settings() and bool(self.layout_editor.model.pinned))
+        self.auto_button.setEnabled(not busy and self.valid_settings() and bool(self.layout_editor.model.pinned) and not self.read_only)
+        self.layout_search_button.setEnabled(not busy and self.valid_settings() and bool(self.layout_editor.model.available) and not self.read_only)
+        self.keep_current_panels.setEnabled(not busy and not self.read_only)
+        self.layout_trial_budget.setEnabled(not busy and not self.read_only)
+        self.layout_strategy.setEnabled(not busy and not self.read_only)
+        self.serviceability_check.setEnabled(not busy and not self.read_only)
         self.save_button.setEnabled(not busy)
         self.cancel_button.setEnabled(not busy)
 
@@ -447,6 +601,64 @@ class BracingAnalysisDialog(QDialog):
     def run_auto_size(self):
         if not self.read_only:
             self.perform(True)
+
+    def adopt_sections(self, chosen):
+        for group, combo in (("strut", self.strut_combo), ("end_post", self.post_combo)):
+            if group == 'strut' and isinstance(chosen[group], StrutPlan):
+                self.component_editor.adopt(chosen[group])
+            else:
+                with QSignalBlocker(combo):
+                    combo.setCurrentIndex(combo.findData(chosen[group].name))
+        for group, combo in self.brace_combos.items():
+            with QSignalBlocker(combo):
+                combo.setCurrentIndex(combo.findText(candidate_name(chosen[group])))
+
+    def run_layout_search(self):
+        if self._running or self.read_only or not self.valid_settings():
+            return
+        self.invalidate()
+        progress = QProgressDialog('Searching available panels...', 'Cancel', 0, self.layout_trial_budget.value(), self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        self.set_busy(True)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            context = self.current_context(require_selected=False)
+            def update(step, total, message):
+                progress.setLabelText(message)
+                # Keep the dialog open until the transaction has been adopted.
+                progress.setValue(min(step, total-1))
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    raise LayoutSearchCancelled('Layout search cancelled; layout and sections are unchanged')
+            candidates = {'strut': self.strut_profiles, 'end_post': self.post_profiles,
+                          **{g: self.component_editor.brace_candidates() for g in self.brace_combos}}
+            required = set(context['layout'].pinned) if self.keep_current_panels.isChecked() else set()
+            result, chosen, selected = find_layout(context, self.selections(context), candidates,
+                self.criteria(), context['cost_rates'], required=required, progress=update,
+                max_trials=self.layout_trial_budget.value(), strategy=self.layout_strategy.currentData())
+            if (not result['design']['passes'] or selected.blocked != context['layout'].blocked
+                    or selected.pinned & selected.blocked or not required <= selected.pinned):
+                raise AnalysisError('Layout search returned an unverified or inconsistent candidate; layout and sections unchanged')
+            # Adopt only a checked success, as one undoable layout edit.
+            editor = self.layout_editor
+            editor.model = BracingLayout(editor.model.geometry, editor.model.blocked, selected.pinned)
+            editor.remember()
+            editor.save_button.hide()
+            self.component_editor.refresh_bracing(selected.pinned)
+            self.adopt_sections(chosen)
+            self.display_result(result)
+            self.status_label.setText(f'Layout search: {len(selected.pinned)} selected X panels; {len(selected.blocked)} blocked panel(s) retained. '+self.status_label.text())
+        except LayoutSearchStopped as error:
+            self.status_label.setText(str(error)+' Layout and sections unchanged.')
+            self.report.setPlainText(str(error)+'\n\n'+json.dumps(error.evidence, indent=2))
+        except (AnalysisError, ValueError, ArithmeticError) as error:
+            self.status_label.setText(str(error))
+            self.report.setPlainText(str(error))
+        finally:
+            progress.close()
+            QApplication.restoreOverrideCursor()
+            self.set_busy(False)
 
     def perform(self, sizing):
         if self._running:
@@ -473,15 +685,7 @@ class BracingAnalysisDialog(QDialog):
                 candidates = {"strut": self.strut_profiles, "end_post": self.post_profiles,
                               **{g: self.component_editor.brace_candidates() for g in self.brace_combos}}
                 result, chosen = auto_size(context, self.selections(), candidates, self.criteria(), context["cost_rates"], update)
-                for g, combo in (("strut", self.strut_combo), ("end_post", self.post_combo)):
-                    if g == "strut" and isinstance(chosen[g], StrutPlan):
-                        self.component_editor.adopt(chosen[g])
-                        continue
-                    with QSignalBlocker(combo):
-                        combo.setCurrentIndex(combo.findData(chosen[g].name))
-                for g, combo in self.brace_combos.items():
-                    with QSignalBlocker(combo):
-                        combo.setCurrentIndex(combo.findText(candidate_name(chosen[g])))
+                self.adopt_sections(chosen)
             else:
                 result = solve_selection(context, self.selections(), self.criteria(), context["cost_rates"])
             self.display_result(result)
@@ -560,8 +764,32 @@ class BracingAnalysisDialog(QDialog):
             failed = sum(c['ratio'] is not None and c['ratio'] > 1 for c in result['section_checks'].values())
             unverified = sum(c['ratio'] is None for c in result['section_checks'].values())
             state += f" ({failed} over capacity; {unverified} missing checks)"
-        rows = ["SCOPED SECTION CHECKS", 'Design basis: '+d.get('design_basis','Strength + serviceability'), state, f"Estimated materials + listed fittings: ${d['estimated_cost']:,.2f}",
+        rows = ["SCOPED SECTION CHECKS", 'Design basis: '+d.get('design_basis','Strength + serviceability'), state, f"Estimated materials + listed fittings + panel installation: ${d['estimated_cost']:,.2f}",
                 summary['text'], f"Overall movement source case: {d['global_sls']['case']}", d["basis"], d["cost_basis"], ""]
+        rows += ['STRUT SIZING POLICY',d['strut_sizing_basis'],'']
+        if result.get('layout_search'):
+            search = result['layout_search']
+            rows += ['LAYOUT SEARCH', search['scope'],
+                     search['method'],
+                     f"Layout trials: {search['layout_trials']} / {search['max_layout_trials']}; up to {search['max_section_solves_per_trial']} exact analyses per section-sizing trial.",
+                     f"Blocked panels retained: {len(search['blocked_panels'])}; required panels retained: {len(search['required_panels'])}; selected X panels: {len(search['selected_panels'])}.",
+                     'Selected: '+', '.join(search['selected_panels']), '']
+            if search.get('strategy') == 'practical':
+                rows += [f"Practical layout search: {search['elapsed_seconds']:.2f} s; bounded demand sizing and optional compact-layout comparison. Full cost-polish trials excluded.", search['ordering_basis'], '']
+            if 'structured_seed_trials' in search:
+                rows += [f"Resized engineering starts: {search['structured_seed_trials']}; neighbourhood width: {search['beam_width']}; duplicate trials skipped: {search['duplicate_trials_skipped']}; winning trial: {search['winning_trial']}.", '']
+                rows += ['RESIZED LAYOUT ALTERNATIVES | Panels | Pass | Estimated cost including installation | SLS UC']
+                for trial in search.get('trials', []):
+                    if trial.get('section_sizing'):
+                        cost = trial.get('estimated_cost')
+                        cost_text = f'${cost:,.2f}' if cost is not None else 'unverified'
+                        sway = trial.get('global_sls_ratio')
+                        sway_text = f'{sway:.3f}' if sway is not None else '-'
+                        rows.append(f"{trial['reason']} | {len(trial['selected_panels'])} | {trial['passes']} | {cost_text} | {sway_text}")
+                rows += ['']
+        sway=d['global_sls']
+        rows += [f"GLOBAL SWAY CRITERION: H/{sway.get('divisor',150.):g}; {sway.get('basis',{}).get('source','legacy criterion')}",
+                 f"Local member/purlin deflection divisor: L/{result['design_request']['criteria']['sls_divisor']:g}",'']
         if result.get('mullion_basis'):
             basis=result['mullion_basis']
             rows += ['ALIGNED MAIN MULLION CHECK',basis['basis'],
@@ -574,7 +802,9 @@ class BracingAnalysisDialog(QDialog):
                             rows.append(f"{check['id']} | {row['case']} | Ncomp {a['compression_kn']:.3f} kN; Nt {a['tension_kn']:.3f} kN; M {a['moment_knm']:.3f} kNm; V {a['shear_kn']:.3f} kN; Le {a['effective_length_y_mm']:.1f}/{a['effective_length_z_mm']:.1f} mm; am {a['moment_modifier']:g}; UC {row['ratio']}; {row['mode']}")
         rows += ["COST BREAKDOWN | Purchased kg | $/kg | Material | Listed fittings | Total"]
         for r in d["cost_items"]:
-            if "price_per_m" in r:
+            if r['group'] == 'panel_installation':
+                rows.append(f"Panel installation: {r['panel_count']} physical X panels × ${r['rate_per_panel']:.2f} = ${r['total']:.2f}. {r['allowance']}")
+            elif "price_per_m" in r:
                 rows.append(f"{r['group']}: {r['section']} | {r['purchased_length_m']:.2f} m @ ${r['price_per_m']:.2f}/m | material ${r['material_cost']:.2f} | fittings ${r['listed_fittings_cost']:.2f} | total ${r['total']:.2f}")
                 if r.get('turnbuckle'):
                     rows.append(f"  {r['turnbuckle_count']} x {r['turnbuckle']} at ${r['fittings_per_run']:.2f}; {r.get('fitting_price_source', '')}. {r['allowance']}. Rope: {r.get('rope_price_source', '')}; {r.get('rope_price_adoption', '')}.")
@@ -619,8 +849,6 @@ class BracingAnalysisDialog(QDialog):
                 rows += [f"{t['group']} | {t['section']} | {t.get('passes', False)} | {t['adopted']}"
                          for t in s.get('cost_reduction_trials', [])]
                 rows += ['']
-            for limit in s.get('locally_checked_strut_floor_limits', []):
-                rows.append(f"Strut search EA target capped by checked alternatives | {limit['member']} | requested {limit['requested_ea_n']/1000:.1f} kN | available {limit['checked_ea_ceiling_n']/1000:.1f} kN; other groups can increase.")
         rows += ["Member | Section | UC | Governing check | Source"]
         for c in result["section_checks"].values():
             uc = f"{c['ratio']:.3f}" if c["ratio"] is not None else "NOT CHECKED"
@@ -688,7 +916,7 @@ class BracingAnalysisDialog(QDialog):
         self.export_text_button.setEnabled(True)
         hint = "" if d['passes'] or 'sizing_search' in result or 'sizing_failure' in result else " Analyse and check evaluates current selections; use Auto size to select suitable members."
         retained = 'Auto-sizing stopped; original input selections retained. ' if 'sizing_failure' in result else ''
-        self.status_label.setText(f"{retained}{state} | estimated materials + fittings ${d['estimated_cost']:,.2f} | SLS {d['global_sls']['ratio']:.3f}.{hint} Connections, full combinations and production portal restraint remain separate.")
+        self.status_label.setText(f"{retained}{state} | estimated materials + fittings + installation ${d['estimated_cost']:,.2f} | SLS {d['global_sls']['ratio']:.3f}.{hint} Connections, full combinations and production portal restraint remain separate.")
 
     def show_case(self):
         if self.result is None or self.case_combo.currentIndex() < 0:
@@ -704,7 +932,7 @@ class BracingAnalysisDialog(QDialog):
             ratio = c.get("ratio")
             values = [m["id"], c.get("section", "-"), f"{m['axial_n']/1000:.3f}",
                       f"{ratio:.3f}" if ratio is not None else "-", check_type(self.result, governing_check_row(c) or c), c.get("mode", "-"), c.get("case", "-"), m["state"]]
-            if m['kind'] == 'roof_diaphragm':
+            if m['kind'].endswith('_diaphragm'):
                 values = [m['id'], 'SLS equivalent diagonal', f"{m['axial_n']/1000:.3f}", '-',
                           'Stiffness only', f"Shear component {m['panel_shear_kn']:.3f} kN", 'Adopted panel flexibility', m['state']]
             for column, value in enumerate(values):
@@ -727,8 +955,8 @@ class BracingAnalysisDialog(QDialog):
                    "forces": "Red: tension | Blue: compression | Grey: slack | Width: magnitude",
                    "utilisation": "Governing UC: green <= 0.8 | amber <= 1 | red > 1 | grey: unchecked",
                    "deformed": f"Purple: displaced model x{self.deformation_scale.value():g} | dashed: original"}
-        self.layout_editor.legend_label.setText(legends[mode]+(' | Teal dashed: SLS equivalent roof diaphragm'
-            if self.result and self.result.get('stressed_skin', {}).get('settings', {}).get('enabled') and mode!='layout' else ''))
+        self.layout_editor.legend_label.setText(legends[mode]+(' | Teal dashed: SLS equivalent diaphragm'
+            if self.result and self.result.get('stressed_skin', {}).get('active') and mode!='layout' else ''))
         self.canvas.update()
 
     def set_cladding_overlay(self, visible):
@@ -764,7 +992,8 @@ class BracingAnalysisDialog(QDialog):
         text = self.canvas.member_description(identifier)
         if identifier.startswith('diaphragm/'):
             settings = self.result['stressed_skin']['settings']
-            return text+f"\nAdopted c = {settings['flexibility_mm_per_kn']:g} mm/kN; displacement direction {settings['shear_direction']}. ULS uses conventional bracing only."
+            panel=next(p for p in self.result['stressed_skin']['panels'] if p['id']==identifier.rsplit('/',1)[0])
+            return text+f"\nAdopted c = {panel['flexibility_mm_per_kn']:g} mm/kN; displacement direction {panel['shear_direction']}. ULS uses conventional bracing only."
         check = self.result["section_checks"][identifier]
         row = governing_check_row(check)
         text += '\nCheck type: '+check_type(self.result, row)

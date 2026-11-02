@@ -20,10 +20,18 @@ def _positive(record, key):
     return value
 
 
-def with_beam_demands(result, plan):
+def with_beam_demands(result, plan, only_lines=None):
     """Solve every affected roof line, including adjoining bays without additions."""
     lines = sorted({a.location["line"] for a in plan.members.values() if a.arrangement in {ARRANGEMENT, 'shared_purlin', 'shared_purlin_pair'}})
     runs, by_member = {}, {}
+    if only_lines is not None:
+        requested = {str(line) for line in only_lines}
+        lines = [line for line in lines if str(line) in requested]
+        previous = result.get('purlin_beams', {})
+        # Local sizing changes one roof line at a time. Retain other lines,
+        # but delete the old target run even if its last addition was removed.
+        runs = {key: value for key,value in previous.get('runs', {}).items() if str(key) not in requested}
+        by_member = {key:value for key,value in previous.get('members', {}).items() if str(value.get('line')) not in requested}
     stations = result["analysis_layout"]["geometry"]["bay_stations_mm"]
     spans = [b-a for a, b in zip(stations, stations[1:])]
     for line in lines:

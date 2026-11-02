@@ -176,7 +176,7 @@ COSTING_DEFAULTS = {
 }
 
 SERVICEABILITY_LIMIT_DEFAULTS = {
-    "column_il1": 80.0,
+    "column_il1": 100.0,
     "column_standard": 150.0,
     "storage_eave": 100.0,
     "crane_rail_height": 250.0,

@@ -34,6 +34,8 @@ def result_summary(result):
     movement = (f"Overall longitudinal movement: {'FAIL' if sls['ratio'] > 1 else 'PASS'} - "
                 f"{sls['movement_mm']:.1f} mm / {sls['limit_mm']:.1f} mm limit "
                 f"({sls['ratio']:.3f} x limit); {node['label']}.")
+    if sls.get('divisor') is not None:
+        movement += f" Global sway criterion H/{sls['divisor']:g}."
     if not result['design'].get('include_serviceability',True):
         movement = (f"Overall longitudinal movement: REPORT ONLY - {sls['movement_mm']:.1f} mm / "
                     f"{sls['limit_mm']:.1f} mm reference ({sls['ratio']:.3f} x reference); "
@@ -53,9 +55,21 @@ def result_summary(result):
     lines = (["AUTO-SIZING STOPPED - original input selections shown; no sizing changes adopted."] if retained else [])
     lines += [movement, members, layout]
     diaphragm = result.get('stressed_skin', {})
-    if diaphragm.get('settings', {}).get('enabled'):
+    if diaphragm.get('active',diaphragm.get('settings', {}).get('enabled')):
         settings = diaphragm['settings']
-        lines.append(f"PRELIMINARY SLS stressed skin: c {settings['flexibility_mm_per_kn']:g} mm/kN ({settings['shear_direction']}); "
+        families=[]
+        if settings['enabled']:
+            families.append(f"roof c {settings['flexibility_mm_per_kn']:g} ({settings['shear_direction']})")
+        if settings.get('side_walls_enabled'):
+            families.append(f"side-wall trial c {settings['side_wall_flexibility_mm_per_kn']:g}")
+        if settings.get('end_walls_enabled'):
+            families.append(f"end-wall trial c {settings['end_wall_flexibility_mm_per_kn']:g}")
+        if settings.get('calibration_mode')=='rev_b_geometry':
+            families=[value.replace('trial c','reference c').replace('roof c','roof reference c') for value in families]
+            actual=[p['flexibility_mm_per_kn'] for p in diaphragm['panels']]
+            if actual:
+                families.append(f'geometry-calculated panel c {min(actual):.3f}-{max(actual):.3f}')
+        lines.append('PRELIMINARY SLS stressed skin: '+', '.join(families)+' mm/kN; '
                      f"bare/with-sheet maximum longitudinal movement {diaphragm['bare_max_longitudinal_mm']:.1f}/{diaphragm['enhanced_max_longitudinal_mm']:.1f} mm. "
                      'ULS uses conventional bracing only; diaphragm connections remain unchecked.')
     if not result['design'].get('include_serviceability',True):
@@ -112,6 +126,7 @@ def stop_for_search(initial, screening, reason, group=None, floor=None, ceiling=
                   'stiffness_floor_n': floor, 'catalogue_stiffness_ceiling_n': ceiling,
                   'action': ('The bounded search found no verified design. This is not proof that the layout cannot work. '
                              'Review the retained input checks, screening movement, available section sizes and missing rating/price data. '
+                             'Struts are selected on ULS and required local checks, without a global-sway EA floor. Global movement needs review of the bracing/frame/diaphragm load path. '
                              'No failed screening selections have been adopted.'),
                   'retained_analysis': 'Original input selections; no failed sizing candidate adopted'}
     diagnostic.update(global_sls=dict(retained), screening_global_sls=dict(sls),
@@ -146,7 +161,7 @@ def failure_record(option, checked):
     return [record for _, record in records.values()]
 
 
-def stop_for_strut(initial_result, current_result, assembly, failures, floor_rejections):
+def stop_for_strut(initial_result, current_result, assembly, failures):
     identifier = assembly.location["id"]
     label = describe_location(assembly.location, initial_result["analysis_layout"]["geometry"])
     # Diagnose the failed screening state, while retaining the original input
@@ -170,37 +185,18 @@ def stop_for_strut(initial_result, current_result, assembly, failures, floor_rej
         target, column = "purlin", 7
         title = reason
         action = "Review the member's case checks and rejected alternatives below; revise the applicable ratings, arrangement or layout."
-    if floor_rejections and not failures:
-        title = "all strut alternatives are below the current SLS stiffness requirement"
-        action = "Review global SLS movement, available strut sizes and the pinned bracing layout."
     if primary.get("ratio") is not None and primary["ratio"] > 1:
         title += f" (UC {primary['ratio']:.3f})"
     suffix = f" ({abs(force):.3f} kN {'tension' if force >= 0 else 'compression'})" if force is not None else ""
-    screening_sls = current_result.get('design', {}).get('global_sls', {})
-    global_stop = (floor_rejections > 0 and screening_sls.get('included_in_design',True) and screening_sls.get('ratio', 0) > 1
-                   and not any(r['state'] == 'missing_data' for r in failures))
-    retained_sls = initial_result.get('design', {}).get('global_sls', {})
-    if global_stop:
-        target, column = 'layout', None
-        title = f"global longitudinal serviceability exceeds the limit (screening SLS UC {screening_sls['ratio']:.3f})"
-        action = ('Review the deformed shape and the pinned roof/wall bracing load path. '
-                  'The search exhausted eligible strut alternatives while enforcing its SLS stiffness floor. '
-                  'This is not proof that a larger purlin will resolve the system movement; '
-                  'check the bracing arrangement and available stiffness before further section sizing.')
-        suffix = f"; original inputs move {retained_sls['movement_mm']:.1f} mm against {retained_sls['limit_mm']:.1f} mm"
     diagnostic = {"status": "STOPPED_NO_ADOPTION", "member": identifier, "location": label,
                   "section": original.get("section", assembly.name), "reason": title,
                   "screening_section": evaluation.get("section", assembly.name),
                   "case": primary.get("case", "-"), "axial_kn": force, "action": action,
                   "input_target": target, "input_column": column,
                   "rating_key": assembly.location["purlin"]["basis_key"],
-                  "rejected_alternatives": failures, "stiffness_floor_rejections": floor_rejections,
+                  "rejected_alternatives": failures, "stiffness_floor_rejections": 0,
                   "retained_analysis": "Original input selections; no failed sizing candidate adopted"}
-    if global_stop:
-        node = retained_sls['node']
-        diagnostic.update(global_sls=dict(retained_sls), screening_global_sls=dict(screening_sls),
-                          governing_node=initial_result['nodes'][node], case=retained_sls['case'])
-    return SizingStopped(f"{'Bracing system' if global_stop else label}: {title}{suffix}", initial_result, diagnostic)
+    return SizingStopped(f"{label}: {title}{suffix}", initial_result, diagnostic)
 
 
 def diagnostic_text(diagnostic):

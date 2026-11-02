@@ -2,6 +2,8 @@
 import json
 from pathlib import Path
 import unittest
+from dataclasses import replace
+from unittest import mock
 
 from bracing_analysis import AnalysisError
 from purlin_strut_tables import snapshot, table_row, single_span_capacities
@@ -67,6 +69,34 @@ class StrutTableTests(unittest.TestCase):
 
 
 class SharedMechanicsTests(unittest.TestCase):
+    def test_local_line_screen_matches_full_recovery_and_removes_stale_runs(self):
+        from bracing_components import StrutPlan
+        from purlin_beam_design import with_beam_demands
+        members = {}
+        for line in range(2):
+            for assembly in fixture(active=(0,1)):
+                loc = {**assembly.location, 'line': line,
+                       'id': f"strut/bay/{assembly.location['bay']}/line/{line}"}
+                members[loc['id']] = replace(assembly, location=loc)
+        plan = StrutPlan(members, {})
+        result = {'analysis_layout': {'geometry': {'bay_stations_mm': [0,8000,16000]}}}
+        baseline = with_beam_demands(result, plan)
+        # Removing an addition changes the full target run, including its neighbour.
+        for bay in range(2):
+            key = f'strut/bay/{bay}/line/0'
+            members = dict(members)
+            members[key] = location_options(members[key].location, [])[0]
+            changed = replace(plan, members=members)
+            full = with_beam_demands(baseline, changed)
+            with mock.patch('purlin_shared_design.solve_shared', wraps=solve_shared) as solve:
+                local = with_beam_demands(baseline, changed, only_lines={0})
+            self.assertEqual(local['purlin_beams'], full['purlin_beams'])
+            self.assertIs(local['purlin_beams']['runs']['1'], baseline['purlin_beams']['runs']['1'])
+            self.assertEqual(solve.call_count, 1 if bay == 0 else 0)
+            baseline = local
+        self.assertNotIn('0', local['purlin_beams']['runs'])
+        self.assertNotIn('strut/bay/0/line/0', local['purlin_beams']['members'])
+
     def pair_fixture(self, count=1):
         assemblies = fixture(count=count)
         assemblies[0] = next(o for o in location_options(assemblies[0].location, [])
@@ -199,7 +229,7 @@ class SharedMechanicsTests(unittest.TestCase):
         rates = {'shs':5.12,'ub':3.7,'wb':4.48,'purlin':1.9}
         return context,selected,pools,rates
 
-    def test_checked_strut_ceiling_does_not_stop_other_group_stiffening(self):
+    def test_sls_grows_braces_without_imposing_a_strut_stiffness_floor(self):
         from unittest import mock
         from bracing_design import auto_size,solve_selection,member_assessment,candidate_stiffness
         c,s,p,rates = self.cost_trade_fixture()
@@ -223,7 +253,8 @@ class SharedMechanicsTests(unittest.TestCase):
              mock.patch('bracing_design.member_assessment',side_effect=assessed):
             result,chosen = auto_size(c,s,p,DesignCriteria(),rates,max_solves=8)
         self.assertTrue(result['design']['passes'])
-        self.assertTrue(result['sizing_search']['locally_checked_strut_floor_limits'])
+        self.assertEqual(result['sizing_search']['locally_checked_strut_floor_limits'],[])
+        self.assertIn('no global-sway stiffness floor',result['sizing_search']['strut_sizing_basis'])
         self.assertTrue(all(a.arrangement!='additional_steel' for a in chosen['strut'].members.values()))
         self.assertEqual(result['sizing_search']['exact_solves'],solver.call_count)
         self.assertLessEqual(solver.call_count,8)

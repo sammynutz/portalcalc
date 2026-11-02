@@ -10,7 +10,7 @@ import json
 import math
 import re
 
-from bracing_analysis import AnalysisError
+from bracing_analysis import AnalysisError, positive
 from bracing_analysis_desktop import analyse_context
 from costing import END_WALL_ROD_TURNBUCKLES, UB_STOCK_LENGTHS_M, section_cost_bucket
 from member_checks import MemberActions, SectionCheckProperties, check_member
@@ -36,19 +36,55 @@ class DesignCriteria:
     post_ke: float = 1.
     sls_divisor: float = 150.
     include_serviceability: bool = True
+    global_sls_divisor: float | None = None
 
     def validate(self):
         for name, value in asdict(self).items():
+            if name=='global_sls_divisor' and value is None:
+                continue
             if name=='include_serviceability':
                 if not isinstance(value,bool):
                     raise AnalysisError('Include serviceability must be true or false')
                 continue
-            if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+            if isinstance(value, bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or value <= 0:
                 raise AnalysisError(f"Invalid section-check criterion: {name}")
         if self.net_area_factor > 1 or self.tension_distribution_factor > 1:
             raise AnalysisError("Net area and force distribution factors must not exceed 1")
         if self.brace_fu_mpa < self.brace_fy_mpa:
             raise AnalysisError("Brace ultimate stress must be at least its yield stress")
+
+
+def global_sway_basis(result,criteria,context=None):
+    """Global H/n is independent of local member/purlin L/n.
+
+    Desktop models carry the actual main in-plane eave criterion. Export-only
+    rechecks recover the same defaults/overrides from the frozen source preset.
+    Low-level fixtures without an importance level retain their legacy L/n
+    reference unless they supply an explicit global criterion.
+    """
+    source=result.get('source_preset',{})
+    importance=source.get('wind',{}).get('importance_level')
+    if criteria.global_sls_divisor is not None:
+        return {'divisor':criteria.global_sls_divisor,'source':'Explicit 3D global sway override',
+                'importance_level':importance,'mode':'override'}
+    basis=(context or {}).get('global_sls_basis') or result.get('global_sls_basis')
+    if basis:
+        return {**basis,'divisor':positive(basis.get('divisor'),'Global sway divisor'),'mode':'follow_in_plane'}
+    if importance is not None:
+        il1=str(importance).strip() in ('1','1.0')
+        display=source.get('display',{})
+        limits=display.get('serviceability_limit_overrides') or {}
+        key='column_il1' if il1 else 'column_standard'
+        divisor=limits.get(key,100. if il1 else 150.)
+        if source.get('storage_loads',{}).get('enabled'):
+            divisor=limits.get('storage_eave',100.)
+        if display.get('eave_deflection_limit_override') is not None:
+            divisor=display['eave_deflection_limit_override']
+        return {'divisor':positive(divisor,'Global sway divisor'),'importance_level':importance,
+                'source':'Main in-plane eave sway criterion from frozen preset; project IL1 H/100 default',
+                'mode':'follow_in_plane'}
+    return {'divisor':criteria.sls_divisor,'importance_level':None,
+            'source':'Legacy low-level fixture reference; importance level unavailable','mode':'legacy_reference'}
 
 
 def candidate_name(candidate):
@@ -279,6 +315,32 @@ def group_cost(result, group, candidate, rates):
             "total": purchased_kg*rate+fitting_cost, "allowance": allowance}
 
 
+def panel_installation_rate(rates):
+    value = rates.get('braced_panel_installation', 50.)
+    try:
+        rate = float(value)
+    except (TypeError, ValueError):
+        raise AnalysisError('Braced-panel installation allowance must be finite and non-negative') from None
+    if isinstance(value, bool) or not math.isfinite(rate) or rate < 0:
+        raise AnalysisError('Braced-panel installation allowance must be finite and non-negative')
+    return rate
+
+
+def panel_installation_cost(result, rates):
+    """Once per physical X panel, independent of case count and rod slackness."""
+    kinds = {'roof_brace', 'wall_brace', 'end_brace'}
+    panels = {m['id'][6:].rsplit('/', 1)[0] for m in result['cases'][0]['members']
+              if m['kind'] in kinds and m['id'].startswith('brace/')}
+    rate = panel_installation_rate(rates)
+    return {'group': 'panel_installation', 'section': 'Installation allowance',
+            'panel_count': len(panels), 'panels': sorted(panels), 'rate_per_panel': rate,
+            'member_count': 0, 'installed_kg': 0., 'purchased_kg': 0., 'material_rate_per_kg': 0.,
+            'installed_length_m': 0., 'purchased_length_m': 0.,
+            'material_cost': 0., 'listed_fittings_cost': 0., 'installation_cost': len(panels)*rate,
+            'total': len(panels)*rate,
+            'allowance': 'Once per installed physical X panel, including both diagonals; roof, side and end walls. SLS diaphragm equivalents excluded.'}
+
+
 def attach_design(result, selections, criteria, rates, context=None):
     criteria.validate()
     if isinstance(selections["strut"], StrutPlan):
@@ -292,6 +354,10 @@ def attach_design(result, selections, criteria, rates, context=None):
             assessed = apply_group_rule(context, group, candidate, assessed)
         checks.update((row["id"], row) for row in assessed)
         costs.append(group_cost(result, group, candidate, rates))
+    installation = panel_installation_cost(result, rates)
+    materials_and_fittings = sum(row['total'] for row in costs)
+    costs.append(installation)
+    sway_basis=global_sway_basis(result,criteria,context)
     movements = []
     for case in result["cases"]:
         if case["case"]["level"] != "SLS":
@@ -299,11 +365,12 @@ def attach_design(result, selections, criteria, rates, context=None):
         for node, displacement in zip(result["nodes"], case["displacements_mm"]):
             height = node["point_mm"][2]
             if height > 0:
-                limit = height/criteria.sls_divisor
+                limit = height/sway_basis['divisor']
                 movements.append({"ratio": abs(displacement[1])/limit, "node": node["index"],
                                   "case": case["case"]["name"], "movement_mm": abs(displacement[1]), "limit_mm": limit})
     drift = max(movements, key=lambda row: row["ratio"])
     drift.update(included_in_design=criteria.include_serviceability,passes=drift['ratio']<=1)
+    drift.update(divisor=sway_basis['divisor'],basis=sway_basis)
     stable = all(case["tangent_status"] == "positive_with_taut_rods"
                  and case.get('bare_sls', {}).get('tangent_status', 'positive_with_taut_rods') == 'positive_with_taut_rods'
                  for case in result["cases"])
@@ -312,8 +379,10 @@ def attach_design(result, selections, criteria, rates, context=None):
     passes = all(row["passes"] for row in checks.values()) and (not criteria.include_serviceability or drift["passes"]) and stable
     request = {"source_hash": result["source_hash"], "sections": {g: candidate_name(c) for g, c in selections.items()},
                "section_properties": {g: candidate_properties(c, criteria) for g, c in selections.items()},
-               "net_fracture_multiplier": .85, "criteria": asdict(criteria), "cost_rates": rates}
+               "net_fracture_multiplier": .85, "criteria": asdict(criteria),
+               "cost_rates": {**rates, 'braced_panel_installation': installation['rate_per_panel']}}
     request['stressed_skin'] = result.get('stressed_skin', {}).get('settings', {})
+    request['global_sls_basis'] = sway_basis
     if result.get('mullion_basis'):
         request['mullion_basis']=result['mullion_basis']
         request['section_properties']['end_post']=asdict(selections['end_post'].check_properties())
@@ -326,6 +395,7 @@ def attach_design(result, selections, criteria, rates, context=None):
     preliminary = any(c.get('method') == 'assigned_half_reference' for check in checks.values() for c in check.get('case_checks', []))
     brace_screen = any(c.get('method') == 'gross_yield_brace_tension' for check in checks.values() for c in check.get('case_checks', []))
     result["design"] = {"passes": passes, 'preliminary_reference_checks': preliminary,
+                        'strut_sizing_basis':'ULS interaction and required local member/roof serviceability; no global-sway stiffness floor; actual EA retained in analysis',
                         'include_serviceability':criteria.include_serviceability,
                         'design_basis':'Strength + serviceability' if criteria.include_serviceability else 'Strength only',
                         'serviceability_passes':sls_pass,
@@ -333,13 +403,17 @@ def attach_design(result, selections, criteria, rates, context=None):
                         "member_checks_pass": all(r["passes"] for r in checks.values()),
                         "global_sls": drift, "taut_tangent_verified": stable,
                         "estimated_cost": sum(row["total"] for row in costs), "cost_items": costs,
+                        'materials_and_fittings_cost': materials_and_fittings,
+                        'installation_cost': installation['total'],
+                        'installed_braced_panel_count': installation['panel_count'],
                         "cost_model": {"stock_lengths_m": UB_STOCK_LENGTHS_M, "hollow_waste_factor": 1.07,
+                                       'braced_panel_installation_rate': installation['rate_per_panel'],
                                        "legacy_fitting_price_catalogue": END_WALL_ROD_TURNBUCKLES,
                                        "selected_scheduled_fittings": {g: {key: c.get(key) for key in
                                            ("forged_turnbuckle", "grade_s_turnbuckle", "fitting_unit_cost")}
                                            for g, c in selections.items() if isinstance(c, dict) and c.get("component_type") == "scheduled_rod"}},
                         "basis": "Project-schedule rods/ropes use supplied factored brace strengths directly. Other members use the preliminary member engine with explicit 0.85 net-fracture multiplier and configured net-area/kt/effective lengths. One section per steel strut/post/brace group. Strong-axis bending orientation. Wind plus local member self-weight checks only; connections and full load combinations remain separate.",
-                        "cost_basis": "Current Costing rates, exact brace lengths, 7% hollow waste, rolled stock rounding, one listed turnbuckle per rod. Angle fittings, other connections, labour and supplier availability/quotes are not priced."}
+                        "cost_basis": "Current Costing rates, exact brace lengths, 7% hollow waste, rolled stock rounding, one listed turnbuckle per rod. Angle fittings, other connections and supplier availability/quotes are not priced."}
     result["limitations"] = [line for line in result["limitations"] if not line.startswith(("Forces are analysis demands only.", "Fixed pinned-panel layout;"))]
     result["limitations"] += [result["design"]["basis"], result["design"]["cost_basis"]]
     if result.get('mullion_basis'):
@@ -361,12 +435,12 @@ def attach_design(result, selections, criteria, rates, context=None):
     if assumed_groups:
         result['limitations'].append(WIRE_ASSUMED_SOURCE+'. Groups: '+', '.join(assumed_groups)+
             '. May underpredict rope stretch; omitted cladding stiffness does not establish conservatism. '
-            + ('Roof diaphragm contribution is included in SLS only on the separately recorded adopted flexibility basis.'
-               if result.get('stressed_skin', {}).get('settings', {}).get('enabled') else 'Global diaphragm contribution remains excluded.'))
+            + ('Enabled roof/wall diaphragm contribution is included in SLS only on the separately recorded adopted flexibility basis.'
+               if result.get('stressed_skin', {}).get('active') else 'Global diaphragm contribution remains excluded.'))
     if isinstance(selections["strut"], StrutPlan):
         old_basis, old_cost = result["design"]["basis"], result["design"]["cost_basis"]
         result["design"]["basis"] = "Per-location common-end purlin/added-member assemblies. Installed compression uses the project-adopted Lysaght May 1999 p20 simplified method with Metroll 2023 p7 Ag/web-axis radius, or declared Nc/Nex ratings as selected. Purlin member tension uses 0.9 min(Ag fy, 0.85 kt An fu), G450 lower-bound fy450/fu480 and configured net-area/kt assumptions, or declared Nt/source as selected. Independent bending/axial envelopes. Added unsheeted cold-formed plies use separate residual ratings. Back-to-back roof sharing only when declared. Common-end/collector force transfer is assumed; its connection capacity is unchecked. No composite bending I."
-        result["design"]["cost_basis"] = "Incremental added struts/purlins only; existing roof purlins already costed. New purlins use 7% waste at the captured purlin rate. Other connections/labour excluded."
+        result["design"]["cost_basis"] = "Incremental added struts/purlins only; existing roof purlins already costed. New purlins use 7% waste at the captured purlin rate. Other unlisted connections excluded."
         result["limitations"] = [line for line in result["limitations"] if not line.startswith("Dedicated axial struts") and line not in (old_basis, old_cost)]
         result["limitations"] += [result["design"]["basis"], result["design"]["cost_basis"]]
         if any(not run.get('preliminary') for run in result.get('purlin_beams', {}).get('runs', {}).values()):
@@ -375,6 +449,9 @@ def attach_design(result, selections, criteria, rates, context=None):
             from purlin_shared_design import BASIS
             result['design']['basis'] += ' '+BASIS
             result['limitations'].append(BASIS)
+    result['design']['cost_basis'] += (' Installation is a flat $'+f"{installation['rate_per_panel']:g}"+
+        ' per physical X-braced panel, once for the crossed pair; other labour/connection costs remain excluded.')
+    result['limitations'].append(installation['allowance'])
     return result
 
 
@@ -401,6 +478,52 @@ def stiffness_ceiling(context, result, group, candidates, rates):
 
 def bounded_stiffness_floor(previous, current, factor, ceiling):
     return min(ceiling, max(previous, current*factor))
+
+
+def fast_sway_proposal(context, result, chosen, candidates, criteria, rates, tried):
+    """One cheap, targeted brace change after local strength sizing.
+
+    Compare the cheapest stiffer choice in each brace group by incremental cost
+    per relative EA gain. This is a ranking heuristic, not an assumed sway gain.
+    Posts/struts are not inflated as a proxy for longitudinal sway. Every proposal
+    requires an exact full-model strength/SLS/stability check.
+    """
+    # Round-robin sweeps may revisit a group at its new EA. A single increment
+    # in each group is not catalogue exhaustion and must not force extra bays.
+    # The caller's exact-solve budget bounds the number of successful proposals.
+    for sweep in range(2):
+        proposals = []
+        for group in ('end_brace', 'roof_brace', 'wall_brace'):
+            if group in tried or not group_members(result, group):
+                continue
+            current_ea = candidate_stiffness(chosen[group])
+            ranked = []
+            for candidate in candidates[group]:
+                ea = candidate_stiffness(candidate)
+                if ea <= current_ea+1e-9 or not policy_eligible(context, group, candidate):
+                    continue
+                try:
+                    cost = group_cost(result, group, candidate, rates)['total']
+                except AnalysisError:
+                    continue
+                if all(row['passes'] for row in group_assessments(result, group, candidate, criteria)):
+                    ranked.append((candidate_rank(context, group, candidate), cost, -ea, candidate_name(candidate), candidate))
+            if ranked:
+                rank, cost, neg_ea, name, candidate = min(ranked, key=lambda row: row[:4])
+                old_cost = group_cost(result, group, chosen[group], rates)['total']
+                gain = (-neg_ea/current_ea)-1.
+                proposals.append((rank-candidate_rank(context, group, chosen[group]),
+                                  max(0., cost-old_cost)/gain, cost-old_cost,
+                                  ('end_brace', 'roof_brace', 'wall_brace').index(group), group, candidate))
+        if proposals:
+            *_, group, candidate = min(proposals, key=lambda row: row[:4])
+            tried.add(group)
+            return {**chosen, group: candidate}, group
+        if not sweep and tried:
+            tried.clear()
+        else:
+            break
+    return None
 
 
 def reduce_verified_cost(context, best, candidates, criteria, rates, budget, progress=None):
@@ -450,23 +573,89 @@ def reduce_verified_cost(context, best, candidates, criteria, rates, budget, pro
     return best, trials, used, screens
 
 
-def auto_size(context, selections, candidates, criteria, rates, progress=None, max_solves=18):
+def balance_compact_braces(context, best, candidates, criteria, rates, floors, budget, progress=None):
+    """At most two coupled checks: lighter roof, stronger wall, balanced ends.
+
+    One-sided roofs can make roof-only stiffness growth expensive. This stencil
+    moves stiffness to the vertical wall while reducing roof/end material. It
+    does not assume a stiffness gain; every proposal gets a full exact check.
+    """
+    result, chosen = best
+    groups = ('roof_brace', 'wall_brace', 'end_brace')
+    if budget <= 0 or any(not group_members(result, group) for group in groups):
+        return best, [], 0
+    def priced(group, test):
+        rows = []
+        for option in candidates[group]:
+            ea = candidate_stiffness(option)
+            if ea < floors.get(group, 0)-1e-9 or not test(option, ea) or not policy_eligible(context, group, option):
+                continue
+            try:
+                cost = group_cost(result, group, option, rates)['total']
+            except AnalysisError:
+                continue
+            rows.append((candidate_rank(context, group, option), cost, -ea, candidate_name(option), option))
+        return rows
+    from bracing_policy import family
+    roof_ea = candidate_stiffness(chosen['roof_brace'])
+    roofs = priced('roof_brace', lambda option, ea: family(option) == family(chosen['roof_brace']) and ea < roof_ea-1e-9)
+    walls = priced('wall_brace', lambda option, ea: ea > candidate_stiffness(chosen['wall_brace'])+1e-9)
+    if not roofs or not walls:
+        return best, [], 0
+    # Nearest smaller roof section avoids a speculative large stiffness loss.
+    roof = min(roofs, key=lambda row: (row[0], row[2], row[1], row[3]))[-1]
+    wall = min(walls, key=lambda row: row[:4])[-1]
+    ends = priced('end_brace', lambda option, ea: ea >= candidate_stiffness(roof)-1e-9)
+    records, used = [], 0
+    for *_, end in sorted(ends, key=lambda row: row[:4]):
+        if used >= min(2, budget):
+            break
+        proposal = {**chosen, 'roof_brace': roof, 'wall_brace': wall, 'end_brace': end}
+        group_cost_old = sum(group_cost(result, g, chosen[g], rates)['total'] for g in groups)
+        expected = result['design']['estimated_cost']-group_cost_old+sum(group_cost(result,g,proposal[g],rates)['total'] for g in groups)
+        if expected >= best[0]['design']['estimated_cost']-1e-9:
+            continue
+        if progress:
+            progress(used, min(2,budget), 'Checking lighter roof / stronger wall brace balance')
+        used += 1
+        record = {'sections': {g: candidate_name(proposal[g]) for g in groups}, 'adopted': False}
+        try:
+            checked = solve_selection(context, proposal, criteria, rates)
+        except AnalysisError as error:
+            record['analysis_error'] = str(error)
+        else:
+            record.update(passes=checked['design']['passes'], estimated_cost=checked['design']['estimated_cost'],
+                          global_sls_ratio=checked['design']['global_sls']['ratio'])
+            if checked['design']['passes'] and selection_score(context, proposal, checked) < selection_score(context, best[1], best[0]):
+                best = checked, proposal
+                record['adopted'] = True
+        records.append(record)
+    return best, records, used
+
+
+def auto_size(context, selections, candidates, criteria, rates, progress=None, max_solves=18,
+              *, fast=False, initial_result=None, retain_brace_stiffness=False):
     """Cheapest candidates for successive demand envelopes; always reanalyse.
 
     Returns the lowest-cost passing reanalysed candidate found. Stiffness floors
-    may rise to meet global SLS. No claim of exhaustive/global optimality.
+    may rise for brace/post groups to meet global SLS. Struts have no global
+    sway stiffness floor and retain their ULS/local checks. No global optimum claim.
     """
     if isinstance(selections["strut"], StrutPlan):
         from bracing_mixed_sizing import auto_size_mixed
-        return auto_size_mixed(context, selections, candidates, criteria, rates, progress, max_solves)
+        return auto_size_mixed(context, selections, candidates, criteria, rates, progress, max_solves,
+                               fast=fast, initial_result=initial_result, retain_brace_stiffness=retain_brace_stiffness)
     current = dict(selections)
-    result = solve_selection(context, current, criteria, rates)
+    result = initial_result if initial_result is not None else solve_selection(context, current, criteria, rates)
     initial = result
     solves = 1
     ceilings = {g: stiffness_ceiling(context, result, g, candidates[g], rates) for g in GROUPS}
     best = (result, dict(current)) if result["design"]["passes"] else None
     trace, visited, floors = [], set(), {group: 0. for group in GROUPS}
+    if retain_brace_stiffness:
+        floors.update({g: candidate_stiffness(current[g]) for g in ('roof_brace', 'wall_brace', 'end_brace')})
     screens = 0
+    local_rounds, sway_tried, sway_adjustments = 0, set(), []
     for iteration in range(max_solves-1):
         if progress:
             progress(iteration, max_solves, f"Sizing round {iteration+1}; best verified cost: " + (f"${best[0]['design']['estimated_cost']:,.2f}" if best else "none yet"))
@@ -476,12 +665,36 @@ def auto_size(context, selections, candidates, criteria, rates, progress=None, m
                       "estimated_cost": result["design"]["estimated_cost"], "global_sls_ratio": result["design"]["global_sls"]["ratio"]})
         if result["design"]["passes"] and (best is None or selection_score(context, current, result) < selection_score(context, best[1], best[0])):
             best = (result, dict(current))
+        if fast and iteration > 0 and result['design']['passes']:
+            break
+        if (fast and (local_rounds or retain_brace_stiffness) and criteria.include_serviceability and result['design']['member_checks_pass']
+                and result['design']['taut_tangent_verified'] and result['design']['global_sls']['ratio'] > 1):
+            adjustment = fast_sway_proposal(context, result, current, candidates, criteria, rates, sway_tried)
+            if adjustment:
+                proposed, group = adjustment
+                floors[group] = max(floors[group], candidate_stiffness(proposed[group]))
+                if progress:
+                    progress(iteration, max_solves, 'Checking targeted SLS stiffness: '+group)
+                solves += 1
+                try:
+                    result = solve_selection(context, proposed, criteria, rates)
+                except AnalysisError as error:
+                    if best:
+                        break
+                    raise stop_for_search(initial, result, 'Targeted brace check failed: '+str(error)) from error
+                current = proposed
+                sway_adjustments.append(group)
+                continue
+            if best:
+                break
+            raise stop_for_search(initial, result, 'Short targeted brace-stiffness checks exhausted; review the load path')
         if not result["design"]["taut_tangent_verified"]:
             raise stop_for_search(initial, result, 'Auto-sizing requires verified taut-rod tangent stiffness for every case; review the layout/neutral rods')
-        if criteria.include_serviceability and result["design"]["global_sls"]["ratio"] > 1:
+        if not fast and criteria.include_serviceability and result["design"]["global_sls"]["ratio"] > 1:
             factor = min(max(result["design"]["global_sls"]["ratio"], 1.12), 2.)
             for group in GROUPS:
-                floors[group] = bounded_stiffness_floor(floors[group], candidate_stiffness(current[group]), factor, ceilings[group])
+                if group != 'strut':
+                    floors[group] = bounded_stiffness_floor(floors[group], candidate_stiffness(current[group]), factor, ceilings[group])
         proposed = dict(current)
         for group in GROUPS:
             if not group_members(result, group):
@@ -509,6 +722,7 @@ def auto_size(context, selections, candidates, criteria, rates, progress=None, m
                 break
             raise stop_for_search(initial, result, 'Candidate selections repeat before a verified design is found')
         solves += 1
+        local_rounds += 1
         try:
             next_result = solve_selection(context, proposed, criteria, rates)
         except AnalysisError as error:
@@ -520,10 +734,15 @@ def auto_size(context, selections, candidates, criteria, rates, progress=None, m
         best = (result, dict(current))
     if best is None:
         raise stop_for_search(initial, result, 'No verified member/SLS sizing found within the search limit')
-    best, reductions, extra, reduction_screens = reduce_verified_cost(context, best, candidates, criteria, rates, max_solves-solves, progress)
+    best, reductions, extra, reduction_screens = reduce_verified_cost(context, best, candidates, criteria, rates, 0 if fast else max_solves-solves, progress)
     solves += extra
     best[0]["sizing_search"] = {"method": "Cost-ranked grouped demand-envelope iteration with exact reanalysis",
                                 "scope": "Passing candidate found, ranked by project brace-family preferences then estimated cost; not a global catalogue/layout optimum",
                                 "candidate_screens": screens+reduction_screens, "rounds": trace, "max_solves": max_solves,
-                                'exact_solves': solves, 'stiffness_ceilings_n': ceilings, 'cost_reduction_trials': reductions}
+                                'exact_solves': solves, 'stiffness_ceilings_n': ceilings, 'cost_reduction_trials': reductions,
+                                'strut_sizing_basis':'ULS interaction and required local member/roof serviceability; no global-sway stiffness floor'}
+    best[0]['sizing_search']['fast'] = fast
+    best[0]['sizing_search']['targeted_sway_adjustments'] = sway_adjustments
+    if fast:
+        best[0]['sizing_search']['scope'] = 'Demand-ranked local section sizing; stop after a verified resized pass; optional cost-polish analyses omitted. No least-cost claim.'
     return best

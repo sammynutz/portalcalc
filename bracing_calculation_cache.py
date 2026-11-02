@@ -22,13 +22,13 @@ def encoded(value):
 def engine_revision():
     # Source builds can change without a release/version increment. In packaged
     # builds the explicit revision also invalidates caches when the engine changes.
-    digest = hashlib.sha256(b'bracing-cache-engine-2026-11-01-v6-sls-diaphragm-inboard-struts')
+    digest = hashlib.sha256(b'bracing-cache-engine-2026-11-02-v15-adaptive-eave-girder-families')
     digest.update(APP_VERSION.encode())
     digest.update(np.__version__.encode())
     folder = Path(__file__).parent
     names = ('bracing_analysis.py','bracing_analysis_desktop.py','bracing_design.py',
              'bracing_components.py','bracing_mixed_sizing.py','bracing_policy.py',
-             'bracing_schedule.py','bracing_layout.py','bracing_calculation_cache.py','bracing_diaphragm.py',
+             'bracing_schedule.py','bracing_layout.py','bracing_layout_search.py','bracing_calculation_cache.py','bracing_diaphragm.py',
              'purlin_combined.py','purlin_beam.py','purlin_beam_design.py',
              'purlin_shared_design.py','purlin_strut_tables.py','member_checks.py',
              'bracing_sizing_diagnostics.py','bracing_mullion_design.py','end_wall.py','costing.py','loads.py','wind.py','main.py')
@@ -58,6 +58,7 @@ def fingerprint(context, settings, selections, criteria):
             'rates':context['cost_rates'],'cladding':context.get('face_cladding'),
             'installed_purlins':context.get('installed_purlins'),
             'mullion_basis':context.get('mullion_basis'),
+            'global_sls_basis':context.get('global_sls_basis'),
             'stressed_skin':context.get('stressed_skin'),
             'table_sha256':context.get('purlin_strut_tables',{}).get('sha256'),
             'sections':{g:candidate_properties(c,criteria) for g,c in selections.items()}}

@@ -23,12 +23,16 @@ def _beam(ei, length):
                              [-12,-6*l,12,-6*l], [6*l,2*l*l,-6*l,4*l*l]])
 
 
+@lru_cache(maxsize=256)
 def _shape(length):
     return (SHAPES[0], SHAPES[1]*length, SHAPES[2], SHAPES[3]*length)
 
 
 def _integral(poly):
-    return float(poly.integ()(1)-poly.integ()(0))
+    # Exact integral over the unit interval. Demand recovery calls this for
+    # every element/load; constructing two Polynomial antiderivatives here
+    # dominated repeated uncoupled roof-run screens.
+    return float(sum(coefficient/(power+1) for power, coefficient in enumerate(poly.coef)))
 
 
 def _roots(poly):

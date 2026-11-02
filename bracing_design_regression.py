@@ -181,6 +181,7 @@ class DesignMechanicsTests(unittest.TestCase):
         self.assertTrue(result['design']['passes'])
         self.assertEqual(chosen['wall_brace']['label'], '16 DIA ROD')
         self.assertEqual(chosen['roof_brace']['label'], '20 DIA ROD')
+        self.assertEqual(chosen['strut'].name,p['strut'][0].name)
         self.assertAlmostEqual(result['design']['global_sls']['ratio'], 1.25*2*16**2/(16**2+20**2))
         self.assertLessEqual(solver.call_count, 8)
         self.assertEqual(solver.call_count, result['sizing_search']['exact_solves'])
@@ -200,6 +201,17 @@ class DesignMechanicsTests(unittest.TestCase):
         self.assertEqual(error.result['design_request']['sections']['roof_brace'], '16 DIA ROD')
         self.assertGreater(error.diagnostic['screening_global_sls']['ratio'], 1.)
         json.dumps(error.result, allow_nan=False)
+
+    def test_global_sway_does_not_select_a_large_strut_when_uls_and_local_sls_pass(self):
+        c,s,p,analysed=self.collector_fixture()
+        p['strut'].append(self.catalog.profile_by_name['250*12.5 SHS'])
+        with mock.patch('bracing_design.solve_selection',side_effect=analysed):
+            result,chosen=auto_size(c,s,p,DesignCriteria(),{'shs':3.,'ub':4.,'wb':5.},max_solves=8)
+        self.assertTrue(result['design']['passes'])
+        self.assertEqual(chosen['strut'].name,'100*3 SHS')
+        self.assertEqual(chosen['roof_brace']['label'],'20 DIA ROD')
+        self.assertTrue(all(row['sections']['strut']!='250*12.5 SHS' for row in result['sizing_search']['rounds']))
+        self.assertIn('no global-sway stiffness floor',result['sizing_search']['strut_sizing_basis'])
 
     def test_stiffness_ceiling_excludes_unpriced_and_policy_ineligible_sections(self):
         from bracing_schedule import rod_options
