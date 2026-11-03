@@ -182,7 +182,12 @@ def prepare_context(window, allow_unconfigured=False):
     portal = PortalReduction(structure, points)
     wind_inputs = window.wind_inputs_from_ui(g.span_mm, g.pitch_deg, g.eave_mm)
     source = copy.deepcopy(window.collect_preset_data())
+    from bracing_spacing import max_bay_spacing
+    spacing_limit=max_bay_spacing({'source_preset':source})
     cases = end_wind_cases(wind_inputs,source['finishes']['roof_profile'])
+    from bracing_roof_loads import building_roof_cases
+    cases, roof_load_basis = building_roof_cases(cases,portal,g,wind_inputs,source,
+                                                window.snow_loads_from_ui()['service_kpa'])
     profile = (window.end_wall_mullion_design or {}).get("selected") or {}
     main_mullions = window.end_wall_mullion_design or {}
     governing = main_mullions.get('governing_mullion') or {}
@@ -280,6 +285,8 @@ def prepare_context(window, allow_unconfigured=False):
             installed[str(line)]['bending_ratio'] = max(loads['outward_kn_m']/match['outward_capacity_kn_m'],loads['inward_strength_kn_m']/match['inward_strength_capacity_kn_m'])
             installed[str(line)]['service_ratio'] = loads['service_kn_m']/match['inward_service_capacity_kn_m']
             eave_data.update(loaded_area_m2=area_m2,wind_upward_kpa=up,wind_downward_kpa=down)
+        from purlin_end_local import end_roof_local_cases
+        installed[str(line)]['beam_inputs']['end_roof_local_cases'] = end_roof_local_cases(wind_inputs,g,installed[str(line)])
         installed[str(line)]["bending_key"] = hashlib.sha256(json.dumps({
             key: installed[str(line)][key] for key in ("section", "area_mm2", "bending_ratio", "service_ratio",
                 "added_bending_ratio", "added_service_ratio", "basis_key", "bending_span_mm", "bending_snapshot", "beam_inputs",
@@ -288,6 +295,8 @@ def prepare_context(window, allow_unconfigured=False):
     from purlin_strut_tables import snapshot as strut_table_snapshot
     return {
         "layout": layout, "nominal_layout": saved.to_dict(), "nominal_geometry": nominal, "portal": portal, "cases": cases,
+        'roof_load_basis': roof_load_basis,
+        'max_braced_bay_spacing':spacing_limit,
         "roof_brace": copy.deepcopy(window.selected_brace_size(window.roof_brace_size_combo)),
         "wall_brace": copy.deepcopy(window.selected_brace_size(window.wall_brace_size_combo)),
         "end_brace": copy.deepcopy(window.selected_end_wall_brace_size()),
@@ -318,8 +327,8 @@ LIMITATIONS = [
     "Fixed pinned-panel layout; unmarked available panels are not installed braces. No automatic layout or section optimisation.",
     "First-order small-displacement elastic analysis, with tension-only rod slackening; no P-delta, buckling, prestress or connection slip.",
     "If zero-force rods are needed for the elastic tangent, equilibrium is reported with stability unverified. A positive taut-rod tangent is not a buckling or code stability check.",
-    "Longitudinal wind: simultaneous end-wall pressures and external roof friction, both directions and both Cpi branches, ULS and SLS. No G/Q, transverse wind, wall/underside/exposed-member drag or full design combinations.",
-    "Normal roof/side-wall pressures are not applied to the reduced 3D frame. Purlin bending uses a separate roof-load envelope; it is not a simultaneous whole-building pressure pattern.",
+    "ULS/SLS gravity and longitudinal wind combinations include G (solar/fire/HVAC/other and actual portal self-weight), Q/snow, simultaneous end-wall pressures, external roof friction and normal roof/clad side-wall pressures. Additional ULS-only side winds include both directions, roof alternatives, internal pressure, end-wall suction and 0.9G/1.2G. Transverse SLS, crane/storage actions and wall/underside/exposed-member drag remain outside scope.",
+    "Normal roof/side-wall loads act through full portal load condensation/recovery. Roof load tributaries use simply supported bay reactions with half tributaries at end frames; purlin continuity redistribution is excluded. Local Table 5.6 patches remain purlin bending checks only.",
     "Roof friction uses the projected external-roof portion of clause 5.5/Table 5.9, with sheeting running down-slope. For open-sided buildings this is a preliminary extension of the enclosed-building method, not a complete open-roof aerodynamic assessment.",
     "End-wall pressure uses simply supported vertical strips: half of each strip resultant goes to roof and half directly to ground. Open ends receive no cladding pressure.",
     "Identical actual 2D portal sections/supports repeat at every frame line. Legacy eave restraints are removed in a private copy. Portal attachment translations use work-conjugate beam interpolation.",
@@ -330,8 +339,8 @@ LIMITATIONS = [
 ]
 
 
-def analyse_context(context, strut_profile, end_post_profile):
-    start = time.perf_counter()
+def prepare_analysis_models(context, strut_profile, end_post_profile):
+    """Shared physical assembly for full checks and lightweight SLS trials."""
     layout, portal = context["layout"], context["portal"]
     post_faces = {face for face, clad in (("front_end", context["front_clad"]), ("back_end", context["back_clad"]))
                   if clad or any(layout.panels[p].face == face for p in layout.pinned)}
@@ -359,11 +368,21 @@ def analyse_context(context, strut_profile, end_post_profile):
                     **context.get('face_cladding',{})}
         sls_model, diaphragm = stressed_skin_model(model, layout, point_nodes, diaphragm_settings, cladding)
         align_fixed_nodes(model,sls_model)
+    return model, sls_model, roof_grid, portal_dofs, point_nodes, diaphragm
+
+
+def analyse_context(context, strut_profile, end_post_profile):
+    start = time.perf_counter()
+    layout, portal = context['layout'], context['portal']
+    model, sls_model, roof_grid, portal_dofs, point_nodes, diaphragm = prepare_analysis_models(
+        context, strut_profile, end_post_profile)
+    from bracing_components import StrutPlan, assembly_properties
+    from bracing_diaphragm import recover_diaphragm
     cases = []
     for case in context["cases"]:
         try:
             solved = solve_building_case(model, layout, portal, portal_dofs, point_nodes, case)
-            if diaphragm_settings.active and case['level'] == 'SLS':
+            if diaphragm['active'] and case['level'] == 'SLS':
                 enhanced = solve_building_case(sls_model, layout, portal, portal_dofs, point_nodes, case)
                 solved = recover_diaphragm(enhanced, diaphragm['panels'], len(model.members), solved)
             cases.append(solved)
@@ -382,7 +401,7 @@ def analyse_context(context, strut_profile, end_post_profile):
            for case in cases if case["case"]["level"] == "SLS"
            for i, displacement in enumerate(case["displacements_mm"]) if i in roof_nodes]
     governing = max(sls, key=lambda item: item[0])
-    if diaphragm_settings.active:
+    if diaphragm['active']:
         bare = [(float(np.linalg.norm(d)), case['case']['name'], i)
                 for case in cases if 'bare_sls' in case
                 for i,d in enumerate(case['bare_sls']['displacements_mm']) if i in roof_nodes]
@@ -400,6 +419,7 @@ def analyse_context(context, strut_profile, end_post_profile):
         'face_cladding': dict(context.get('face_cladding', {})),
         'mullion_basis':copy.deepcopy(context.get('mullion_basis')),
         'global_sls_basis':copy.deepcopy(context.get('global_sls_basis')),
+        'roof_load_basis':copy.deepcopy(context.get('roof_load_basis')),
         "schema": "portalcalc.fixed-bracing-analysis.v1", "status": "SOLVED_DEMANDS_ONLY",
         "created_utc": datetime.now(timezone.utc).isoformat(), "elapsed_seconds": time.perf_counter()-start,
         "source_hash": context["source_hash"], "source_preset": context["source_preset"],
@@ -415,7 +435,7 @@ def analyse_context(context, strut_profile, end_post_profile):
                                        "node": governing[2], "components_mm": governing[3]},
         "limitations": ([line.replace('No diaphragm or sheeting stiffness.',
                          'Enabled roof/wall diaphragm stiffness is included in SLS only.') for line in LIMITATIONS]
-                        + [diaphragm['basis']] if diaphragm_settings.active else list(LIMITATIONS)),
+                        + [diaphragm['basis']] if diaphragm['active'] else list(LIMITATIONS)),
     }
 
 
@@ -438,6 +458,17 @@ def text_report(result):
         else:
             lines.append(f"{kind.replace('_', ' ').title()}: {section.get('section', section.get('label', '-'))}; A = {section['area_mm2']:.1f} mm2; E = 200000 MPa")
     lines += ["", "SCOPE AND ASSUMPTIONS"] + [f"- {item}" for item in result["limitations"]]
+    spacing=result.get('design',{}).get('layout_spacing',{})
+    if 'anchor_bays' in spacing:
+        from bracing_spacing import spacing_text
+        lines += ['', 'PROJECT BRACED-BAY SPACING',spacing_text(spacing),spacing['basis']]
+    roof_basis = result.get('roof_load_basis')
+    if roof_basis:
+        lines += ['', 'SIMULTANEOUS ROOF LOAD BASIS',roof_basis['basis'],
+                  f"Permanent roof load {roof_basis['permanent_roof_kpa']:g} kPa; live/snow service load {roof_basis['live_or_snow_service_kpa']:g} kPa.",
+                  'Frame roof tributary widths (m): '+', '.join(f'{v/1000:g}' for v in roof_basis['frame_tributary_widths_mm']),
+                  'Roof load extents: '+json.dumps(roof_basis['placements'],sort_keys=True),roof_basis['source'],
+                  'Excluded: '+roof_basis['excluded']]
     diaphragm = result.get('stressed_skin', {})
     if diaphragm.get('active',diaphragm.get('settings', {}).get('enabled')):
         settings = diaphragm['settings']
@@ -484,7 +515,7 @@ def text_report(result):
                   f"Global moment residual [Nmm]: {case['balance_moment_error_nmm']}"]
         if case['case'].get('pressure_basis'):
             b=case['case']['pressure_basis']
-            lines += [f"End-wind coefficient basis: d/b={b['d_over_b']:.5f} (length/span); leeward Cp,e={b['leeward_cpe']:.5f}; effective surfaces {b['effective_surface_count']}; Kce/Kci={b['kce']:g}/{b['kci']:g}.",b['source'],b['scope']]
+            lines += [f"Wind coefficient basis: d/b={b['d_over_b']:.5f} (along-wind depth/crosswind breadth); leeward Cp,e={b['leeward_cpe']:.5f}; effective surfaces {b['effective_surface_count']}; Kce/Kci={b['kce']:g}/{b['kci']:g}.",b['source'],b['scope']]
         if case['case'].get('components_windward_leeward'):
             lines += ['SIMULTANEOUS END-WALL PRESSURES (kPa; inward positive)',
                       'Common Cpi on both ends; net inward = external minus internal. Front inward acts +Y; back inward acts -Y.']
@@ -497,6 +528,24 @@ def text_report(result):
                       drag['application'],drag['basis'],drag['source']]
         for work in case["load_workings"]:
             lines.append(f"{work['face']}: roof {work['roof_resultant_n']/1000:.3f} kN; direct ground {work['direct_ground_resultant_n']/1000:.3f} kN")
+            if work.get('pressure_segments_mm_kpa'):
+                lines.append('Signed Y pressure bands [X start mm, X end mm, kPa]: '+json.dumps(work['pressure_segments_mm_kpa']))
+        if case['case'].get('transverse_pressure_pattern'):
+            pattern=case['case']['transverse_pressure_pattern']
+            lines += ['ULS TRANSVERSE PRESSURE PATTERN',pattern['source'],
+                      'Roof Cpe bands [X start mm, X end mm, Cp,e]: '+json.dumps(pattern['roof_cpe_segments_mm']),
+                      'End-wall side-suction Cpe bands [X start mm, X end mm, Cp,e]: '+json.dumps(pattern['end_wall_cpe_segments_mm']),
+                      'ULS uses conventional bracing only. No transverse SLS/diaphragm credit. Scalar front/back pressure above is the peak; the applied bands are shown here.']
+            drag=case['case']['transverse_roof_drag']
+            lines.append(f"Transverse roof friction X {drag['signed_x_force_kn']:.3f} kN; Cf={drag['cf']:g}, X={drag['x_start_mm']/1000:g} to {drag['x_end_mm']/1000:g} m. "+drag['basis'])
+        if case.get('portal_load_workings'):
+            lines += ['SIMULTANEOUS PORTAL LOADS (physical applied X/Y/Z, kN)',
+                      f"G/Q factors: {case['case'].get('g_factor',0):g} / {case['case'].get('q_factor',0):g}"]
+            for work in case['portal_load_workings']:
+                lines.append(f"Portal {work['index']+1}: "+' / '.join(f'{v/1000:.3f}' for v in work['applied_force_n']))
+            lines.append('Whole-building applied resultant X/Y/Z kN: '+' / '.join(f'{v/1000:.3f}' for v in case['applied_resultant_n']))
+        if case['case'].get('equivalent_case_names'):
+            lines += ['Identical physical combination also represents: '+name for name in case['case']['equivalent_case_names']]
         if case.get('load_path'):
             path = case['load_path']
             lines += ['', 'LOAD PATH / BRACE DIRECTIONS',path['axes'],path['basis'],

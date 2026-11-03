@@ -7,6 +7,7 @@ The approximation is explicit in every affected check and overall result.
 import json
 import math
 from functools import lru_cache
+from numpy.polynomial import Polynomial as P
 
 from bracing_analysis import AnalysisError
 from purlin_beam import solve_run
@@ -79,6 +80,48 @@ def _added_actions(q, length, inertia, offset):
             'shear_kn': abs(q)*length/2/1000, 'deflection_mm': 5*abs(q)*length**4/(384*200000*inertia)}
 
 
+def _added_patch_actions(segments, length, inertia, offset):
+    """Exact simply supported piecewise-UDL actions; each ply remains independent."""
+    # Sizing revisits the same physical ply/patch under many axial options.
+    # These read-only actions depend only on the frozen beam inputs.
+    return _cached_added_patch_actions(tuple(tuple(s) for s in segments), length, inertia, offset)
+
+
+@lru_cache(maxsize=512)
+def _cached_added_patch_actions(segments, length, inertia, offset):
+    loads = [(max(0.,a-offset),min(length,b-offset),q) for a,b,q in segments
+             if min(length,b-offset) > max(0.,a-offset)]
+    force = sum(q*(b-a) for a,b,q in loads)
+    right = sum(q*(b*b-a*a)/2 for a,b,q in loads)/length
+    left = force-right
+    end_w = -left*length**3/6+sum(q*((length-a)**4-(length-b)**4)/24 for a,b,q in loads)
+    c1 = -end_w/length
+    bounds = sorted({0.,length,*[x for a,b,q in loads for x in (a,b)]})
+    samples = []
+    x = P([0.,length])
+    def roots(poly,lo,hi):
+        return [float(r.real) for r in poly.roots() if abs(r.imag)<1e-7 and lo < r.real < hi]
+    for lo,hi in zip(bounds,bounds[1:]):
+        shear,moment,w = P([left]),left*x,-left*x**3/6+c1*x
+        mid = (lo+hi)/2
+        for a,b,q in loads:
+            for edge,sign in ((a,1.),(b,-1.)):
+                if mid > edge:
+                    h = x-edge
+                    shear -= sign*q*h
+                    moment -= sign*q*h*h/2
+                    w += sign*q*h**4/24
+        w /= 200000*inertia
+        positions = {lo/length,hi/length,(lo+hi)/2/length,*roots(shear,lo/length,hi/length),*roots(w.deriv(),lo/length,hi/length)}
+        for t in sorted(positions):
+            samples.append({'x_mm':offset+t*length,'moment_knm':float(moment(t))/1e6,
+                            'shear_kn':float(shear(t))/1000,'deflection_mm':float(w(t)),'plies':1})
+    return {'samples':samples,'positive_moment_knm':max((max(s['moment_knm'],0.) for s in samples),default=0.),
+            'negative_moment_knm':max((max(-s['moment_knm'],0.) for s in samples),default=0.),
+            'shear_kn':max((abs(s['shear_kn']) for s in samples),default=0.),
+            'deflection_mm':max((abs(s['deflection_mm']) for s in samples),default=0.)}
+
+
 def solve_shared(assemblies, spans, line):
     data = assemblies[0].location['purlin']
     rating, inputs = data['axial_rating'], data.get('beam_inputs')
@@ -129,6 +172,12 @@ def solve_shared(assemblies, spans, line):
     for load in loads:
         load['roof_n_mm_by_bay'] = [load['roof_n_mm']*fractions.get(i, 1.) for i in range(len(spans))]
         load['added_n_mm'] = 0.
+    from purlin_end_local import split_segments
+    for local in inputs.get('end_roof_local_cases',[]):
+        loads.append({'name':local['name'],'roof_n_mm':0.,'added_n_mm':0.,'own_factor':0.,
+            'source_segments':local['segments'],'local_pressure':local['local_pressure'],
+            'roof_patches':split_segments(local['segments'],spans,[fractions.get(i,1.) for i in range(len(spans))]),
+            'added_patches':split_segments(local['segments'],spans,[n*(1-fractions[i])/added_counts[i] if i in active else 0. for i in range(len(spans))])})
     roof = _solve({'spans_mm': spans, 'roof_i_mm4': p['web_ix_mm4'], 'added_i_mm4': p['web_ix_mm4'],
                    'roof_count': n, 'span_type': kind, 'lap_ratio': lap, 'loads': loads})
     cases = []
@@ -139,9 +188,15 @@ def solve_shared(assemblies, spans, line):
             q = 0.
             if i in active:
                 c = active[i]
-                q = load['roof_n_mm']*n*(1-fractions[i])/added_counts[i] + load['own_factor']*c['area_mm2']*7.85e-6*9.80665
-                added = _added_actions(q, length, c['section_properties']['web_ix_mm4'], offset)
-                added_total += added_counts[i]*q*length
+                if 'source_segments' in load:
+                    factor = n*(1-fractions[i])/added_counts[i]
+                    segments = [[a,b,q*factor] for a,b,q in load['source_segments']]
+                    added = _added_patch_actions(segments,length,c['section_properties']['web_ix_mm4'],offset)
+                    added_total += added_counts[i]*sum(q*max(0.,min(b,offset+length)-max(a,offset)) for a,b,q in segments)
+                else:
+                    q = load['roof_n_mm']*n*(1-fractions[i])/added_counts[i] + load['own_factor']*c['area_mm2']*7.85e-6*9.80665
+                    added = _added_actions(q, length, c['section_properties']['web_ix_mm4'], offset)
+                    added_total += added_counts[i]*q*length
             else:
                 added = bay['added']
             bays.append({**bay, 'added': added})
@@ -205,14 +260,15 @@ def shared_check(run, entry, component, force, name, level, divisor, criteria):
                      'deflection_per_kn_m': 5*l**4/(384*200000*data['section_properties']['web_ix_mm4']),
                      'capacity': data['table_capacity']}
     if level == 'SLS':
-        d = max(d['deflection_mm'] for _,d in demands)
+        beam_case, governing_demand = max(demands,key=lambda item:item[1]['deflection_mm'])
+        d = governing_demand['deflection_mm']
         rated = reference['deflection_per_kn_m']*reference['capacity']['service_capacity_kn_m']
         limit = data['analysis_span_mm']/divisor
         adjusted = d/rated*(data['analysis_span_mm']/150.)
         return {**base, 'mode': f'PRELIMINARY {split} table-reference serviceability',
                 'ratio': max(d, adjusted)/limit, 'elastic_deflection_mm': d,
                 'table_adjusted_deflection_mm': adjusted, 'deflection_mm': max(d, adjusted),
-                'limit_mm': limit, 'table_reference': reference}
+                'limit_mm': limit, 'table_reference': reference,'governing_beam_case':beam_case}
     try:
         p = properties(data['section'], data['axial_rating'].get('purlin_shape', 'Z'))
         ns = compression_capacity(p['area_mm2'], p['web_rx_mm'], data['analysis_span_mm'])
@@ -222,17 +278,24 @@ def shared_check(run, entry, component, force, name, level, divisor, criteria):
         for case, d in demands:
             direction = 'outward' if 'outward' in case else 'inward'
             cap = reference['capacity'][direction+'_capacity_kn_m']
+            if 'End local' in case:
+                # Local strips can include mixed-sign net pressure; use the
+                # lower directional UDL reference in this preliminary screen.
+                cap = min(reference['capacity']['outward_capacity_kn_m'],reference['capacity']['inward_capacity_kn_m'])
             mr, vr = reference['moment_per_kn_m']*cap, reference['shear_per_kn_m']*cap
             bm = max(d['positive_moment_knm'], d['negative_moment_knm'])/mr
             shear = d['shear_kn']/vr
             comparisons.append({'case': case, 'reference_line_load_kn_m': cap, 'reference_moment_knm': mr,
                                 'reference_shear_kn': vr, 'moment_ratio': bm, 'shear_ratio': shear, 'ratio': max(bm, shear)})
-        envelope = max(r['ratio'] for r in comparisons)
+        governing_bending = max(comparisons,key=lambda r:r['ratio'])
+        envelope = governing_bending['ratio']
         tension = tension_capacity(data, criteria) if force > 1e-8 else {}
         axial = force/tension['tension_capacity_kn'] if force > 1e-8 else max(-force,0.)/ns
     except AnalysisError as error:
         return {**base, 'mode': str(error), 'ratio': None, 'passes': False}
+    local = next(c['loads'].get('local_pressure') for c in run['cases'] if c['name']==governing_bending['case'])
     return {**base, **tension, 'mode': f'PRELIMINARY {split} axial + table-reference envelope',
             'ratio': axial+envelope, 'bending_ratio': max(c['moment_ratio'] for c in comparisons),
             'reference_envelope_ratio': envelope, 'axial_ratio': axial, 'compression_capacity_kn': ns,
-            'table_reference': reference, 'reference_comparisons': comparisons}
+            'table_reference': reference, 'reference_comparisons': comparisons,
+            'governing_beam_case':governing_bending['case'],'governing_local_pressure':local}

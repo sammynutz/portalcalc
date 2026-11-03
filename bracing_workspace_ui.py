@@ -23,21 +23,37 @@ from bracing_diaphragm import DiaphragmSettings
 from bracing_layout_search import find_layout, LayoutSearchCancelled, LayoutSearchStopped
 from purlin_beam_ui import PurlinBeamResults
 from bracing_sizing_diagnostics import (SizingStopped, diagnostic_text, result_summary,
-                                       governing_check_row, check_type)
+                                       governing_check_row, governing_case_member, check_type)
+
+
+def workspace_available_geometry(parent=None):
+    screen=parent.screen() if parent is not None else QApplication.primaryScreen()
+    return screen.availableGeometry()
 
 
 class BracingAnalysisDialog(QDialog):
     def __init__(self, context, catalog, saved=None, parent=None, read_only=False, cached_calculation=None):
         super().__init__(parent)
         self.setWindowTitle("3D bracing - layout, sections and checks")
-        available = QApplication.primaryScreen().availableGeometry()
-        self.resize(min(1420, max(1080, available.width()-50)), min(860, max(680, available.height()-70)))
+        available = workspace_available_geometry(parent)
+        self.setSizeGripEnabled(True)
+        self.setWindowFlag(Qt.WindowMinMaxButtonsHint,True)
+        self.setMinimumSize(min(640,max(1,available.width()-40)),min(360,max(1,available.height()-70)))
+        self.resize(min(1420,max(1,available.width()-40)),min(860,max(1,available.height()-70)))
         self.context, self.catalog, self.read_only = context, catalog, read_only
         self.result, self.report_text, self._running = None, "", False
         saved = saved if isinstance(saved, dict) else {}
         self.adopted_mullion_section = saved.get('adopted_mullion_section')
-        layout = QVBoxLayout(self)
-        intro = QLabel("Block panels where braces cannot go, then Find layout and size. Selected panels can also be checked or sized as a fixed layout. Main building, end-wind analysis; production portal restraint and connections remain separate.")
+        outer=QVBoxLayout(self)
+        self.content_scroll=QScrollArea()
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setFrameShape(QScrollArea.NoFrame)
+        content=QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0,0,0,0)
+        self.content_scroll.setWidget(content)
+        outer.addWidget(self.content_scroll,1)
+        intro = QLabel("Block panels where braces cannot go, then Find layout and size. Selected panels can also be checked or sized as a fixed layout. Main building: gravity/end wind plus ULS side wind; production portal restraint and connections remain separate.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
         toolbar = QHBoxLayout()
@@ -81,7 +97,7 @@ class BracingAnalysisDialog(QDialog):
         self.layout_strategy.addItem('Detailed cost search', 'cost')
         self.layout_strategy.setCurrentIndex(max(0, self.layout_strategy.findData(search_settings.get('strategy', 'practical'))))
         self.layout_strategy.setEnabled(not read_only)
-        self.layout_strategy.setToolTip('Practical: end collectors, end-wall restraint and continuous eave roof-girder patterns, trying up to four compact patterns until a cheaper passing layout is found. Detailed: broader bay-pattern and cost exploration.')
+        self.layout_strategy.setToolTip('Practical: end collectors, end-wall restraint and continuous eave roof-girder patterns. Heavy wall steel triggers an extra-bay rod comparison before compacting. Stops at the first preferred/lower-cost passing layout. Detailed: broader bay-pattern and cost exploration.')
         self.keep_current_panels.setChecked(search_settings.get('keep_selected') is True)
         self.keep_current_panels.setToolTip('Unchecked: reconsider current selections; all unblocked panels are candidates. Checked: every currently selected panel must remain.')
         self.layout_trial_budget = QSpinBox()
@@ -90,7 +106,7 @@ class BracingAnalysisDialog(QDialog):
         budget = search_settings.get('max_trials', default_budget) if 'strategy' in search_settings else default_budget
         self.layout_trial_budget.setValue(budget if isinstance(budget, int) and not isinstance(budget, bool) else default_budget)
         self.layout_trial_budget.setPrefix('Layout trials: ')
-        self.layout_trial_budget.setToolTip('Practical mode: at most 12 exact analyses per sized layout, with feasibility first and optional brace balancing using remaining budget. Verifies the current layout, then tries up to four compact girder-depth/end-restraint patterns within the layout budget. Detailed mode explores more layouts.')
+        self.layout_trial_budget.setToolTip('Practical mode: at most 12 exact analyses per sized layout, with feasibility first. A passing heavy-wall layout can compare up to two extra-bay rod arrangements, then up to four compact patterns, all sharing this layout budget. Detailed mode explores more layouts.')
         self.layout_strategy.currentIndexChanged.connect(lambda: self.layout_trial_budget.setValue(6 if self.layout_strategy.currentData() == 'practical' else 48))
         self.keep_current_panels.setEnabled(not read_only)
         self.layout_trial_budget.setEnabled(not read_only)
@@ -175,6 +191,14 @@ class BracingAnalysisDialog(QDialog):
             catalog.profile_by_name.get(self.strut_combo.currentData(), self.strut_profiles[0]), saved, read_only)
         form.addRow("Uniform steel (alternative model)", self.strut_combo)
         form.addRow("Mullions: main + bracing check" if context.get('mullion_basis') else "End-wall posts", self.post_combo)
+        from bracing_spacing import max_bay_spacing
+        self.max_braced_bay_spacing=QSpinBox()
+        self.max_braced_bay_spacing.setRange(1,50)
+        self.max_braced_bay_spacing.setSuffix(' bays')
+        self.max_braced_bay_spacing.setValue(max_bay_spacing({'max_braced_bay_spacing':search_settings.get('max_braced_bay_spacing',max_bay_spacing(context))}))
+        self.max_braced_bay_spacing.setEnabled(not read_only)
+        self.max_braced_bay_spacing.setToolTip('Project load-path rule: a complete roof-braced bay with aligned side-wall bracing in every N consecutive bays. Default 5; continuous narrow eave strips alone do not count. Find layout adds intermediate bays around blocked panels; fixed-layout checks also report this limit.')
+        form.addRow('Maximum braced-bay spacing',self.max_braced_bay_spacing)
         if context.get('mullion_basis'):
             note=QLabel(f"Main mullion: {context.get('default_end_post')}. Uses the same wind envelope, properties and flybrace basis, plus bracing axial force. A checked adopted section updates main results/costing on Save and close. Main strength/deflection prerequisites apply in either bracing mode.")
             note.setWordWrap(True);inputs.addWidget(note)
@@ -368,8 +392,8 @@ class BracingAnalysisDialog(QDialog):
         forces.addWidget(self.member_detail)
         self.member_table = QTableWidget()
         self.member_table.setColumnCount(8)
-        self.member_table.setHorizontalHeaderLabels(["Member", "Section", "Case axial kN", "UC", 'Check type', "Governing check", "Source", "State"])
-        self.member_table.horizontalHeaderItem(2).setToolTip('Axial force for the selected display case. UC, check type and source describe the governing member envelope.')
+        self.member_table.setHorizontalHeaderLabels(["Member", "Section", "Governing axial kN", "Governing UC", 'Check type', "Governing check", "Governing case", "Governing state"])
+        self.member_table.horizontalHeaderItem(2).setToolTip('Total member/assembly axial force in the case governing its utilisation. Individual ply forces are in the member detail. The diagram and selected-case detail follow the display case. Stiffness-only diaphragm rows show selected-case forces.')
         self.member_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.member_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.member_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -394,7 +418,7 @@ class BracingAnalysisDialog(QDialog):
         self.save_button.setToolTip('Retain layout, sections and current calculations. Saving the building preset also saves the calculations.')
         footer.addWidget(self.cancel_button)
         footer.addWidget(self.save_button)
-        layout.addLayout(footer)
+        outer.addLayout(footer)
         self.run_button.clicked.connect(self.run_analysis)
         self.auto_button.clicked.connect(self.run_auto_size)
         self.layout_search_button.clicked.connect(self.run_layout_search)
@@ -422,6 +446,7 @@ class BracingAnalysisDialog(QDialog):
         editor.layoutChanged.connect(self.invalidate)
         self.component_editor.changed.connect(self.invalidate)
         self.panel_installation_input.valueChanged.connect(self.invalidate)
+        self.max_braced_bay_spacing.valueChanged.connect(self.invalidate)
         self.visual_mode.currentIndexChanged.connect(self.change_visual_mode)
         self.case_combo.currentIndexChanged.connect(self.show_case)
         self.deformation_scale.valueChanged.connect(self.change_visual_mode)
@@ -474,8 +499,7 @@ class BracingAnalysisDialog(QDialog):
             if index>=0:
                 self.visual_mode.setCurrentIndex(index)
             self.deformation_scale.setValue(float(view.get('shape_scale',50.)))
-            current = result['cases'][self.case_combo.currentIndex()]
-            visible_ids = {m['id'] for m in current['members']+current.get('diaphragm_members', [])}
+            visible_ids = {m['id'] for m in self.canvas.display_members()}
             if view.get('member') in visible_ids:
                 self.inspect_member(view['member'])
             self.status_label.setText('Saved calculation restored. '+self.status_label.text())
@@ -508,6 +532,7 @@ class BracingAnalysisDialog(QDialog):
                 'installation_cost_per_panel': self.panel_installation_input.value(),
                 'layout_search': {'keep_selected': self.keep_current_panels.isChecked(),
                                   'max_trials': self.layout_trial_budget.value(),
+                                  'max_braced_bay_spacing':self.max_braced_bay_spacing.value(),
                                   'strategy': self.layout_strategy.currentData()},
                 'stressed_skin': asdict(DiaphragmSettings(self.stressed_skin_check.isChecked(),
                     self.diaphragm_flexibility.value(), self.diaphragm_direction.currentData(),
@@ -547,6 +572,7 @@ class BracingAnalysisDialog(QDialog):
         source = copy.deepcopy(self.context["source_preset"])
         source.setdefault("bracing", {}).update(layout=payload, analysis_3d=self.snapshot())
         return {**self.context, "layout": actual, "nominal_layout": payload, "source_preset": source,
+                'max_braced_bay_spacing':self.max_braced_bay_spacing.value(),
                 'cost_rates': {**self.context['cost_rates'], 'braced_panel_installation': self.panel_installation_input.value()},
                 'stressed_skin': self.snapshot()['stressed_skin'],
                 'brace_policy': self.component_editor.snapshot()['brace_policy'],
@@ -637,7 +663,8 @@ class BracingAnalysisDialog(QDialog):
             result, chosen, selected = find_layout(context, self.selections(context), candidates,
                 self.criteria(), context['cost_rates'], required=required, progress=update,
                 max_trials=self.layout_trial_budget.value(), strategy=self.layout_strategy.currentData())
-            if (not result['design']['passes'] or selected.blocked != context['layout'].blocked
+            from bracing_spacing import spacing_assessment
+            if (not result['design']['passes'] or not spacing_assessment(selected,self.max_braced_bay_spacing.value())['passes'] or selected.blocked != context['layout'].blocked
                     or selected.pinned & selected.blocked or not required <= selected.pinned):
                 raise AnalysisError('Layout search returned an unverified or inconsistent candidate; layout and sections unchanged')
             # Adopt only a checked success, as one undoable layout edit.
@@ -684,7 +711,7 @@ class BracingAnalysisDialog(QDialog):
                         raise AnalysisError("Sizing cancelled; sections are unchanged")
                 candidates = {"strut": self.strut_profiles, "end_post": self.post_profiles,
                               **{g: self.component_editor.brace_candidates() for g in self.brace_combos}}
-                result, chosen = auto_size(context, self.selections(), candidates, self.criteria(), context["cost_rates"], update)
+                result, chosen = auto_size(context, self.selections(), candidates, self.criteria(), context["cost_rates"], update, fast=True)
                 self.adopt_sections(chosen)
             else:
                 result = solve_selection(context, self.selections(), self.criteria(), context["cost_rates"])
@@ -698,7 +725,7 @@ class BracingAnalysisDialog(QDialog):
             if case >= 0:
                 self.case_combo.setCurrentIndex(case)
             if error.diagnostic['input_target'] == 'layout':
-                self.review_movement()
+                self.review_sizing_issue()
             else:
                 if error.diagnostic['input_target'] == 'group':
                     self.review_sizing_issue()
@@ -716,6 +743,12 @@ class BracingAnalysisDialog(QDialog):
 
     def review_sizing_issue(self):
         if self.result and self.result.get("sizing_failure"):
+            if self.result['sizing_failure'].get('constraint')=='braced_bay_spacing':
+                self.visual_mode.setCurrentIndex(self.visual_mode.findData('layout'))
+                self.tabs.setCurrentIndex(0)
+                self.max_braced_bay_spacing.setFocus()
+                self.member_detail.setText(self.result['sizing_failure']['reason'])
+                return
             if self.result['sizing_failure']['input_target'] == 'layout':
                 self.review_movement()
                 return
@@ -843,6 +876,11 @@ class BracingAnalysisDialog(QDialog):
         if "sizing_search" in result:
             s = result["sizing_search"]
             rows += [s["scope"], f"Candidate screens: {s['candidate_screens']}; rounds: {len(s['rounds'])}", ""]
+            stiffness = s.get('stiffness_screening', [])
+            if stiffness:
+                rows += [f"3D stiffness screening: {sum(t.get('catalogue_predictions', 0) for t in stiffness)} response predictions; "
+                         f"{sum(len(t.get('lightweight_trials', [])) for t in stiffness)} lightweight trials; "
+                         f"{sum(t.get('sls_solves', 0) for t in stiffness)} SLS case solves. Full design checks follow each selected trial."]
             if 'exact_solves' in s:
                 rows += [f"Exact 3D analyses: {s['exact_solves']} / {s['max_solves']}; stiffness growth capped at eligible priced catalogue sizes.",
                          'LOWER-COST / PREFERRED ALTERNATIVE REANALYSES | Group | Section | Pass | Adopted']
@@ -908,7 +946,9 @@ class BracingAnalysisDialog(QDialog):
         self.report.setPlainText(self.report_text)
         for case in result["cases"]:
             self.case_combo.addItem(case["case"]["name"])
-        self.canvas.set_result(result, max(0, self.case_combo.currentIndex()))
+        self.case_combo.addItem('Governing case for each member', 'governing')
+        self.canvas.set_result(result, 0)
+        self.case_combo.setCurrentIndex(self.case_combo.count()-1)
         self.visual_mode.setCurrentIndex(2)
         self.change_visual_mode()
         self.tabs.setCurrentIndex(1)
@@ -922,16 +962,20 @@ class BracingAnalysisDialog(QDialog):
         if self.result is None or self.case_combo.currentIndex() < 0:
             self.member_table.setRowCount(0)
             return
-        index = self.case_combo.currentIndex()
+        governing = self.case_combo.currentData() == 'governing'
+        index = 0 if governing else self.case_combo.currentIndex()
+        self.canvas.governing_cases = governing
         self.canvas.case_index = index
-        case = self.result["cases"][index]
-        members = case['members']+case.get('diaphragm_members', [])
+        if governing and self.visual_mode.currentData() == 'deformed':
+            self.visual_mode.setCurrentIndex(self.visual_mode.findData('utilisation'))
+        members = self.canvas.display_members()
         self.member_table.setRowCount(len(members))
         for row, m in enumerate(members):
             c = self.result["section_checks"].get(m["id"], {})
             ratio = c.get("ratio")
-            values = [m["id"], c.get("section", "-"), f"{m['axial_n']/1000:.3f}",
-                      f"{ratio:.3f}" if ratio is not None else "-", check_type(self.result, governing_check_row(c) or c), c.get("mode", "-"), c.get("case", "-"), m["state"]]
+            governing = governing_case_member(self.result, m['id'])
+            values = [m["id"], c.get("section", "-"), f"{governing['axial_n']/1000:.3f}" if governing else '-',
+                      f"{ratio:.3f}" if ratio is not None else "-", check_type(self.result, governing_check_row(c) or c), c.get("mode", "-"), c.get("case", "-"), governing['state'] if governing else '-']
             if m['kind'].endswith('_diaphragm'):
                 values = [m['id'], 'SLS equivalent diagonal', f"{m['axial_n']/1000:.3f}", '-',
                           'Stiffness only', f"Shear component {m['panel_shear_kn']:.3f} kN", 'Adopted panel flexibility', m['state']]
@@ -940,11 +984,23 @@ class BracingAnalysisDialog(QDialog):
                 if ratio is not None and column == 3:
                     from PySide6.QtGui import QColor
                     item.setForeground(QColor("#b32929" if ratio > 1 else "#128265"))
+                if m['kind'].endswith('_diaphragm') and column in (2, 7):
+                    item.setToolTip('Selected display case; SLS stiffness surrogate with no physical member utilisation check.')
                 self.member_table.setItem(row, column, item)
+        if self.canvas.member_selected:
+            if any(m['id'] == self.canvas.member_selected for m in members):
+                self.member_detail.setText(self.check_description(self.canvas.member_selected))
+            else:
+                self.canvas.member_selected = ''
+                self.member_detail.setText('Click a member in the view or table for its governing check.')
+        self.change_visual_mode()
         self.canvas.update()
 
     def change_visual_mode(self):
         mode = self.visual_mode.currentData() or "layout"
+        if mode == 'deformed' and self.result and self.case_combo.currentData() == 'governing':
+            # A displacement field must come from one equilibrium case.
+            self.case_combo.setCurrentIndex(self.case_combo.findText(self.result['design']['global_sls']['case']))
         self.canvas.result_mode = mode
         self.canvas.deformation_factor = self.deformation_scale.value()
         self.deformation_scale.setEnabled(mode == "deformed")
@@ -955,8 +1011,11 @@ class BracingAnalysisDialog(QDialog):
                    "forces": "Red: tension | Blue: compression | Grey: slack | Width: magnitude",
                    "utilisation": "Governing UC: green <= 0.8 | amber <= 1 | red > 1 | grey: unchecked",
                    "deformed": f"Purple: displaced model x{self.deformation_scale.value():g} | dashed: original"}
+        if self.canvas.governing_cases and mode in {'forces', 'utilisation'}:
+            legends[mode] += ' | Each member uses its own governing UC case; not one simultaneous load case'
+        self.layout_editor.legend_label.setWordWrap(True)
         self.layout_editor.legend_label.setText(legends[mode]+(' | Teal dashed: SLS equivalent diaphragm'
-            if self.result and self.result.get('stressed_skin', {}).get('active') and mode!='layout' else ''))
+            if self.result and self.result.get('stressed_skin', {}).get('active') and mode!='layout' and not self.canvas.governing_cases else ''))
         self.canvas.update()
 
     def set_cladding_overlay(self, visible):
@@ -966,8 +1025,7 @@ class BracingAnalysisDialog(QDialog):
     def inspect_member(self, identifier):
         if self.result is None:
             return
-        case = self.result['cases'][self.case_combo.currentIndex()]
-        members = case['members']+case.get('diaphragm_members', [])
+        members = self.canvas.display_members()
         row = next((i for i, m in enumerate(members) if m["id"] == identifier), -1)
         if row >= 0:
             self.member_table.selectRow(row)
@@ -979,8 +1037,7 @@ class BracingAnalysisDialog(QDialog):
 
     def select_table_member(self, row, column, previous_row, previous_column):
         if self.result and row >= 0:
-            case = self.result['cases'][self.case_combo.currentIndex()]
-            members = case['members']+case.get('diaphragm_members', [])
+            members = self.canvas.display_members()
             if row >= len(members):
                 return
             identifier = members[row]['id']
@@ -997,6 +1054,10 @@ class BracingAnalysisDialog(QDialog):
         check = self.result["section_checks"][identifier]
         row = governing_check_row(check)
         text += '\nCheck type: '+check_type(self.result, row)
+        if row.get('component') is not None:
+            text += f"\nGoverning component {row['component']+1}: {row.get('section', '-')}."
+        if row.get('load_share') is not None:
+            text += f"\nGoverning component axial share: {row['load_share']:.2%}."
         if check.get('mullion_basis'):
             uls=[r for r in check['case_checks'] if r.get('level')=='ULS' and not r.get('required_baseline')]
             governing_uls=max(uls,key=lambda r:float('inf') if r['ratio'] is None else r['ratio'],default=None)
@@ -1008,7 +1069,7 @@ class BracingAnalysisDialog(QDialog):
         if not self.result['design'].get('include_serviceability',True):
             text += ('\nStrength-only bracing design. Main mullion strength/deflection prerequisites still apply; additional bracing deflections are report-only.' if self.result.get('mullion_basis') else '\nStrength-only design. Local deflections and global movement are reported but excluded from acceptance and sizing.')
         if identifier.startswith('brace/front_end/') or identifier.startswith('brace/back_end/'):
-            text += '\nFront/back end-wall brace: lies across the span in X/Z; zero direct resistance along the building length (Y). This run excludes transverse-wind sizing.'
+            text += '\nFront/back end-wall brace: lies across the span in X/Z; zero direct resistance along the building length (Y). ULS side-wind roof/portal forces can govern its transverse strength check.'
         if row.get('tributary_width_mm') is not None:
             if row.get('method')=='main_mullion_combined':
                 text += f"\nMullion design height {row['design_height_mm']:.1f} mm; tributary width {row['tributary_width_mm']:.1f} mm. {row['restraint']}"
@@ -1016,12 +1077,18 @@ class BracingAnalysisDialog(QDialog):
                 if 'actions' in row:
                     text += f"\nBracing axial {row['axial_kn']:.3f} kN; wind bending {row['actions']['moment_knm']:.3f} kNm; effective length {row['actions']['effective_length_y_mm']:.1f} mm."
             else:
-                text += f"\nOriginal roof tributary width: {row['tributary_width_mm']:.1f} mm per existing purlin; member span remains between frames."
+                text += f"\nOriginal roof tributary width: {row['tributary_width_mm']:.1f} mm per existing purlin."
         if row.get('method') == 'assigned_half_reference':
-            text += f"\nAssigned roof load on this physical ply: {row['roof_load_fraction']:.2%} of the original local run load; added self-weight is separate."
+            text += f"\nAssigned roof load on this physical ply: {row['roof_load_fraction']:.2%}; added self-weight is separate."
         if row.get("method") in {"coupled_purlin_beam", 'assigned_half_reference'}:
-            text += f"\n{row['beam_role'].title()} beam, bay {row['beam_bay']+1}; axial {row['axial_kn']:.3f} kN. {row['mode']}"
-            for d in row.get("beam_demands", []):
+            text += f"\n{row['beam_role'].title()} beam, bay {row['beam_bay']+1}; governing ply axial {row['axial_kn']:.3f} kN."
+            beam_case = row.get('governing_beam_case')
+            if beam_case:
+                text += '\nGoverning roof-bending/deflection case: '+beam_case
+            local = row.get('governing_local_pressure')
+            if local:
+                text += f"\nTable 5.6 {local['region']}: Kl {local['kl']:g}; a {local['a_m']:.3f} m; local patch {local['patch_length_m']:.3f} m; area {local['effective_patch_area_m2']:.3f} m2."
+            for d in [d for d in row.get('beam_demands',[]) if not beam_case or d['case']==beam_case]:
                 text += f"\n{d['case']}: M+ {d['positive_moment_knm']:.3f}, M- {d['negative_moment_knm']:.3f} kNm; V {d['shear_kn']:.3f} kN; deflection {d['deflection_mm']:.3f} mm"
             if 'limit_mm' in row:
                 delta = row.get('deflection_mm', row.get('table_adjusted_deflection_mm'))

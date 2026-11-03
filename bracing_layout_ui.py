@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QHBoxLayout, QLabel, QListWid
                               QPushButton, QToolTip, QVBoxLayout, QWidget)
 
 from bracing_layout import BracingLayout, FACE_LABELS
+from bracing_sizing_diagnostics import governing_case_member
 
 
 class BracingLayoutCanvas(QWidget):
@@ -29,6 +30,7 @@ class BracingLayoutCanvas(QWidget):
         self.invert_orbit_vertical = False
         self.result = None
         self.case_index = 0
+        self.governing_cases = False
         self.result_mode = "layout"
         self.deformation_factor = 50.
         self.member_selected = None
@@ -84,11 +86,21 @@ class BracingLayoutCanvas(QWidget):
             points.append(point)
         return points
 
+    def display_members(self):
+        if not self.result:
+            return []
+        if self.governing_cases:
+            return [governing_case_member(self.result, m['id']) or
+                    {**m, 'axial_n': 0., 'state': 'unknown', 'unknown_action': True}
+                    for m in self.result['cases'][0]['members']]
+        case = self.result['cases'][self.case_index]
+        return case['members']+case.get('diaphragm_members', [])
+
     def member_description(self, identifier):
         if not self.result:
             return ""
         case = self.result['cases'][self.case_index]
-        member = next(m for m in case['members']+case.get('diaphragm_members', []) if m['id'] == identifier)
+        member = next(m for m in self.display_members() if m['id'] == identifier)
         if member['kind'].endswith('_diaphragm'):
             return (f"{identifier}\nSLS equivalent diaphragm: {member['axial_n']/1000:.3f} kN ({member['state']})"
                     f"\nPhysical panel shear component ({member['shear_direction']}): {member['panel_shear_kn']:.3f} kN; "
@@ -97,8 +109,16 @@ class BracingLayoutCanvas(QWidget):
         check = self.result.get("section_checks", {}).get(identifier, {})
         ratio = check.get("ratio")
         uc = f"{ratio:.1%}" if ratio is not None else "not checked"
-        return (f"{identifier}\n{check.get('section', member['kind'])}: {member['axial_n']/1000:.3f} kN ({member['state']})"
-                f"\nGoverning utilisation: {uc} | {check.get('mode', '-')}\n{check.get('case', '-')}")
+        governing = governing_case_member(self.result, identifier)
+        text = f"{identifier}\n{check.get('section', member['kind'])}"
+        if not self.governing_cases:
+            text += (f"\nSelected display case: {case['case']['name']}"
+                     f"\nSelected-case total axial: {member['axial_n']/1000:.3f} kN ({member['state']})")
+        text += (f"\nGoverning utilisation: {uc} | {check.get('mode', '-')}"
+                f"\nGoverning case: {check.get('case', '-')}")
+        if governing is not None:
+            text += f"\nGoverning-case total axial: {governing['axial_n']/1000:.3f} kN ({governing['state']})"
+        return text
 
     def projection(self):
         geometry = self.layout_model.geometry
@@ -176,8 +196,7 @@ class BracingLayoutCanvas(QWidget):
         if self.result is not None and self.result_mode != "layout":
             points = self.result_points(self.result_mode == "deformed")
             original = self.result_points()
-            case = self.result['cases'][self.case_index]
-            members = case['members']+case.get('diaphragm_members', [])
+            members = self.display_members()
             maximum = max((abs(m["axial_n"]) for m in members), default=1.) or 1.
             draw = []
             for member in members:
@@ -189,7 +208,7 @@ class BracingLayoutCanvas(QWidget):
                 elif self.result_mode == "deformed":
                     color = "#a43db2"
                 else:
-                    color = "#c1c8ce" if member["state"] == "slack" else "#ce4d43" if member["axial_n"] >= 0 else "#287bb4"
+                    color = "#c1c8ce" if member["state"] in {"slack", "unknown"} else "#ce4d43" if member["axial_n"] >= 0 else "#287bb4"
                 if member['kind'].endswith('_diaphragm'):
                     color = '#8bbab5' if member['state'] == 'slack' else '#008c82'
                 width = 1.5+2*abs(member["axial_n"])/maximum

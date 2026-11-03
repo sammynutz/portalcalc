@@ -8,6 +8,13 @@ Keep the license server as a deployed FastAPI service on Render using `requireme
 
 ## Build
 
+The source regression suite and historical sample presets have been archived
+outside this working folder. The build runs `smoke_checks.py` when restored;
+otherwise it reports that source checks are unavailable and continues with the
+packaged executable startup and computation-report export checks described below.
+Restore the archived regression suite before using the source-check commands in
+this document.
+
 From this folder:
 
 ```powershell

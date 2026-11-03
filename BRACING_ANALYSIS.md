@@ -1,6 +1,6 @@
 # Fixed-layout 3D bracing analysis
 
-This is a small-displacement, wind-only demand model for a fixed layout. The
+This is a small-displacement gravity and wind demand model for a fixed layout. The
 combined workspace adds scoped member checks and section sizing described in
 `BRACING_DESIGN.md`. A solved model is **not a passing structural design**.
 The workspace can now search layouts built from unblocked panels, using this
@@ -160,7 +160,7 @@ its actual a/b, geometry factor, adopted c and equivalent diagonal properties.
 Measured source inputs are distinguished from empirical interpolation/allowances.
 The note's 0.42 BMT five-rib fixing/support assumptions remain explicit.
 
-Eight wind cases cover front-to-back/back-to-front, Cpi +/- and ULS/SLS. Each
+Base wind cases cover front-to-back/back-to-front, Cpi +/- and ULS/SLS. Each
 uses simultaneous windward/leeward pressures from the existing wind module,
 with actual source direction, enclosure flags and pressure factors. Reversing
 wind swaps physical end identities for the Cpi model. `End +`/`End -` in the
@@ -172,7 +172,8 @@ parallel-to-ridge coefficient branch, independently of the transverse portal's
 roof-pitch lookup. The corrected leeward coefficient is also used for dominant
 leeward-end openings. End-pressure action-combination factors count only the
 applied clad end surfaces and an effective internal surface (abs(Cpi)>=0.4),
-not a roof pressure that this model does not apply. Case evidence freezes d/b,
+with these factors conservatively retained when normal roof/side-wall loads are
+added. Case evidence freezes d/b,
 Cp,e, surface count, Ka/Kce/Kci and the source: AS/NZS 1170.2:2021 Amendment 2,
 Table 5.2(B) and clause 5.4.3. Transverse cases and connection acceptance remain
 separate.
@@ -197,7 +198,8 @@ not add cladding/diaphragm stiffness. Old cached calculations are invalidated.
 End-wall pressure acts normal to the front/back walls along Y. Side-wall braces
 have a Y component and carry longitudinal forces to ground; front/back end-wall
 braces are in X/Z and have no direct Y component. Their coupled spatial actions
-are calculated, but transverse-wind end-wall bracing sizing is not included.
+include transverse ULS wind cases, so their transverse strength demands can
+govern independently of longitudinal end-wall wind.
 Per-case load-path evidence resolves actual axial forces at their ground ends,
 reports reactions by wall face and balances the roof-applied Y load separately
 from pressure delivered directly to end-post bases.
@@ -209,13 +211,52 @@ piecewise linear roof height. Roof forces interpolate onto roof stations; ground
 forces interpolate onto real end-post stations. This is a declared load model,
 not a separately verified cladding/girt/mullion connection design.
 
-Excluded actions include G/Q, transverse wind, wall/underside/exposed-member drag, crane,
-storage and full production load combinations. They cannot be inferred from a
-successful end-wind solve. ULS/SLS pressure scales are applied within each wind
-case; rod active sets are solved afresh rather than superposing nonlinear results.
-Normal roof and side-wall pressures are also outside this reduced 3D solve;
-the separate purlin roof-bending envelope is not a simultaneous whole-building
-wind-pressure pattern.
+The 3D combinations also apply gravity and normal wind pressures through the
+actual portals. G includes roof dead load, solar, fire services, HVAC, other
+permanent roof loads and portal member self-weight. Roof load placements follow
+the main input extents. Q uses the larger of entered live load and the main
+snow service load. ULS includes 1.35G, 1.2G + 1.5Q and both 0.9G + W / 1.2G + W
+for every end-wind pressure branch. SLS follows the main project's G, G + Q,
+Ws and G + Ws checks.
+
+Normal roof wind uses Table 5.3(A) crosswind-slope R bands measured along the
+building length from the windward end, with both external-pressure branches and
+the same internal pressure as the accompanying end-wall case. Clad side-wall
+normal pressures use Table 5.2(C); open side walls receive no pressure. Each bay
+delivers load to its two portal lines using simply supported reaction shape
+functions. This integrates pressure boundaries within bays, conserves force and
+longitudinal moment, and gives half adjacent-bay gravity tributaries at the ends.
+Local Table 5.6 patches remain separate purlin bending checks, not global patches.
+The global model excludes purlin continuity redistribution and uses identical
+portal sections at every line; end-post and installed end-brace stiffness can
+still produce different end/interior frame movements and additional axial loads.
+
+ULS side-wind checks run from both left and right, with both external roof
+alternatives, both internal-pressure branches and 0.9G/1.2G. Side sources use
+the same orientation convention as the main portal (270/90 degrees minus the
+building's north angle). Roof normal pressures use horizontal Table 5.3(A)
+bands for low pitch, Table 5.3(B/C) slope coefficients for pitched gables, and
+the appropriate upwind/downwind branch for skillions. The pitched downwind
+coefficient remains present in both alternative roof patterns. Windward/leeward
+side-wall pressures act on clad columns only. Table 5.2(C) suction on clad end
+walls varies across the span; equal opposing end resultants do not remove the
+local tie actions. Pressure-band edges split integration intervals, including
+partial loads within roof members. Consistent FE forces/couples preserve both
+force and moment, with original distributed-load vectors retained for recovery.
+
+Transverse external roof friction uses Cf=0.01 parallel to the down-slope sheet
+ribs beyond 4*min(mean height, building length). It acts tangentially to each
+roof slope and is mirrored with the wind. Open-sided use retains the declared
+preliminary extension of the enclosed-building method. All side-wind cases use
+the conventional ULS model, with no stressed-skin credit. Member ULS envelopes
+and sizing include both wind families. SLS remains gravity/longitudinal wind,
+so the main in-plane sway check is unchanged. Transverse SLS is separate.
+
+Wall/underside/exposed-member drag, crane, storage and the full
+production combination set remain excluded. Each physical combination is solved
+with its own tension-only active set, rather than superposing member results.
+Identical physical load cases are solved once with equivalent source names
+recorded. Geometry, assembly and active stiffness factors are reused across cases.
 
 ## Portal reduction and recovery
 
@@ -239,13 +280,18 @@ v  = Kvv^-1 (fv - Kvu u)
 
 The reduction therefore permits an unbraced portal sway mechanism: the assembled
 bracing must stabilise it. An internal mechanism remaining with attachments held
-is rejected. The generic reduction retains load condensation/recovery, but this
-building stage explicitly requires an unloaded macro and applies end-wall wind
-to the 3D network. Portal nodal displacements, support forces/couples and local
-member end-force vectors are recovered after every case.
+is rejected. The building uses an unloaded stiffness macro with a separate full
+load vector and retained member equivalent loads for every portal in every case.
+The reduction produces the equivalent interface loads and the particular internal
+deformation. Portal nodal displacements, support forces/couples and physical local
+member end-force vectors are recovered after every case. Global equilibrium uses
+the original physical loads/couples, including loads at native supports, rather
+than treating condensed interface loads as the original loading.
 For interior attachments, physical member end-force recovery subtracts the
 consistent point-load vector from the deformation forces; exact nodal
-attachments remain joint loads. Those point-load vectors are retained in JSON.
+attachments remain joint loads. Distributed-load equivalent local vectors are
+also subtracted. Both types of load vector are retained in JSON. Reports record
+per-portal applied resultants and whole-building force/moment balance.
 
 ## Rod solver and checks
 
@@ -263,6 +309,12 @@ ground loads, brace reactions, portal supports and base spring couples. If
 neutral zero-force rods are needed for the tangent, the result explicitly flags
 stability as unverified. A positive taut-rod elastic tangent is not a geometric
 stability/buckling assessment. Displacements have no automatic acceptance limit.
+For gravity-only cases, a singular intermediate tangent can use a compatible
+least-squares search step without artificial supports. The physical unilateral
+force law and equilibrium residual remain mandatory. Any final neutral tangent
+stays explicitly unverified and prevents a passing scoped design or automatic
+adoption. Adding gravity cases can therefore expose previously untested slack
+load paths in layouts that passed end wind alone.
 
 The current dense solver is limited to 600 free roof DOFs. Portal reduction is
 performed once and reused across frame lines and cases. No new dependencies
@@ -287,7 +339,7 @@ end-wall forces/overturning, a sway mechanism stabilised by a real rod, loaded
 non-nodal portal reduction and an independently assembled unreduced building
 with base springs. The cantilever point-load benchmark independently checks
 member end actions. Desktop checks exercise actual sections and offsets, legacy
-restraint removal, state preservation, eight wind cases, openings, stale geometry,
+restraint removal, state preservation, gravity/normal-roof combinations, openings, stale geometry,
 section persistence, dialog tables, failed-rerun invalidation and JSON export.
 The suite is also included in `python smoke_checks.py --full`.
 

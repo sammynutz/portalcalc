@@ -1,5 +1,11 @@
 # PortalCalc Code Map
 
+Working-folder cleanup, 2026-11-03: regression scripts, standalone hay-shed study
+tools, historical sample presets and selected completed review notes are archived
+outside this folder. References to them below describe the archived development
+workflow; restore those files before running their commands. Runtime calculation
+modules and factory defaults remain in this folder.
+
 This document is a fast navigation guide for future edits. It is not a full
 design spec; it points to the files and regions that usually matter first.
 
@@ -47,11 +53,14 @@ Release packaging is performed only when the user explicitly asks. Routine chang
 | `column_flybracing_regression.py` | Segment/load-case provenance, tall-column brace growth, LTB/in-plane separation, caching and export regression. |
 | `end_wall.py` | UI-independent end-wall mullion layout, pinned-member strength selection and H/150 deflection checks. |
 | `bracing_layout.py` | Qt-free versioned bracing geometry and blocked/pinned panel constraints for desktop/BOLT; no structural analysis. See `BRACING_LAYOUT.md`. |
-| `bracing_layout_search.py`, `bracing_layout_search_regression.py` | Practical end-load-path search with geometry-adaptive continuous eave roof girders, end-wall restraint and up to four compact installed-cost patterns; optional detailed cost search. Keeps passing input incumbents, blocked/required constraints and exact scoped strength/SLS/bare-stability acceptance. Fast sizing cost-orders local checks, ranks repeatable brace-EA steps and permits bounded brace balancing. See `BRACING_LAYOUT.md`. |
+| `bracing_layout_search.py`, `bracing_layout_search_regression.py` | Practical end-load-path search with geometry-adaptive continuous eave roof girders, end-wall restraint and bounded extra-wall-bay rod alternatives and up to four compact installed-cost patterns; optional detailed cost search. Keeps passing input incumbents, blocked/required constraints and exact scoped strength/SLS/bare-stability acceptance. Fast sizing cost-orders local checks, ranks repeatable brace-EA steps and permits bounded brace balancing. See `BRACING_LAYOUT.md`. |
 | `bracing_layout_ui.py` | Interactive Qt-painted 3D location editor, face filters, local undo/redo and geometry review. |
 | `bracing_layout_regression.py` | Geometry/constraint validation, real canvas clicks, preset persistence, read-only review and no structural-credit regressions. |
 | `bracing_analysis.py` | Axial 3D network, tension-only rod equilibrium, portal interface condensation/recovery, building assembly, integrated end-wall loads and reaction balance. |
-| `bracing_analysis_desktop.py` | Actual portal/section adapter, eight directional end-wind cases, frozen result evidence and readable report. See `BRACING_ANALYSIS.md`. |
+| `bracing_analysis_desktop.py` | Actual portal/section adapter, simultaneous gravity/end-wind combinations, frozen result evidence and readable report. See `BRACING_ANALYSIS.md`. |
+| `bracing_roof_loads.py` | Frame tributaries, G/Q/solar placements, end-wind normal roof/side-wall pressure patterns and full portal load snapshots; independent full-matrix/load conservation checks in `bracing_roof_loads_regression.py`. |
+| `bracing_side_wind.py` | ULS left/right wind, roof alternatives, internal pressure, varying end-wall suction, exact partial-member pressure integration and applicable roof friction. Independent statics/mirroring/full-matrix checks in `bracing_side_wind_regression.py`. |
+| `bracing_spacing.py` | Default five-bay project rule, complete roof/side-wall anchor assessment and bounded intermediate-bay planning. See `bracing_spacing_regression.py`; small-screen/footer checks are in `bracing_workspace_fit_regression.py`. |
 | `bracing_diaphragm.py` | Revision B roof/wall reference calibrations (3/6 mm/kN), explicit empirical a/b² actual-panel c calculation or direct overrides; SLS equivalents, sloping-wall conversion, physical shear recovery and independent bare stability. Regression checks cover reference factors, geometry, reversal, open faces, ULS independence and saved UI behavior. |
 | `bracing_analysis_ui.py` | Compatibility import for the combined bracing workspace. |
 | `bracing_calculation_cache.py`, `bracing_cache_regression.py` | Compressed optional result cache with current-model/input/engine fingerprints; reopen/job persistence, stale/corrupt rejection, preserved failure diagnostics and input-hash separation. |
@@ -66,13 +75,13 @@ Release packaging is performed only when the user explicitly asks. Routine chang
 | `purlin_shared_design.py` | User-adopted single-addition 50/50 run/added allocation and two-addition equal-per-ply allocation; existing-run/added single-span beam demands and explicitly preliminary table-reference checks. Candidates/frozen checks enforce matching roof profile size; each added ply is checked and costed independently. |
 | `purlin_strut_tables.py` | In-range manufacturer UDL-table interpolation with stated bridging and frozen source rows; separate single/double/five-span reference arrangements. |
 | `purlin_strut_regression.py` | Independent asymmetric two-span statics, single-span responses, load conservation/self-weight, table/reference limits, sizing, UI invalidation and persistence. |
-| `purlin_beam.py`, `purlin_beam_design.py` | Roof-run Euler-Bernoulli model, finite distributed cladding coupling, direct load pickup, single-span additions, demand evidence and gated M/V/axial checks; local fast screens recover only the changed full roof run, final exact checks recover all affected lines. |
+| `purlin_beam.py`, `purlin_beam_design.py`, `purlin_end_local.py` | Roof-run Euler-Bernoulli model with separate Table 5.6 end-roof pressure patches, finite distributed cladding coupling, direct load pickup, single-span additions, demand evidence and gated M/V/axial checks; local fast screens recover only the changed full roof run, final exact checks recover all affected lines. |
 | `purlin_beam_ui.py`, `purlin_beam_regression.py` | Native moment/shear/deflection/transfer plots; independent beam and load-sharing benchmarks, whole-run sizing and workspace persistence tests. |
 | `bracing_schedule.py` | Supplied Grade 300 rod and Grade 1570 rope factored capacities, exact turnbuckle sizes and source image evidence. |
-| `bracing_mixed_sizing.py`, `bracing_components_regression.py` | Bounded per-location incremental-cost sizing with exact reanalysis; locally checked EA ceilings and coupled purlin/brace cost trials share the 18-analysis cap. Sharing, missing/stale ratings, schedule capacities and saved UI regression. |
+| `bracing_mixed_sizing.py`, `bracing_components_regression.py`, `bracing_sizing_recovery_regression.py` | Cost-ordered per-location screens and bounded exact reanalysis; reject unstable brace downgrades and retry sized struts/posts with last verified braces within the solve cap. Detailed callers also compare coupled purlin/brace costs. Sharing, missing/stale ratings, transactional recovery, schedule capacities and saved UI regression. |
 | `bracing_sizing_diagnostics.py` | Specific sizing-stop reasons and rejected alternatives; retains unchanged-input analysis and directs the workspace to the relevant rating row. |
 | `bracing_analysis_regression.py` | Closed-form mechanics, unreduced/reduced comparison, load/moment integration, missing-path failures and real offscreen desktop/export checks. |
-| `bracing_analysis_desktop.end_wind_cases` | End-pressure cases use along-wind length/span Cp,e, contributing end/internal surface Kc and explicit pressure-source evidence; frictional drag and transverse-wind cases remain excluded. |
+| `bracing_analysis_desktop.end_wind_cases` | Base end-pressure cases use along-wind length/span Cp,e, contributing end/internal surface Kc and external roof friction. `building_roof_cases` adds simultaneous normal roof/side-wall and gravity actions plus ULS side-wind cases; transverse SLS remains excluded. |
 | `crane_beam.py` | Crane runway beam input/result dataclasses and section checks. |
 | `storage_loads.py` | Stored-material pressure/load calculations, storage panel design, storage load application and summary text. |
 | `elevation_drawings.py` | PDF elevation/plan/section drawing export using Qt painting. |

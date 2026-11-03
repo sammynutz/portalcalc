@@ -14,18 +14,66 @@ depth and end restraint adapt to the geometry. **Detailed cost search** remains 
 `BRACING_LAYOUT.md` for budgets and acceptance rules. **Analyse and check** and **Size selected layout**
 also operate on exactly the selected/pinned panels. Unmarked panels are available
 search locations, not installed braces.
+When a passing side-wall design uses angles/other steel, practical layout search
+first compares an extra rod-braced wall bay (plus a roof collector if needed).
+This shares the existing search budget and retains the checked incumbent unless
+the alternative passes and improves its material preference/total cost.
 Save and close records layout, analysis settings and current calculations together;
 the window X does the same. Cancel discards edits.
 The production portal, Phase 1 checks, legacy springs and cost totals are not
 changed by this workspace.
 
+The window can shrink to the available screen height. Its main workspace
+scrolls when results, controls or member details need more room; Export,
+Cancel and Save and close stay in a fixed footer outside the scroll area.
+The title bar permits maximising/restoring and the resize grip remains available.
+
+**Maximum braced-bay spacing**, in Sections / criteria, defaults to **5 bays**.
+This project load-path rule requires a complete roof-braced bay with an aligned
+side-wall brace in every five consecutive building bays. Continuous narrow
+eave strips alone do not qualify. End runs are limited too. For example, a
+20-bay building retaining its end bays uses bays 1, 6, 11, 16 and 20 unless
+blocked panels require nearer alternatives. The count limit is editable and
+saves with the workspace; it is not presented as a code-derived capacity.
+Both layout search modes add intermediate complete roof/wall bays before
+structural sizing and reject later removals that break this rule. Fixed-layout
+checks report a spacing failure independently of strength or SLS, and section
+sizing stops with guidance to Find layout instead of increasing section sizes.
+Required panels and blocked locations remain unchanged by this planning step.
+
+The 3D member envelope includes G/Q and simultaneous end-wind normal roof
+and clad side-wall pressures, as well as end-wall pressures and roof friction.
+Gravity includes solar/other entered permanent roof loads, their selected
+extents and actual portal self-weight. End portals receive half adjacent-bay
+roof tributaries. Full loaded-portal reduction/recovery captures additional tie
+and brace axial actions from different portal movements. Each combination is
+solved with tension-only slackening; see `BRACING_ANALYSIS.md` for the combination
+set, pressure bands and remaining scope. Recheck earlier sizes: old wind-only
+results are invalidated by the engine cache revision. ULS wind from both sides
+is also included, with roof pressure alternatives, internal pressure, 0.9G/1.2G,
+clad side-wall pressures, varying end-wall suction and applicable roof friction.
+These cases use conventional bracing with no diaphragm credit. Global SLS
+remains the gravity/longitudinal wind check and the main in-plane sway check
+remains separate.
+
 ## Visual output
 
 - Layout constraints: block/unblock or pin/unpin panels. Face filters reach
   hidden panels; Panel list allows keyboard selection. Local Undo/Redo applies.
+- The case selector defaults to **Governing case for each member**. Axial forces
+  and governing utilisation use each physical member's own governing UC case;
+  the resulting envelope is not one simultaneous equilibrium case. Individual
+  wind cases remain available. SLS diaphragm surrogates are shown only in an
+  individual case. Deformed shape switches to the governing global SLS case.
 - Axial forces: red tension, blue compression, grey slack; line width scales
-  with force magnitude for the selected wind case.
+  with the force magnitude in the chosen individual-case/envelope view.
 - Governing utilisation: green <= 0.8, amber <= 1, red > 1, grey unchecked.
+- Member-check table axial force/state and UC use the same governing case.
+  The diagram follows the individual case or governing envelope. Details label total
+  assembly forces and identify the governing component, its axial share and ply
+  force separately from any assigned roof-load fraction. Stiffness-only diaphragm
+  rows retain selected-case actions; prerequisites without a matching 3D case
+  show no axial force.
   Member utilisation governs across cases, including local SLS checks.
 - Deformed shape: exaggerated axial-network nodal displacements over the
   original model, with explicit scale. These are not curved 3D portal diagrams.
@@ -35,6 +83,33 @@ demand/capacity values. Global SLS is reported separately in the status line.
 Editing engineering inputs clears old results and disables exports. Camera and
 case/view changes do not invalidate a frozen calculation. Orbit is locked to
 **Invert left/right ON, Invert up/down OFF**, including when opening older presets.
+
+The 3D mixed-purlin checks add independent end-roof local pressure cases under
+AS/NZS 1170.2:2021 Amd 2 clause 5.4.4/Table 5.6. RA1/RA2 end-edge patches and
+applicable RC1 (<10 degrees) or gable ridge/end RC2 (>=10 degrees) patches are
+separate alternatives at both ends. The pressure multiplier acts on external
+roof pressure only; internal pressure remains separate. The product Kl*Cpe is
+limited to -3.0. Area/4:1 shape limits and actual tributary overlap are recorded.
+Where the area limit shortens a patch, end/inner-edge and midspan-oriented
+placements are checked. Low-pitch Cpe bands use distance along the building
+length; steeper roofs use an explicitly conservative external Cpe envelope and
+independent ridge-side corner checks. Local roof/internal action factors are
+0.9/0.9 for an effective internal surface, otherwise 1.0/1.0.
+
+Piecewise UDLs retain patch boundaries in the whole roof-run beam model. Added
+plies retain the adopted 50/50 or pair load allocation and independent
+single-span actions. Adjacent bays and existing-only runs are checked too.
+If no isolated-bay candidate passes, fast sizing tries a shared-addition roof-line
+arrangement, then reduces additions only while every bay on that line passes.
+This handles adjacent-span moments caused by an end pressure patch. It is bounded
+to single/pair starting patterns and one pruning sweep, followed by exact global
+reanalysis. After the first local repair round, locally adequate fast choices
+are retained to avoid undoing a neighbour's required roof pickup. This is not a
+global-sway stiffness floor. The saved sizing evidence records roof-line repairs.
+Local option screens recover only the changed full roof line in both sizing modes; final exact acceptance recovers all affected lines. The same preliminary manufacturer UDL-reference method remains in use; these
+are not newly verified general M/V resistances. Named local cases and geometry
+are in member details, Purlin beam results and JSON. Global bracing wind loads
+and SLS-only diaphragm treatment are unchanged. Old calculation caches clear.
 
 ## Reopening calculations
 
@@ -58,8 +133,8 @@ length (Y). Roof bracing and struts transfer the roof reaction into the side-wal
 braces and down to their bases. Front/back end-wall braces lie across the span in
 X/Z, so their direct Y force projection is zero. They can still participate through
 spatial coupling. A smaller front/back brace is not evidence that the longitudinal
-load is missing. Those braces require separate transverse-wind cases before final
-sizing; these are not yet included. Peak force also does not alone determine size:
+load is missing. ULS transverse cases now check roof/eave collector transfer into
+these end-wall braces and can govern their strength. Peak force also does not alone determine size:
 global movement and brace orientation/stiffness can govern.
 
 Result summary shows ULS tension peaks by brace group. Each TXT/JSON case records
@@ -119,7 +194,7 @@ results and exports before another checked result can be used.
 The main end-wall calculation and 3D workspace share
 `end_wall.mullion_profile_design`: wind bending/shear, self-weight, catalogue
 properties, compression/tension interaction, and the main assumed mid-height
-flybrace effective lengths/moment modifier. Each 3D mullion adds its wind-only
+flybrace effective lengths/moment modifier. Each 3D mullion adds its combination
 axial force to local wind bending. Local bending uses the larger of the main
 wind envelope and that end-wind case; height/tributary width envelope the main
 layout and actual 3D geometry. This is explicitly conservative independent
@@ -442,7 +517,8 @@ ULS 1.2 times self-weight and SLS self-weight. End posts receive local end-press
 bending/shear using tributary width and actual height. Post self-weight is added
 to compression without taking beneficial credit against tension. Local deflection
 uses `5wL^4/(384EI)`; global longitudinal roof drift uses node height / SLS
-divisor. These local loads are not fed back into the wind-only global solve.
+divisor. These local member checks are separate from the portal roof-load
+combinations applied in the 3D solve.
 
 JSON freezes section properties, criteria, per-case checks, source cases, cost
 data and hashes. TXT includes member summaries, cost breakdown and analysis
@@ -530,8 +606,20 @@ global drift fails. Their actual EA still participates in the exact 3D analysis;
 this selection rule does not suppress the physical influence of strut stiffness.
 A passing member plan with excessive building drift still fails overall SLS.
 Every combined proposal requires exact reanalysis.
-Once a passing design is found, remaining
-analysis budget is used for lower-cost/preferred grouped alternatives. Every
+The workspace's **Size selected layout** uses bounded fast sizing and stops at
+the first verified resized pass. Per-location options are screened in cost/name
+order; the first local pass is the same choice as exhaustive local screening.
+Repeated, identical simply-supported local pressure patch actions are cached by
+their complete beam inputs. No loads, limits or checks are removed.
+If a mixed-strut proposal becomes unstable after a brace downgrade, reject that
+proposal and, if the exact-solve budget permits, retry the sized struts/posts with
+the last verified brace set. Require exact whole-building acceptance; a failed
+retry leaves original input selections unchanged. Record rejected/retained brace
+sections, the source stability error and retry acceptance under
+`sizing_search.stability_recovery_trials`. Retained brace stiffness bounds further
+downgrades in that sizing run; struts still have no global-sway stiffness floor.
+For callers explicitly requesting detailed sizing (`fast=False`), once a passing
+design is found, remaining analysis budget is used for lower-cost/preferred grouped alternatives. Every
 change is exactly reanalysed and must pass all scoped member, stability and SLS
 checks before adoption. Before the final grouped pass, up to four coupled trials
 compare the cheapest locally checked existing/single/pair purlin paths with current braces
@@ -623,7 +711,8 @@ The actual purlin offset from the idealised roof interface is recorded;
 collector connection stiffness/capacity remains assumed.
 
 Connection detailing, turnbuckle capacity, portal-column weak-axis checks, full
-G/Q/transverse/drag combinations, second-order/geometric stability, foundation
+production combinations beyond the recorded gravity/ULS/SLS scope, complete drag,
+transverse serviceability, second-order/geometric stability, foundation
 flexibility and production portal-restraint feedback remain separate. Neutral
 rod stability flags prevent automatic member/SLS acceptance. Production cost
 totals and the full-computations PDF are not overwritten.
@@ -638,3 +727,34 @@ No releases are packaged.
 Primary tension reference: [Australian Steel Institute / Australian Tube Mills
 design tables, Part 7](https://www.steel.org.au/resources/elibrary/resources/design-capacity-tables-for-structural-steel-hollow/?view=download).
 Load-path background: [SCI braced-frame systems](https://steelconstruction.info/topics/design/braced-frames).
+# Response-guided 3D stiffness screening (first implementation)
+
+Sizing now ranks eligible brace upgrades using the building's SLS movement
+response. `bracing_stiffness_screen.py` captures the checked SLS load vectors,
+uses the shared physical model assembly, and computes local displacement
+derivatives with respect to roof/side-wall/end-wall brace EA. Up to four
+diversified catalogue upgrades then receive tension-only SLS trial solves.
+These omit portal recovery, ULS/member checks and full report generation.
+The chosen upgrade still receives the normal full analysis and scoped checks
+before acceptance. Neutral/stale baselines and unhelpful shortlists fall back
+to the existing stiffness/cost ranking; screening cannot declare infeasibility.
+
+This stage is enabled in grouped and per-location sizing, including the sizing
+called by layout searches. It currently holds portal sections, strut/post sizes
+and the selected layout fixed. It targets the existing absolute longitudinal
+H/n criterion. `MovementResponse` also supports signed relative movements, but
+this does not yet add adjacent-frame/crane/transverse SLS acceptance criteria.
+It makes no global-optimum claim. The internal context switch
+`stiffness_screening=False` enables baseline comparisons.
+
+Results retain catalogue prediction counts, lightweight SLS solve counts,
+predicted/physical movement ratios, selected upgrades, elapsed screening time
+and fallback reasons in `sizing_search.stiffness_screening`. The workspace
+report separates these from full 3D analysis counts. Cached calculations include
+the new screening engine revision.
+
+Run `python bracing_stiffness_screen_regression.py` for mechanics, reversal,
+simultaneous portal-load recovery comparisons, diaphragms, grouped/per-location
+sizing and fallback checks. Run it with `--benchmark` for a seven-repeat A/B
+comparison on a fixed five-bay building. Reported cost is the existing scoped
+bracing/strut estimate, not a whole-building quote.

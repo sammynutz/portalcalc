@@ -22,15 +22,15 @@ def encoded(value):
 def engine_revision():
     # Source builds can change without a release/version increment. In packaged
     # builds the explicit revision also invalidates caches when the engine changes.
-    digest = hashlib.sha256(b'bracing-cache-engine-2026-11-02-v15-adaptive-eave-girder-families')
+    digest = hashlib.sha256(b'bracing-cache-engine-2026-11-03-v23-response-screening')
     digest.update(APP_VERSION.encode())
     digest.update(np.__version__.encode())
     folder = Path(__file__).parent
-    names = ('bracing_analysis.py','bracing_analysis_desktop.py','bracing_design.py',
-             'bracing_components.py','bracing_mixed_sizing.py','bracing_policy.py',
+    names = ('bracing_analysis.py','bracing_analysis_desktop.py','bracing_roof_loads.py','bracing_side_wind.py','bracing_spacing.py','bracing_design.py',
+             'bracing_components.py','bracing_mixed_sizing.py','bracing_stiffness_screen.py','bracing_policy.py',
              'bracing_schedule.py','bracing_layout.py','bracing_layout_search.py','bracing_calculation_cache.py','bracing_diaphragm.py',
              'purlin_combined.py','purlin_beam.py','purlin_beam_design.py',
-             'purlin_shared_design.py','purlin_strut_tables.py','member_checks.py',
+             'purlin_shared_design.py','purlin_strut_tables.py','purlin_end_local.py','member_checks.py',
              'bracing_sizing_diagnostics.py','bracing_mullion_design.py','end_wall.py','costing.py','loads.py','wind.py','main.py')
     for name in names:
         path = folder/name
@@ -42,6 +42,7 @@ def engine_revision():
 
 def fingerprint(context, settings, selections, criteria):
     from bracing_design import candidate_properties
+    from bracing_spacing import max_bay_spacing
     source = copy.deepcopy(context['source_preset'])
     # Engineering settings/actual properties are captured explicitly below.
     # View choices and result payloads must not enter an input/source hash.
@@ -60,6 +61,7 @@ def fingerprint(context, settings, selections, criteria):
             'mullion_basis':context.get('mullion_basis'),
             'global_sls_basis':context.get('global_sls_basis'),
             'stressed_skin':context.get('stressed_skin'),
+            'max_braced_bay_spacing':max_bay_spacing(context),
             'table_sha256':context.get('purlin_strut_tables',{}).get('sha256'),
             'sections':{g:candidate_properties(c,criteria) for g,c in selections.items()}}
     return hashlib.sha256(encoded(data)).hexdigest()

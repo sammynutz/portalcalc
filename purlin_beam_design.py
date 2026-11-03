@@ -22,7 +22,8 @@ def _positive(record, key):
 
 def with_beam_demands(result, plan, only_lines=None):
     """Solve every affected roof line, including adjoining bays without additions."""
-    lines = sorted({a.location["line"] for a in plan.members.values() if a.arrangement in {ARRANGEMENT, 'shared_purlin', 'shared_purlin_pair'}})
+    lines = sorted({a.location["line"] for a in plan.members.values() if a.arrangement in {ARRANGEMENT, 'shared_purlin', 'shared_purlin_pair'}
+                    or a.location.get('purlin',{}).get('beam_inputs',{}).get('end_roof_local_cases')})
     runs, by_member = {}, {}
     if only_lines is not None:
         requested = {str(line) for line in only_lines}
@@ -40,7 +41,8 @@ def with_beam_demands(result, plan, only_lines=None):
         rating = data["axial_rating"]
         error = None
         try:
-            if any(a.arrangement in {'shared_purlin', 'shared_purlin_pair'} for a in assemblies):
+            if any(a.arrangement in {'shared_purlin', 'shared_purlin_pair'} for a in assemblies) or (
+                    data.get('beam_inputs',{}).get('end_roof_local_cases') and not any(a.arrangement == ARRANGEMENT for a in assemblies)):
                 from purlin_shared_design import solve_shared
                 run = solve_shared(assemblies, spans, line)
                 runs[str(line)] = run
@@ -97,6 +99,11 @@ def with_beam_demands(result, plan, only_lines=None):
             for load in loads:
                 load["roof_n_mm_by_bay"] = [load["roof_n_mm"]*(1-beta if i in active_bays else 1.) for i in range(len(spans))]
                 load["added_n_mm_by_bay"] = [load["added_n_mm"]+load["roof_n_mm"]*n*beta if i in active_bays else 0. for i in range(len(spans))]
+            from purlin_end_local import split_segments
+            for local in inputs.get('end_roof_local_cases',[]):
+                loads.append({'name':local['name'],'roof_n_mm':0.,'added_n_mm':0.,'local_pressure':local['local_pressure'],
+                    'roof_patches':split_segments(local['segments'],spans,[1-beta if i in active_bays else 1. for i in range(len(spans))]),
+                    'added_patches':split_segments(local['segments'],spans,[n*beta if i in active_bays else 0. for i in range(len(spans))])})
             payload = {"spans_mm": spans, "roof_i_mm4": p["web_ix_mm4"], "added_i_mm4": p["web_ix_mm4"],
                        "roof_count": assemblies[0].location["existing_count"],
                        "added_bays": active_bays,

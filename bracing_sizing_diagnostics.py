@@ -8,6 +8,18 @@ def governing_check_row(check):
     return next(iter(exact), None) or max(rows, key=lambda r: float('inf') if r.get('ratio') is None else r['ratio'], default={})
 
 
+def governing_case_member(result, identifier):
+    """Total member action from the case governing its check, not the display case.
+
+    A component check may use only its EA share of this action. Material rules
+    and prerequisite checks can have no corresponding 3D case; leave those
+    actions unknown rather than substituting a different case's force.
+    """
+    name = result.get('section_checks', {}).get(identifier, {}).get('case')
+    case = next((c for c in result.get('cases', []) if c['case']['name'] == name), None)
+    return next((m for m in case['members'] if m['id'] == identifier), None) if case else None
+
+
 def check_type(result, row):
     if row.get('ratio') is None:
         return 'Missing check'
@@ -53,6 +65,9 @@ def result_summary(result):
         (('left_wall', 'left'), ('right_wall', 'right'), ('front_end', 'front'), ('back_end', 'back')))+'.'
     retained = bool(result.get('sizing_failure'))
     lines = (["AUTO-SIZING STOPPED - original input selections shown; no sizing changes adopted."] if retained else [])
+    if result['design'].get('layout_spacing',{}).get('enforced',True) and 'anchor_bays' in result['design'].get('layout_spacing',{}):
+        from bracing_spacing import spacing_text
+        lines.append(spacing_text(result['design']['layout_spacing']))
     lines += [movement, members, layout]
     diaphragm = result.get('stressed_skin', {})
     if diaphragm.get('active',diaphragm.get('settings', {}).get('enabled')):
@@ -91,7 +106,14 @@ def result_summary(result):
         lines += [f"External roof drag included: up to {abs(peak['signed_y_force_kn']):.2f} kN; Cf {peak['cf']:g}, projected loaded area {peak['projected_area_m2']:.1f} m2. See full results for the load strip and basis."]
         if any(d['preliminary_open_sided'] for d in drags):
             lines.append('PRELIMINARY open-side assumption: enclosed-building external-roof friction method; open-roof underside/exposed-member drag is not assessed.')
-    lines.append('Demand scope: end-wall pressure'+(' plus external roof friction' if drags else ' only; roof friction excluded')+'; normal roof/side-wall pressures, wall friction and transverse-wind cases are outside this 3D solve.')
+    if result.get('roof_load_basis'):
+        lines.append('Demand scope: gravity + longitudinal wind, and ULS-only wind from both sides. Includes simultaneous roof/wall/internal pressures, varying end-wall suction and roof friction; G includes solar/other permanent roof loads and portal self-weight. Transverse SLS, wall/underside/exposed-member drag and crane/storage actions remain outside scope.')
+    else:
+        lines.append('Demand scope: end-wall pressure'+(' plus external roof friction' if drags else ' only; roof friction excluded')+'; normal roof/side-wall pressures, wall friction and transverse-wind cases are outside this 3D solve.')
+    local_regions = sorted({c['loads']['local_pressure']['region'] for run in result.get('purlin_beams',{}).get('runs',{}).values()
+                            for c in run.get('cases',[]) if c.get('loads',{}).get('local_pressure')})
+    if local_regions:
+        lines.append('Purlin roof-bending checks include Table 5.6 end patches: '+', '.join(local_regions)+'. Applied bracing wind loads are unchanged.')
     return {'text': '\n'.join(lines), 'movement_text': movement, 'member_counts': counts,
             'failed_members': failed, 'wall_panel_counts': faces, 'retained_inputs': retained}
 
@@ -132,6 +154,17 @@ def stop_for_search(initial, screening, reason, group=None, floor=None, ceiling=
     diagnostic.update(global_sls=dict(retained), screening_global_sls=dict(sls),
                       governing_node=initial['nodes'][retained['node']])
     return SizingStopped(f'{label}: {title}', initial, diagnostic)
+
+
+def require_layout_spacing(result):
+    check=result.get('design',{}).get('layout_spacing',{})
+    if check.get('passes',True):
+        return
+    from bracing_spacing import spacing_text
+    error=stop_for_search(result,result,spacing_text(check))
+    error.diagnostic.update(constraint='braced_bay_spacing',input_target='layout',
+        action='Use Find layout and size to add intermediate complete roof/side-wall braced bays, or revise the blocked panels and maximum spacing in Sections / criteria. Larger sections cannot satisfy this layout rule.')
+    raise error
 
 
 def describe_location(location, geometry):
