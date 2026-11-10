@@ -103,6 +103,67 @@ class SavedCalculationTests(unittest.TestCase):
                 self.assertIsNone(unpack(corrupt,cache['fingerprint']))
         finally:d.reject()
 
+    def test_undo_of_a_layout_click_restores_the_cleared_result(self):
+        d=self.dialog()
+        try:
+            d.run_analysis();result=d.result;self.assertIsNotNone(result)
+            editor=d.layout_editor
+            panel=next(p for p in editor.model.panels if p not in editor.model.pinned and p not in editor.model.blocked)
+            editor.toggle_panel(panel)
+            self.assertIsNone(d.result)
+            with mock.patch('bracing_workspace_ui.solve_selection') as solve:
+                editor.restore_history(-1)
+            solve.assert_not_called()
+            self.assertIs(d.result,result)
+            self.assertEqual(d.visual_mode.currentData(),'utilisation')
+            self.assertIn('result is shown again',d.status_label.text())
+            # A different layout is not the analysed one.
+            editor.restore_history(1);self.assertIsNone(d.result)
+        finally:d.reject()
+
+    def test_optimiser_saved_check_reopens_in_the_workspace_with_members_inspectable(self):
+        import combined_sizing
+        w=self.window
+        stored=combined_sizing.store_calculation(w)
+        self.assertIsNotNone(w.bracing_3d_calculation_cache)
+        # Reopen as MainWindow.analyse_fixed_bracing_layout does.
+        w.generate_and_solve()
+        context=prepare_context(w,allow_unconfigured=True)
+        with mock.patch('bracing_workspace_ui.solve_selection') as solve, mock.patch('bracing_workspace_ui.auto_size') as size:
+            reopened=BracingAnalysisDialog(context,w.catalog,copy.deepcopy(w.bracing_3d_settings),
+                                           cached_calculation=w.bracing_3d_calculation_cache)
+        try:
+            solve.assert_not_called();size.assert_not_called()
+            self.assertEqual(reopened.result,json.loads(json.dumps(stored)))
+            self.assertNotEqual(reopened.canvas.result_mode,'layout')
+            self.assertEqual(reopened.result['design']['estimated_cost'],stored['design']['estimated_cost'])
+        finally:reopened.reject()
+
+    def test_optimiser_refuses_locations_saved_for_other_dimensions(self):
+        import combined_sizing, frontier_sizing
+        from bracing_layout import BracingLayout
+        w=self.window
+        saved=BracingLayout.from_dict(w.bracing_location_layout)
+        blocked=next(p for p in saved.panels if p.startswith('roof/') and p not in saved.pinned)
+        saved.blocked.add(blocked)
+        w.bracing_location_layout=saved.to_dict()
+        w.building_length_input.setText(str(float(w.building_length_input.text())+6))
+        w.generate_and_solve()
+        # The failure it prevents: the 3D context drops the old blocks, and saving
+        # a search result onto the old layout pins a blocked panel.
+        context=prepare_context(w,allow_unconfigured=True)
+        self.assertNotIn(blocked,context['layout'].blocked)
+        with self.assertRaisesRegex(ValueError,'both blocked and pinned'):
+            combined_sizing._store_bracing(w,context,{blocked},combined_sizing._start_selections(w,context,None))
+        w.bracing_location_layout=saved.to_dict()
+        before=copy.deepcopy(w.collect_preset_data())
+        for run in (frontier_sizing.optimise,combined_sizing.run):
+            with self.subTest(run=run.__module__), mock.patch('combined_sizing._size_frame') as size:
+                with self.assertRaisesRegex(Exception,'dimensions have changed'):
+                    run(w)
+                size.assert_not_called()
+                self.assertEqual(w.collect_preset_data(),before)
+
     def test_saved_sizing_stop_retains_diagnostic_and_original_input_status(self):
         d=self.dialog()
         try:

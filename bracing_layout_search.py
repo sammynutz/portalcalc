@@ -11,10 +11,12 @@ from time import perf_counter
 
 from bracing_analysis import AnalysisError
 from bracing_design import (auto_size, solve_selection, candidate_name, panel_installation_rate,
-                           candidate_stiffness, balance_compact_braces)
+                           candidate_stiffness, balance_compact_braces, group_cost,
+                           deferred_transverse_sls)
 from bracing_components import StrutPlan, StrutAssembly
 from bracing_layout import BracingLayout
-from bracing_policy import selection_score
+from bracing_policy import selection_score, family, eligible as policy_eligible
+from bracing_spacing import max_bay_spacing,spacing_assessment,repair_spacing,spacing_text
 
 
 class LayoutSearchCancelled(AnalysisError):
@@ -147,6 +149,7 @@ def find_cost_layout(context, selections, candidates, criteria, rates, *, requir
                 'blocked_panels': sorted(original.blocked), 'required_panels': sorted(required),
                 'max_layout_trials': max_trials, 'max_section_solves_per_trial': max_section_solves,
                 'trials': []}
+    evidence.update(max_braced_bay_spacing=max_bay_spacing(context),spacing_rejections=[])
     trials = evidence['trials']
     if not original.available:
         raise LayoutSearchStopped('All panels are blocked; no layout can be tried', evidence)
@@ -157,6 +160,10 @@ def find_cost_layout(context, selections, candidates, criteria, rates, *, requir
 
     evaluated = set()
     def evaluate(selected, chosen, reason, sizing=False):
+        spacing=spacing_assessment(original,max_bay_spacing(context),selected)
+        if not spacing['passes']:
+            evidence['spacing_rejections'].append({'reason':reason,'spacing':spacing})
+            return None
         key = (frozenset(selected), section_signature(chosen), sizing)
         if key in evaluated:
             evidence['duplicate_trials_skipped'] += 1
@@ -216,6 +223,14 @@ def find_cost_layout(context, selections, candidates, criteria, rates, *, requir
     for reason, selected in structured_seeds(original, required):
         if evidence['structured_seed_trials'] >= seed_limit or len(trials) >= max_trials:
             break
+        try:
+            repaired=repair_spacing(context,selected)
+        except AnalysisError as error:
+            evidence['spacing_rejections'].append({'reason':reason,'error':str(error)})
+            continue
+        if repaired!=selected:
+            reason+=f'; intermediate roof/wall bays (maximum {max_bay_spacing(context)})'
+        selected=repaired
         before = len(trials)
         trial = evaluate(set(selected), selections, reason, True)
         if len(trials) == before:
@@ -232,6 +247,8 @@ def find_cost_layout(context, selections, candidates, criteria, rates, *, requir
             beam.append(trial)
     if best is None:
         evidence['layout_trials'] = len(trials)
+        if not trials and evidence['spacing_rejections']:
+            raise LayoutSearchStopped(f"Blocked panels prevent a compliant braced bay within every {max_bay_spacing(context)} bays. Review the blocked locations or maximum braced-bay spacing.",evidence)
         raise LayoutSearchStopped('No passing layout found within the search budget. Review blocked locations, sections and criteria; this is not proof that no feasible layout exists.', evidence)
 
     # Give two promising starts a bounded neighbourhood budget. Full bay moves
@@ -430,22 +447,102 @@ def practical_seeds(context, required):
             yield reason, selected
 
 
+def twist_restraint_seeds(context, selected):
+    """End-wall restraint on the open side of a shed braced on one side wall.
+
+    The open side lets the roof twist in plan, so longitudinal sway can be
+    stiffness-governed and push the braced wall to heavy steel. End-wall
+    bracing at the open-side panel of each end resists the twist; both outer
+    panels are the stiffer alternative. Exact analysis decides.
+    """
+    layout = context['layout']
+    faces = {layout.panels[p].face for p in selected if p.startswith(('left_wall/', 'right_wall/'))}
+    if len(faces) != 1 or any(p.startswith(('front_end/', 'back_end/')) for p in selected):
+        return
+    open_right = faces == {'left_wall'}
+    open_side, both = set(), set()
+    for face in ('front_end', 'back_end'):
+        options = sorted((p for p in layout.available if p.startswith(face+'/')), key=lambda p: int(p.split('/')[-1]))
+        if options:
+            open_side.add(options[-1] if open_right else options[0])
+            both.update((options[0], options[-1]))
+    if open_side:
+        yield 'End-wall restraint at the open-side panels', selected | open_side
+    if both and both != open_side:
+        yield 'End-wall restraint at both outer panels', selected | both
+
+
+def wall_rod_expansion_seeds(context, selected):
+    """One extra wall anchor, then with its full roof collector, before heavy wall steel.
+
+    Fill the largest gap between selected side-wall bracing bays first. The
+    wall panel alone comes first: longitudinal struts can collect to it even
+    without a roof girder (a three-sided 24 x 40 m shed passed this way at less
+    cost than with a collector). Exact coupled analysis decides.
+    """
+    layout = context['layout']
+    g = layout.geometry
+    bay_count = len(g.bay_stations_mm)-1
+    strip_count = len(g.roof_stations)-1
+    options = []
+    for face, strip in (('left_wall', 0), ('right_wall', strip_count-1)):
+        existing = [int(p.split('/')[-1]) for p in selected if p.startswith(face+'/bay/')]
+        if not existing:
+            continue
+        continuous = all(f'roof/bay/{bay}/strip/{strip}' in selected for bay in range(bay_count))
+        for bay in range(bay_count):
+            wall = f'{face}/bay/{bay}'
+            roof = {f'roof/bay/{bay}/strip/{s}' for s in range(strip_count)}
+            if wall in selected or wall not in layout.available or (not continuous and not roof <= layout.available):
+                continue
+            centre = (g.bay_stations_mm[bay]+g.bay_stations_mm[bay+1])/2
+            distance = min(abs(centre-(g.bay_stations_mm[b]+g.bay_stations_mm[b+1])/2) for b in existing)
+            options.append((-distance, abs(centre-g.length_mm/2), face, bay, wall, roof, continuous))
+    if not options:
+        return
+    _, _, face, bay, wall, roof, continuous = min(options)
+    expanded = selected | {wall}
+    yield f'Extra {face} bay {bay+1} anchor for rod bracing', expanded
+    if roof <= layout.available and not roof <= expanded:
+        yield f'Extra {face} bay {bay+1} with full roof collector for rod bracing', expanded | roof
+
+
 def _find_practical_layout(context, selections, candidates, criteria, rates, required, progress,
-                           max_trials, max_section_solves, *, seed_override=None, compare_compact=True):
+                           max_trials, max_section_solves, *, seed_override=None, compare_compact=True,
+                           retain_braces=True):
     started = perf_counter()
     original = context['layout']
     evidence = {'strategy': 'practical', 'method': 'End load paths, eccentric-plan restraint and bounded compact-layout comparison',
-                'scope': 'Practical passing arrangement with up to four compact load-path patterns within the layout budget, stopping at the first cheaper passing option. Includes materials, fittings and panel installation. No global optimum claim.',
+                'scope': 'Practical passing arrangement, re-sized, then within the layout budget: open-side end-wall restraint for sheds braced on one side wall, up to two extra-bay rod alternatives for heavy wall steel and up to four compact load-path patterns, each stopping at the first preferred/lower-cost passing option. Includes materials, fittings and panel installation. No global optimum claim.',
                 'blocked_panels': sorted(original.blocked), 'required_panels': sorted(required),
                 'max_layout_trials': max_trials, 'max_section_solves_per_trial': max_section_solves,
                 'trials': [], 'section_polish': False,
                 'ordering_basis': 'One-sided nominal span/eave >= 4 prioritises a supported-eave roof girder with end-wall restraint; a search heuristic, not a design limit.'}
+    evidence.update(max_braced_bay_spacing=max_bay_spacing(context),spacing_rejections=[])
     if not original.available:
         raise LayoutSearchStopped('All panels are blocked; no layout can be tried', evidence)
     seeds = practical_seeds(context, required) if seed_override is None else seed_override
+    seen_spacing=set()
     for reason, selected in seeds:
         if len(evidence['trials']) >= max_trials:
             break
+        try:
+            if seed_override is None:
+                repaired=repair_spacing(context,selected)
+                if repaired!=selected:
+                    reason+=f'; intermediate roof/wall bays (maximum {max_bay_spacing(context)})'
+                selected=repaired
+            spacing=spacing_assessment(original,max_bay_spacing(context),selected)
+            if not spacing['passes']:
+                evidence['spacing_rejections'].append({'reason':reason,'spacing':spacing})
+                continue
+        except AnalysisError as error:
+            evidence['spacing_rejections'].append({'reason':reason,'error':str(error)})
+            continue
+        signature=frozenset(selected)
+        if signature in seen_spacing:
+            continue
+        seen_spacing.add(signature)
         if progress:
             progress(len(evidence['trials']), max_trials, reason)
         local = layout_context(context, selected)
@@ -481,7 +578,10 @@ def _find_practical_layout(context, selections, candidates, criteria, rates, req
             # Feasibility has first use of the solve budget. Reserving two
             # polish checks previously discarded near-passing girders early.
             sizing_budget = max_section_solves
-            retain = seed_override is not None or reason.startswith('Verify current')
+            # Compact comparisons keep the proven brace stiffness; a passing
+            # current layout and the twist/extra-bay comparisons are re-sized
+            # freely, so lighter braces can be found.
+            retain = seed_override is not None and retain_braces
             same_roof_wall = {p for p in selected if not p.startswith(('front_end/', 'back_end/'))} == {
                 p for p in original.pinned if not p.startswith(('front_end/', 'back_end/'))}
             if not same_roof_wall and 'girder' in reason and any(not isinstance(chosen[g],dict) or chosen[g].get('component_type') != 'wire_rope'
@@ -490,19 +590,30 @@ def _find_practical_layout(context, selections, candidates, criteria, rates, req
                 # from a previous topology. Let local demand sizing reconsider
                 # those groups, with full exact acceptance as usual.
                 retain = False
-            if reason.startswith('Verify current') and screen['design']['passes']:
-                # Establish the checked incumbent without repeating catalogue
-                # sizing that was already done for the saved input layout.
+            incumbent = reason.startswith('Verify current') and screen['design']['passes']
+            try:
+                # A passing current layout is also re-sized: its sections may
+                # have been chosen under older rules or for another layout.
+                sized = auto_size(local, chosen, candidates, criteria, rates, sizing_progress,
+                                  max_solves=sizing_budget, fast=True, initial_result=screen,
+                                  retain_brace_stiffness=retain)
+            except LayoutSearchCancelled:
+                raise
+            except AnalysisError as error:
+                if not incumbent:
+                    raise
+                sized, record['resize_error'] = None, str(error)
+            if incumbent and (sized is None or not sized[0]['design']['passes']
+                              or selection_score(local, sized[1], sized[0]) >= selection_score(local, chosen, screen)):
+                # The checked input stays the incumbent unless re-sizing beats it.
                 result = screen
-                record['section_sizing'] = False
+                record['section_sizing'] = sized is not None
                 result['sizing_search'] = {'method': 'Verified input incumbent',
-                    'scope': 'Current sections checked once before compact layout trials; no repeated catalogue sizing.',
+                    'scope': 'Current sections checked; re-sizing found nothing cheaper.',
                     'candidate_screens': 0, 'rounds': [], 'exact_solves': 1,
                     'max_solves': max_section_solves, 'cost_reduction_trials': [], 'fast': True}
             else:
-                result, chosen = auto_size(local, chosen, candidates, criteria, rates, sizing_progress,
-                                           max_solves=sizing_budget, fast=True, initial_result=screen,
-                                           retain_brace_stiffness=retain)
+                result, chosen = sized
             if seed_override is not None and max_section_solves >= 12:
                 search = dict(result.get('sizing_search', {}))
                 used = search.get('exact_solves', sizing_budget)
@@ -527,11 +638,106 @@ def _find_practical_layout(context, selections, candidates, criteria, rates, req
             evidence.update(layout_trials=len(evidence['trials']), winning_trial=record['trial'],
                             selected_panels=sorted(selected), elapsed_seconds=perf_counter()-started,
                             stopped_after_pass=True, budget_exhausted=False)
+            # A shed braced on one side wall twists in plan; end-wall restraint
+            # at the open side can be cheaper than stiffening the braced wall.
+            if compare_compact and len(evidence['trials']) < max_trials:
+                for label, panels in twist_restraint_seeds(local, selected):
+                    if len(evidence['trials']) >= max_trials:
+                        break
+                    offset = len(evidence['trials'])
+                    def twist_progress(step, total, message):
+                        if progress:
+                            progress(offset+step, max_trials, 'End-wall restraint: '+message)
+                    evidence.setdefault('twist_restraint_comparison', {'attempted': True, 'adopted': False, 'patterns_checked': 0})
+                    evidence['twist_restraint_comparison']['patterns_checked'] += 1
+                    try:
+                        alternative = _find_practical_layout(local, chosen, candidates, criteria, rates, required,
+                            twist_progress, 1, max_section_solves,
+                            seed_override=[('End-wall restraint comparison: '+label, panels)],
+                            compare_compact=False, retain_braces=False)
+                    except LayoutSearchCancelled:
+                        raise
+                    except LayoutSearchStopped as error:
+                        alternative, extra_trials = None, error.evidence['trials']
+                    else:
+                        extra_trials = alternative[0]['layout_search']['trials']
+                    for trial in extra_trials:
+                        trial['trial'] += offset
+                        trial['adopted'] = False
+                    evidence['trials'].extend(extra_trials)
+                    evidence.update(layout_trials=len(evidence['trials']), stopped_after_pass=False)
+                    if alternative is None:
+                        continue
+                    checked, resized, twisted_layout = alternative
+                    twisted_context = layout_context(local, twisted_layout.pinned)
+                    if selection_score(twisted_context, resized, checked) < selection_score(local, chosen, result):
+                        result, chosen, local = checked, resized, twisted_context
+                        selected = set(twisted_layout.pinned)
+                        evidence['twist_restraint_comparison']['adopted'] = True
+                        evidence['trials'][-1]['adopted'] = True
+                        evidence.update(winning_trial=evidence['trials'][-1]['trial'], selected_panels=sorted(selected))
+                        break
+            # A passing angle layout is not evidence that another rod-braced
+            # wall bay is inefficient. Keep the proven roof load path and try
+            # at most two expansions, sharing the overall topology/solve caps.
+            wall_rod_adopted = False
+            if compare_compact and family(chosen['wall_brace']) == 'other' and len(evidence['trials']) < max_trials:
+                rods = []
+                for option in candidates['wall_brace']:
+                    if family(option) != 'rod' or not policy_eligible(local, 'wall_brace', option):
+                        continue
+                    try:
+                        group_cost(result, 'wall_brace', option, rates)
+                    except AnalysisError:
+                        continue  # Missing fittings/rates never become free options.
+                    rods.append(option)
+                expansions = list(wall_rod_expansion_seeds(local, selected)) if rods else []
+                if expansions:
+                    evidence['wall_rod_comparison'] = {'attempted': True, 'adopted': False,
+                        'pattern_limit': min(2, max_trials-len(evidence['trials'])), 'patterns_checked': 0}
+                for label, panels in expansions:
+                    if len(evidence['trials']) >= max_trials:
+                        break
+                    offset = len(evidence['trials'])
+                    def rod_progress(step, total, message):
+                        if progress:
+                            progress(offset+step, max_trials, 'Extra-bay rod layout: '+message)
+                    evidence['wall_rod_comparison']['patterns_checked'] += 1
+                    rod_start = {**chosen, 'wall_brace': max(rods, key=candidate_stiffness)}
+                    rod_pool = {**candidates, 'wall_brace': rods}
+                    try:
+                        alternative = _find_practical_layout(local, rod_start, rod_pool, criteria, rates, required,
+                            rod_progress, 1, max_section_solves,
+                            seed_override=[('Extra-bay rod comparison: '+label, panels)], compare_compact=False,
+                            retain_braces=False)
+                    except LayoutSearchCancelled:
+                        raise
+                    except LayoutSearchStopped as error:
+                        alternative, extra_trials = None, error.evidence['trials']
+                    else:
+                        extra_trials = alternative[0]['layout_search']['trials']
+                    for trial in extra_trials:
+                        trial['trial'] += offset
+                        trial['adopted'] = False
+                    evidence['trials'].extend(extra_trials)
+                    evidence.update(layout_trials=len(evidence['trials']), stopped_after_pass=False,
+                                    stopped_after_wall_rod_comparison=True)
+                    if alternative is None:
+                        continue
+                    checked, resized, expanded_layout = alternative
+                    expanded_context = layout_context(local, expanded_layout.pinned)
+                    if selection_score(expanded_context, resized, checked) < selection_score(local, chosen, result):
+                        result, chosen, local = checked, resized, expanded_context
+                        wall_rod_adopted = True
+                        evidence['wall_rod_comparison']['adopted'] = True
+                        evidence['trials'][-1]['adopted'] = True
+                        evidence.update(winning_trial=evidence['trials'][-1]['trial'], selected_panels=sorted(expanded_layout.pinned))
+                        break
             # A flat installation allowance must influence layout choice, not
             # just the displayed total. Progress through a few compact girder
             # patterns, warm-started from the verified sections. No panel
             # deletion sweep or restarted broad cost search.
-            if compare_compact and panel_installation_rate(rates) > 0 and len(evidence['trials']) < max_trials:
+            if compare_compact and not wall_rod_adopted and panel_installation_rate(rates) > 0 and len(evidence['trials']) < max_trials:
                 alternatives = [(label, panels) for label, panels in practical_seeds(context, required)
                                 if label.startswith('End ') and len(panels) < len(selected)]
                 g = original.geometry
@@ -621,9 +827,12 @@ def _find_practical_layout(context, selections, candidates, criteria, rates, req
         except AnalysisError as error:
             record['analysis_error'] = str(error)
     evidence.update(layout_trials=len(evidence['trials']), elapsed_seconds=perf_counter()-started)
+    if not evidence['trials'] and evidence['spacing_rejections']:
+        raise LayoutSearchStopped(f"Blocked panels prevent a compliant braced bay within every {max_bay_spacing(context)} bays. Review the blocked locations or maximum braced-bay spacing. Layout and sections unchanged.",evidence)
     raise LayoutSearchStopped('No passing practical layout found within the short search. Review blocked paths/ratings or use Detailed cost search for a broader search. Layout and sections unchanged.', evidence)
 
 
+@deferred_transverse_sls(final_context=lambda context, layout: layout_context(context, layout.pinned))
 def find_layout(context, selections, candidates, criteria, rates, *, required=(), progress=None,
                 max_trials=None, max_section_solves=None, strategy='practical'):
     """Default to a short load-path search; broader cost search is explicit."""

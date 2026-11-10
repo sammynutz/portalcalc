@@ -1,11 +1,12 @@
 # Fixed-layout 3D bracing analysis
 
-This is a small-displacement, wind-only demand model for a fixed layout. The
+This is a small-displacement gravity and wind demand model for a fixed layout. The
 combined workspace adds scoped member checks and section sizing described in
 `BRACING_DESIGN.md`. A solved model is **not a passing structural design**.
 The workspace can now search layouts built from unblocked panels, using this
-fixed-layout solver for every candidate (see `BRACING_LAYOUT.md`). Restraint
-feedback into the production 2D portal remains separate work.
+fixed-layout solver for every candidate (see `BRACING_LAYOUT.md`). The frame
+restraint it finds can be adopted by the production 2D portal; see
+**Frame restraint for the 2D portal** below.
 
 ## Desktop workflow
 
@@ -160,7 +161,7 @@ its actual a/b, geometry factor, adopted c and equivalent diagonal properties.
 Measured source inputs are distinguished from empirical interpolation/allowances.
 The note's 0.42 BMT five-rib fixing/support assumptions remain explicit.
 
-Eight wind cases cover front-to-back/back-to-front, Cpi +/- and ULS/SLS. Each
+Base wind cases cover front-to-back/back-to-front, Cpi +/- and ULS/SLS. Each
 uses simultaneous windward/leeward pressures from the existing wind module,
 with actual source direction, enclosure flags and pressure factors. Reversing
 wind swaps physical end identities for the Cpi model. `End +`/`End -` in the
@@ -172,7 +173,8 @@ parallel-to-ridge coefficient branch, independently of the transverse portal's
 roof-pitch lookup. The corrected leeward coefficient is also used for dominant
 leeward-end openings. End-pressure action-combination factors count only the
 applied clad end surfaces and an effective internal surface (abs(Cpi)>=0.4),
-not a roof pressure that this model does not apply. Case evidence freezes d/b,
+with these factors conservatively retained when normal roof/side-wall loads are
+added. Case evidence freezes d/b,
 Cp,e, surface count, Ka/Kce/Kci and the source: AS/NZS 1170.2:2021 Amendment 2,
 Table 5.2(B) and clause 5.4.3. Transverse cases and connection acceptance remain
 separate.
@@ -197,7 +199,8 @@ not add cladding/diaphragm stiffness. Old cached calculations are invalidated.
 End-wall pressure acts normal to the front/back walls along Y. Side-wall braces
 have a Y component and carry longitudinal forces to ground; front/back end-wall
 braces are in X/Z and have no direct Y component. Their coupled spatial actions
-are calculated, but transverse-wind end-wall bracing sizing is not included.
+include transverse ULS wind cases, so their transverse strength demands can
+govern independently of longitudinal end-wall wind.
 Per-case load-path evidence resolves actual axial forces at their ground ends,
 reports reactions by wall face and balances the roof-applied Y load separately
 from pressure delivered directly to end-post bases.
@@ -209,13 +212,179 @@ piecewise linear roof height. Roof forces interpolate onto roof stations; ground
 forces interpolate onto real end-post stations. This is a declared load model,
 not a separately verified cladding/girt/mullion connection design.
 
-Excluded actions include G/Q, transverse wind, wall/underside/exposed-member drag, crane,
-storage and full production load combinations. They cannot be inferred from a
-successful end-wind solve. ULS/SLS pressure scales are applied within each wind
-case; rod active sets are solved afresh rather than superposing nonlinear results.
-Normal roof and side-wall pressures are also outside this reduced 3D solve;
-the separate purlin roof-bending envelope is not a simultaneous whole-building
-wind-pressure pattern.
+The 3D combinations also apply gravity and normal wind pressures through the
+actual portals. G includes roof dead load, solar, fire services, HVAC, other
+permanent roof loads and portal member self-weight. Roof load placements follow
+the main input extents. Q uses the larger of entered live load and the main
+snow service load. ULS includes 1.35G, 1.2G + 1.5Q and both 0.9G + W / 1.2G + W
+for every end-wind pressure branch. SLS follows the main project's G, G + Q,
+Ws and G + Ws checks.
+
+Normal roof wind uses Table 5.3(A) crosswind-slope R bands measured along the
+building length from the windward end, with both external-pressure branches and
+the same internal pressure as the accompanying end-wall case. Clad side-wall
+normal pressures use Table 5.2(C); open side walls receive no pressure. Each bay
+delivers load to its two portal lines using simply supported reaction shape
+functions. This integrates pressure boundaries within bays, conserves force and
+longitudinal moment, and gives half adjacent-bay gravity tributaries at the ends.
+Local Table 5.6 patches remain separate purlin bending checks, not global patches.
+The global model excludes purlin continuity redistribution and uses identical
+portal sections at every line; end-post and installed end-brace stiffness can
+still produce different end/interior frame movements and additional axial loads.
+
+ULS side-wind checks run from both left and right, with both external roof
+alternatives, both internal-pressure branches and 0.9G/1.2G. Side sources use
+the same orientation convention as the main portal (270/90 degrees minus the
+building's north angle). Roof normal pressures use horizontal Table 5.3(A)
+bands for low pitch, Table 5.3(B/C) slope coefficients for pitched gables, and
+the appropriate upwind/downwind branch for skillions. The pitched downwind
+coefficient remains present in both alternative roof patterns. Windward/leeward
+side-wall pressures act on clad columns only. Table 5.2(C) suction on clad end
+walls varies across the span; equal opposing end resultants do not remove the
+local tie actions. Pressure-band edges split integration intervals, including
+partial loads within roof members. Consistent FE forces/couples preserve both
+force and moment, with original distributed-load vectors retained for recovery.
+
+Transverse external roof friction uses Cf=0.01 parallel to the down-slope sheet
+ribs beyond 4*min(mean height, building length). It acts tangentially to each
+roof slope and is mirrored with the wind. Open-sided use retains the declared
+preliminary extension of the enclosed-building method. All side-wind cases use
+the conventional ULS model, with no stressed-skin credit. Member ULS envelopes
+and sizing include both wind families.
+
+## Transverse SLS frame sway (report only)
+
+The same side-wind patterns are also solved at serviceability pressure, as
+**Ws** and **G + Ws** for both directions, roof alternatives and internal
+pressures, matching the main portal's serviceability combinations. They use
+the bare conventional network: stressed-skin surrogates are not added, even
+when enabled for longitudinal SLS. These cases do **not** govern 3D sizing:
+global longitudinal sway acceptance, the response-guided stiffness screen and
+the reported maximum resultant remain gravity/longitudinal only, and the main
+2D in-plane sway check remains the acceptance. Member local-deflection rows
+(including aligned mullions under end-wall side suction) and the taut-rod
+tangent status do include them.
+
+`transverse_sls` in the result reports, per frame line: the larger column-top
+X movement in Ws-only cases against the main in-plane eave criterion (H/100 IL1
+default), the same frame's sway under the same loads without the 3D network,
+the governing G + Ws movement and the secant roof-level restraint
+`-sum(roof interface X) / mean eave X` with its range across cases that sway
+the unrestrained frame by more than 1 mm. Struts carry no X force, so frames
+outside roof-braced bays receive zero restraint. A negative value means roof
+bracing ties the frame to a softer neighbour and adds load. The secant value is
+case-specific because of tension-only slackening and load pattern. The section
+appears in TXT/JSON and as a one-line summary in the workspace.
+
+Agreement with the main 2D portal: both now apply roof wind normal to each
+panel (the main portal previously applied it vertically). For gable roofs the
+unrestrained interior-frame Ws sway matches the main column-top check within
+0.5% (factory defaults: 50.91 vs 50.96 mm at 7.5 deg; 127.8 vs 128.1 mm at
+22.5 deg). Skillion roofs use one adopted basis in both models: wind on the
+high side takes Table 5.3(A) bands measured horizontally from the windward
+high edge at every pitch (the main portal previously applied a uniform worst-bay
+Cpe). Factory geometry as a skillion agrees within 0.5%: 156.4 vs 157.0 mm at
+5 deg, 335.0 vs 336.6 mm at 12 deg and 695.2 vs 697.5 mm at 20 deg.
+Low-pitch Table 5.3(A) bands are horizontal distances from the windward edge
+in both models; the main portal converts them to positions along the slope
+(it previously measured them along the slope).
+`bracing_transverse_sls_regression.py` checks the SLS/ULS scaling, recovery
+and an independent 2D portal solve, bare-network use with diaphragms enabled,
+and that longitudinal acceptance is identical with and without these cases.
+
+During layout search and section sizing the transverse SLS cases are deferred:
+the search runs without them and the adopted design is then checked with every
+case, reusing the cases already solved for it. If that final check fails where
+the reduced search passed, or a deferred case cannot be solved (a Ws-only case
+with no gravity can leave an unstable tension-only rod set on a light design),
+the search is repeated with every case.
+`transverse_sls_search` in the result records this. Practical searches that pass
+on their first trial gain nothing; searches with several exact analyses save
+about a quarter of each analysis.
+
+## Frame restraint for the 2D portal
+
+`frame_restraint` in the result gives, per frame, the least and greatest secant
+roof-level sway restraint over every transverse ULS and SLS case that sways the
+unrestrained frame by more than 1 mm. The adoptable value is the least value
+over **interior** frames: the 2D model analyses one representative frame with
+identical sections, so the least-restrained interior frame governs. End frames
+are excluded because end posts and end-wall bracing support them directly (a
+single eave spring overestimates their moments by a factor of three to six) and
+they carry half the roof load. If any interior frame gets zero or negative
+restraint, for example when only end bays are roof-braced, nothing is adoptable.
+
+In the main window, **End-wall portal restraint > 3D bracing model** applies the
+adopted value as one spring on the mean of the two eave X movements
+(`Structure2D.add_sway_spring`). It resists frame sway but not eave spread, which
+interior-frame roof bracing does not restrain. On Save and close the workspace
+adopts the value from a passing, taut-stable, unstopped result
+(`bracing_restraint.adoption_record`), saved as `bracing.restraint_3d`.
+
+The record is valid only for the bracing it came from:
+
+- **Stale, no credit:** layout geometry, pinned panels, brace/strut/post
+  selections or declared rope EA have changed.
+- **Recheck, credit kept:** portal sections, loads, wind or canopies have
+  changed. This lets the 2D portal be re-sized with the restraint it was given;
+  the 3D bracing must then be rechecked with the final portal.
+
+The results text states which applies. While the option is active, 3D sizing and
+layout search keep each brace group at least as stiff as the adopted record
+(`floor_candidates`), so the bracing cannot be sized below the restraint the
+frame was credited with. The 3D model's private portal copy drops any adopted
+sway spring, so it never credits itself. On factory defaults with a continuous
+eave girder, the adopted 0.335 kN/mm reduces 2D Ws column-top sway from 51.0 to
+26.9 mm against 26.0 mm for the 3D interior frames.
+
+## Optimising frame and bracing together
+
+**Bracing > 3D bracing locations > Optimise frame + bracing together...** runs
+`frontier_sizing.optimise`. It replaces the frame sections, bracing layout and
+bracing sections; Cancel restores the previous design.
+
+1. Size the 2D frame with no restraint.
+2. Find practical bracing for it, then check bracing options in 3D: the practical
+   layout and up to four eave-girder layouts, each with roof/end-wall brace size
+   steps within their family and the brace policy. Keep the frontier: the
+   cheapest bracing for each level of frame restraint.
+3. Size the frame once, with the 2D auto-size, at the stiffest frontier
+   restraint (less a 5% margin). Frame cost cannot rise with more restraint, so
+   this is a floor: bracing options whose cost plus that floor cannot beat the
+   best verified total are skipped.
+4. For the rest, cheapest first: first check the floor frame with the option
+   (recheck the bracing in 3D with it, adopt the restraint it now delivers and
+   run the exact 2D check). If it verifies with the option's own bracing it is
+   the least-cost frame for that option and no re-size is needed. Otherwise
+   size the frame for that restraint and check that pair the same way. The
+   verified total decides.
+
+The 3D option checks and girder-layout sizings in step 2 are independent and
+run in worker processes (`bracing_parallel.py`, up to 8; set
+`PORTALCALC_BRACING_WORKERS=1` to run them in-process). A script that calls the
+optimiser must keep its code under `if __name__ == '__main__':`, because each
+worker imports the calling script.
+
+The unrestrained frame with the cheapest bracing is always a valid starting
+answer. Bracing uses the workspace's own setup from the saved 3D settings
+(per-location strut plans, rope ratings/prices, angles, brace policy) and is
+saved back through it. The 2D auto-size is needed per restraint level because
+restraint changes more than member sizes: on factory defaults the restrained
+optimum also deepens the truss and re-sizes the webs. Factory defaults
+(2026-11-10, with the saved workspace bracing setup): 2 auto-sizes, 26 3D checks,
+61 s (340 s before the speed-ups); the continuous left-eave roof girder with the
+floor frame wins at $38,514.03. Costs are the existing estimates; options are
+bounded and this is not a global optimum.
+
+`combined_sizing.py` is the earlier fixed-option sweep (re-sizes the frame for
+every option) and holds the shared helpers. `bracing_restraint_regression.py` covers the sway spring, adoption,
+staleness, floors, deferral and roof bands.
+
+Wall/underside/exposed-member drag, crane, storage and the full
+production combination set remain excluded. Each physical combination is solved
+with its own tension-only active set, rather than superposing member results.
+Identical physical load cases are solved once with equivalent source names
+recorded. Geometry, assembly and active stiffness factors are reused across cases.
 
 ## Portal reduction and recovery
 
@@ -239,13 +408,18 @@ v  = Kvv^-1 (fv - Kvu u)
 
 The reduction therefore permits an unbraced portal sway mechanism: the assembled
 bracing must stabilise it. An internal mechanism remaining with attachments held
-is rejected. The generic reduction retains load condensation/recovery, but this
-building stage explicitly requires an unloaded macro and applies end-wall wind
-to the 3D network. Portal nodal displacements, support forces/couples and local
-member end-force vectors are recovered after every case.
+is rejected. The building uses an unloaded stiffness macro with a separate full
+load vector and retained member equivalent loads for every portal in every case.
+The reduction produces the equivalent interface loads and the particular internal
+deformation. Portal nodal displacements, support forces/couples and physical local
+member end-force vectors are recovered after every case. Global equilibrium uses
+the original physical loads/couples, including loads at native supports, rather
+than treating condensed interface loads as the original loading.
 For interior attachments, physical member end-force recovery subtracts the
 consistent point-load vector from the deformation forces; exact nodal
-attachments remain joint loads. Those point-load vectors are retained in JSON.
+attachments remain joint loads. Distributed-load equivalent local vectors are
+also subtracted. Both types of load vector are retained in JSON. Reports record
+per-portal applied resultants and whole-building force/moment balance.
 
 ## Rod solver and checks
 
@@ -263,6 +437,45 @@ ground loads, brace reactions, portal supports and base spring couples. If
 neutral zero-force rods are needed for the tangent, the result explicitly flags
 stability as unverified. A positive taut-rod elastic tangent is not a geometric
 stability/buckling assessment. Displacements have no automatic acceptance limit.
+For gravity-only cases, a singular intermediate tangent can use a compatible
+least-squares search step without artificial supports. The physical unilateral
+force law and equilibrium residual remain mandatory. Any final neutral tangent
+stays explicitly unverified and prevents a passing scoped design or automatic
+adoption. Adding gravity cases can therefore expose previously untested slack
+load paths in layouts that passed end wind alone.
+
+**Slack play.** Rods that are all slack at equilibrium, such as both diagonals
+of an X panel slightly shortened, can leave a zero-stiffness mode in the
+converged active rod set although the structure is not a mechanism. The solver
+used to abort the whole analysis with "Unstable or ill-conditioned model".
+It now checks each such mode in both directions (`bounded_slack_play`). If
+moving either way extends a slack rod, the case completes with
+`tangent_status = slack_play_stability_unverified` and a `slack_play` record:
+the play in mm before the first slack rod becomes taut (mode scaled to 1 mm
+largest movement) and the rods that take it up. A direction that extends no
+rod is still reported as a mechanism and raises. As with neutral rods, slack
+play leaves stability unverified, so the design does not pass. Sizing treats a
+brace downgrade that loses verified stability like the former error: it keeps
+the best verified design, and mixed-strut sizing retries with the last stable
+braces. Adding end-wall bracing to a three-sided 24 x 40 m shed gave 0.21 mm
+of play on the open-side roof lines in side wind.
+
+**Accepted slack play (project-adopted, 4 November 2026).** Stability is judged on
+the taut rods. Where they leave zero-stiffness modes, every other rod can take up
+a movement that extends it: zero-force (neutral) rods at once, slack rods after
+their gap. Design checks accept the case when every movement along the modes,
+including any combination of modes, extends some rod, and the play is at most
+**Sections / criteria > Accepted rod slack play** (default 1.0 mm; 0 accepts
+none). The basis is that turnbuckle pretension, which the model omits, takes it
+up. Combinations are checked exactly (`no_escaping_direction`, Stiemke's lemma
+via non-negative least squares); with several modes the reported play is taken
+along the modes. A movement that extends no rod stays unverified (or raises as a
+mechanism where even zero-force rods give no stiffness). Neutral zero-force rods
+under gravity were the second adopted case: they previously always failed.
+`design.slack_play` records the limit, accepted cases, largest accepted play and
+any unverified cases; the summary and TXT show them. Older presets take the
+1.0 mm default. On the shed above, open-side end-wall bracing then passes at
+$7,944 against $9,964 with EA 75x75x6 wall angles.
 
 The current dense solver is limited to 600 free roof DOFs. Portal reduction is
 performed once and reused across frame lines and cases. No new dependencies
@@ -274,10 +487,11 @@ The low-level solver returns **demands only**. The workspace's scoped member
 checks and cost model are described in `BRACING_DESIGN.md`. Combined existing
 purlin duties, connections, foundation flexibility, second-order/geometric
 stability and complete installed costs remain separate. Existing Phase 1
-results, portal eave springs, costing and the full
-computation PDF export are not overwritten. The next coupling stage must retain
-the coupled interface stiffness/load vector and recover portal actions; a set of
-independent grounded springs or copied 3D moments is not substituted here.
+results, the hand-calculated portal eave springs, costing and the full
+computation PDF export are not overwritten. Frame restraint feedback uses one
+secant sway spring per representative frame (above); it reproduces 3D interior
+frame column moments within about 1–4% in the checked cases but is not the full
+coupled interface, and end frames are not represented by it.
 
 ## Verification and references
 
@@ -287,7 +501,7 @@ end-wall forces/overturning, a sway mechanism stabilised by a real rod, loaded
 non-nodal portal reduction and an independently assembled unreduced building
 with base springs. The cantilever point-load benchmark independently checks
 member end actions. Desktop checks exercise actual sections and offsets, legacy
-restraint removal, state preservation, eight wind cases, openings, stale geometry,
+restraint removal, state preservation, gravity/normal-roof combinations, openings, stale geometry,
 section persistence, dialog tables, failed-rerun invalidation and JSON export.
 The suite is also included in `python smoke_checks.py --full`.
 

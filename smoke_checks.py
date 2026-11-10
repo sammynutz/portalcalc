@@ -1,5 +1,6 @@
 import argparse
 from contextlib import contextmanager
+import os
 import py_compile
 import copy
 import html
@@ -8,6 +9,14 @@ import math
 import tempfile
 import time
 from pathlib import Path
+
+# The solvers use small dense matrices, where multi-threaded BLAS costs more
+# than it saves (bracing_design_regression: 28 s single-threaded v 46 s) and
+# parallel steps would oversubscribe the CPU. Must be set before numpy loads;
+# main.py sets the same for the desktop app.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import numpy as np
 
@@ -28,17 +37,19 @@ def timed_step(label: str):
 
 
 def compile_sources(root: Path) -> None:
+    for name in ('bracing_spacing.py','bracing_spacing_regression.py','bracing_workspace_fit_regression.py','bracing_sizing_recovery_regression.py'):
+        py_compile.compile(str(root/name),doraise=True)
     for name in ('bracing_diaphragm.py', 'bracing_diaphragm_regression.py'):
         py_compile.compile(str(root / name), doraise=True)
     for name in ('column_flybracing.py', 'column_flybracing_regression.py'):
         py_compile.compile(str(root / name), doraise=True)
     for name in ("bracing_layout.py", "bracing_layout_ui.py", "bracing_layout_regression.py"):
         py_compile.compile(str(root / name), doraise=True)
-    for name in ("bracing_analysis.py", "bracing_analysis_desktop.py", "bracing_analysis_ui.py", "bracing_analysis_regression.py"):
+    for name in ("bracing_analysis.py", "bracing_analysis_desktop.py", "bracing_analysis_ui.py", "bracing_analysis_regression.py", "bracing_roof_loads.py", "bracing_roof_loads_regression.py", "bracing_side_wind.py", "bracing_side_wind_regression.py"):
         py_compile.compile(str(root / name), doraise=True)
     for name in ("bracing_design.py", "bracing_design_regression.py", "bracing_workspace_ui.py", 'bracing_policy.py', 'bracing_policy_regression.py', 'bracing_calculation_cache.py', 'bracing_cache_regression.py', 'bracing_serviceability_regression.py', 'bracing_mullion_design.py', 'bracing_alignment_regression.py', 'bracing_layout_search.py', 'bracing_layout_search_regression.py'):
         py_compile.compile(str(root / name), doraise=True)
-    for name in ("bracing_components.py", "bracing_component_ui.py", "bracing_mixed_sizing.py", "bracing_sizing_diagnostics.py", "bracing_components_regression.py", "bracing_schedule.py", "purlin_combined.py", "purlin_beam.py", "purlin_beam_design.py", "purlin_beam_ui.py", "purlin_beam_regression.py", 'purlin_shared_design.py', 'purlin_strut_tables.py', 'purlin_strut_regression.py'):
+    for name in ("bracing_components.py", "bracing_component_ui.py", "bracing_mixed_sizing.py", "bracing_sizing_diagnostics.py", "bracing_components_regression.py", "bracing_schedule.py", "purlin_combined.py", "purlin_beam.py", "purlin_beam_design.py", "purlin_beam_ui.py", "purlin_beam_regression.py", 'purlin_shared_design.py', 'purlin_strut_tables.py', 'purlin_strut_regression.py', 'purlin_end_local.py', 'purlin_end_local_regression.py'):
         py_compile.compile(str(root / name), doraise=True)
     for name in ["app_metadata.py", "main.py", "purlin_selection.py", "purlin_selection_regression.py", "computation_report.py", "computation_report_data.py", "computation_report_regression.py", "portalcalc_service.py", "portalcalc_headless.py", "configurator_review.py", "calculation_service_regression.py", "configurator_review_regression.py", "physics_optimiser_regression.py", "concept_3d.py", "costing.py", "elevation_drawings.py", "finishes.py", "member_checks.py", "loads.py", "wind.py", "end_wall.py", "bracing.py", "licensing.py", "reduced_optimizer.py", "license_server.py", "license_generator_app.py", "crane_beam.py", "storage_loads.py"]:
         py_compile.compile(str(root / name), doraise=True)
@@ -509,8 +520,13 @@ def run_license_smoke_checks() -> None:
     right_strips = skillion_wind.case_roof_strips("Right +")
     end_strips = skillion_wind.case_roof_strips("End +")
     assert left_strips == [(0.0, skillion_wind.roof_slope_length_m, upwind_zone.line_load_max_kn_m)]
-    assert right_strips == [(0.0, skillion_wind.roof_slope_length_m, crosswind_zone.line_load_max_kn_m)]
-    assert end_strips == right_strips
+    # Wind on the high side: Table 5.3(A) bands from the windward high edge,
+    # contiguous over the whole roof (adopted basis shared with the 3D model).
+    assert len(right_strips) > 1
+    assert math.isclose(right_strips[0][0], 0.0, abs_tol=1e-12)
+    assert math.isclose(right_strips[-1][1], skillion_wind.roof_slope_length_m, rel_tol=1e-12)
+    assert all(math.isclose(a[1], b[0], abs_tol=1e-9) for a, b in zip(right_strips, right_strips[1:]))
+    assert end_strips == [(0.0, skillion_wind.roof_slope_length_m, crosswind_zone.line_load_max_kn_m)]
     assert math.isclose(wind.free_roof_cpn(18.4, 0.5, "leeward", "empty", False), 0.0, abs_tol=1e-12)
     assert math.isclose(wind.transverse_free_roof_cpn("empty", True), -0.3, abs_tol=1e-12)
     assert math.isclose(wind.transverse_free_roof_cpn("empty", False), 0.4, abs_tol=1e-12)
@@ -782,7 +798,8 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     assert window.help_tabs.count() == 3
     assert window.help_tabs.tabText(0) == "What's New"
     assert window.help_tabs.tabText(1) == "EULA"
-    assert "SLS Structural Software" in window.help_tabs.widget(1).toPlainText()
+    assert "remains the property of CSB" in window.help_tabs.widget(1).toPlainText()
+    assert "SLS Structural" not in window.help_tabs.widget(1).toPlainText()
     assert "Portal Calc 1.6.4 - 25 October 2026" in window.whats_new_text.toPlainText()
     assert "Longitudinal bracing" in window.whats_new_text.toPlainText()
     assert "406.4 mm diameter" in window.whats_new_text.toPlainText()
@@ -2413,9 +2430,11 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     last_main_cpe = max((arrow for arrow in left_cpe_vertical if arrow[0] < main_right_x), key=lambda arrow: arrow[0])
     first_lean_cpe = min((arrow for arrow in left_cpe_vertical if arrow[0] > main_right_x), key=lambda arrow: arrow[0])
     assert abs(first_lean_cpe[2]) > 1e-9
+    # Main-roof and lean-to roof pressure both act normal to their panels.
+    assert abs(last_main_cpe[2]) > 1e-9
     assert math.isclose(
         math.hypot(first_lean_cpe[2], first_lean_cpe[3]),
-        abs(last_main_cpe[3]),
+        math.hypot(last_main_cpe[2], last_main_cpe[3]),
         rel_tol=1e-9,
     )
 
@@ -2718,6 +2737,78 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     app.quit()
 
 
+def run_tests(failure: str, *specs: str) -> None:
+    """Run unittest modules ("module") or classes ("module:Class") as one suite."""
+    import importlib
+    import unittest
+    loader = unittest.defaultTestLoader
+    suite = unittest.TestSuite()
+    for spec in specs:
+        module_name, _, class_name = spec.partition(":")
+        module = importlib.import_module(module_name)
+        suite.addTests(loader.loadTestsFromTestCase(getattr(module, class_name)) if class_name
+                       else loader.loadTestsFromModule(module))
+    result = unittest.TextTestRunner(verbosity=1).run(suite)
+    assert result.wasSuccessful(), failure
+
+
+def build_steps(quick: bool):
+    """(label, callable, typical seconds). The seconds only order parallel
+    launches (longest first); they are the serial timings from 2026-11-10."""
+    from functools import partial as p
+    return [
+        ("calculation service contract checks", run_calculation_service_smoke_checks, 1),
+        ("reduced optimiser numerical checks", run_reduced_optimizer_smoke_checks, 1),
+        ("roof member UDL checks", run_roof_udl_smoke_checks, 3),
+        ("license and calculation checks", run_license_smoke_checks, 5),
+        ("compatible roof purlin selection checks", p(run_tests, "Roof purlin selection regression failed",
+            "purlin_selection_regression:PairSelectionTests", "purlin_selection_regression:RoofIntegrationTests"), 3),
+        ("3D bracing location planning checks", p(run_tests, "Bracing location planning regression failed",
+            "bracing_layout_regression:LayoutModelTests", "bracing_layout_regression:LayoutUITests"), 4),
+        ("fixed-layout 3D bracing mechanics and desktop checks", p(run_tests, "Fixed-layout 3D bracing analysis regression failed",
+            "bracing_analysis_regression:MechanicsTests", "bracing_analysis_regression:DesktopTests",
+            "bracing_roof_loads_regression:RoofLoadTests", "bracing_side_wind_regression:SideWindTests"), 28),
+        ("bracing section checks, sizing and combined workspace", p(run_tests, "Bracing design/workspace regression failed",
+            "bracing_design_regression:DesignMechanicsTests", "bracing_design_regression:WorkspaceTests"), 46),
+        ("braced-bay spacing and small-screen footer", p(run_tests, "Bracing spacing/screen-fit regression failed",
+            "bracing_spacing_regression:SpacingTests", "bracing_workspace_fit_regression:WorkspaceFitTests"), 5),
+        ("blocked-panel bracing layout search and transactional adoption", p(run_tests,
+            "Bracing layout search regression failed", "bracing_layout_search_regression"), 26),
+        ("brace family preferences and unclad-wall rod rules", p(run_tests,
+            "Bracing material policy regression failed", "bracing_policy_regression"), 23),
+        ("saved bracing calculations and stale-result rejection", p(run_tests,
+            "Bracing saved-calculation regression failed", "bracing_cache_regression"), 87),
+        ("bracing strength-only and serviceability design modes", p(run_tests,
+            "Bracing serviceability-mode regression failed", "bracing_serviceability_regression"), 29),
+        ("eave tributaries and aligned main/bracing mullion checks", p(run_tests,
+            "Bracing alignment regression failed", "bracing_alignment_regression"), 39),
+        ("SLS stressed-skin diaphragms and conventional ULS independence", p(run_tests,
+            "Bracing diaphragm regression failed", "bracing_diaphragm_regression"), 54),
+        # Split by class so the slowest step does not hold up a parallel run.
+        ("rated ropes and per-location purlin strut checks", p(run_tests, "Bracing rated-component regression failed",
+            "bracing_components_regression:RatedComponentTests"), 1),
+        ("rated-component workspace checks", p(run_tests, "Bracing rated-component workspace regression failed",
+            "bracing_components_regression:ComponentWorkspaceTests"), 95),
+        ("bracing sizing recovery checks", p(run_tests, "Bracing sizing recovery regression failed",
+            "bracing_sizing_recovery_regression:SizingRecoveryTests"), 1),
+        ("sheeted-purlin beam load sharing and workspace checks", p(run_tests, "Sheeted-purlin beam regression failed",
+            "purlin_beam_regression:BeamMechanicsTests", "purlin_beam_regression:BeamWorkspaceTests"), 42),
+        ("50/50 purlin strut reference and sizing checks", p(run_tests,
+            "50/50 purlin strut regression failed", "purlin_strut_regression"), 30),
+        ("end-roof local pressure patch checks", p(run_tests,
+            "End-roof local pressure regression failed", "purlin_end_local_regression"), 10),
+        ("internal column layout checks", p(run_tests, "Internal column layout regression failed",
+            "internal_columns_regression:InternalColumnsRegression"), 10),
+        ("automatic column flybrace segment checks", p(run_tests, "Automatic column flybrace regression failed",
+            "column_flybracing_regression:FlybraceRegression"), 10),
+        (f"{'quick' if quick else 'full'} UI checks", p(run_ui_smoke_checks, quick=quick), 60 if quick else 230),
+    ]
+
+
+def default_jobs() -> int:
+    return max(1, min(6, (os.cpu_count() or 2) - 1))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PortalCalc smoke and regression checks.")
     mode = parser.add_mutually_exclusive_group()
@@ -2731,105 +2822,80 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run the full UI regression smoke suite. This is the default.",
     )
+    parser.add_argument(
+        "--jobs", type=int, default=default_jobs(),
+        help="Steps run at once, each in its own process (default %(default)s). "
+             "1 runs every step in this process, one after another.",
+    )
+    parser.add_argument("--step", type=int, help=argparse.SUPPRESS)  # internal: run one step
     return parser.parse_args()
+
+
+def run_parallel(steps, jobs: int, quick: bool) -> bool:
+    """Run each step in its own process, longest first; True if all pass."""
+    import subprocess
+    import sys
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    logs = Path(tempfile.mkdtemp(prefix="portalcalc_smoke_logs_"))
+
+    def run(index):
+        label = steps[index][0]
+        env = dict(os.environ, APPDATA=tempfile.mkdtemp(prefix="portalcalc_smoke_appdata_"))
+        log = logs / f"{index:02d}.log"
+        start = time.perf_counter()
+        with open(log, "w", encoding="utf-8", errors="replace") as handle:
+            code = subprocess.call([sys.executable, str(Path(__file__).resolve()), "--step", str(index)]
+                                   + (["--quick"] if quick else []),
+                                   cwd=Path(__file__).resolve().parent, env=env,
+                                   stdout=handle, stderr=subprocess.STDOUT)
+        return index, code, time.perf_counter() - start, log
+
+    order = sorted(range(len(steps)), key=lambda i: -steps[i][2])
+    print(f"[smoke] running {len(steps)} steps, {jobs} at a time; logs in {logs}", flush=True)
+    results = {}
+    with ThreadPoolExecutor(jobs) as pool:
+        for future in as_completed([pool.submit(run, i) for i in order]):
+            index, code, elapsed, log = future.result()
+            results[index] = (code, elapsed)
+            label = steps[index][0]
+            if code == 0:
+                print(f"[smoke] {label} finished in {elapsed:.1f}s", flush=True)
+            else:
+                tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-60:]
+                print(f"[smoke] {label} FAILED after {elapsed:.1f}s (full log: {log})", flush=True)
+                print("\n".join("    " + line for line in tail), flush=True)
+    failed = [steps[i][0] for i in sorted(results) if results[i][0] != 0]
+    for label in failed:
+        print(f"[smoke] FAILED: {label}", flush=True)
+    return not failed
 
 
 def main() -> None:
     args = parse_args()
     mode_name = "quick" if args.quick else "full"
+    steps = build_steps(args.quick)
+    if args.step is not None:
+        label, function, _ = steps[args.step]
+        with timed_step(label):
+            function()
+        return
+    started = time.perf_counter()
     root = Path(__file__).resolve().parent
     with timed_step("compile sources"):
         compile_sources(root)
-    with timed_step("calculation service contract checks"):
-        run_calculation_service_smoke_checks()
-    with timed_step("reduced optimiser numerical checks"):
-        run_reduced_optimizer_smoke_checks()
-    with timed_step("roof member UDL checks"):
-        run_roof_udl_smoke_checks()
-    with timed_step("license and calculation checks"):
-        run_license_smoke_checks()
-    with timed_step("compatible roof purlin selection checks"):
-        import unittest
-        from purlin_selection_regression import PairSelectionTests, RoofIntegrationTests
-        suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(test) for test in (PairSelectionTests, RoofIntegrationTests))
-        result = unittest.TextTestRunner(verbosity=1).run(suite)
-        assert result.wasSuccessful(), "Roof purlin selection regression failed"
-    with timed_step("3D bracing location planning checks"):
-        import unittest
-        from bracing_layout_regression import LayoutModelTests, LayoutUITests
-        suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(test) for test in (LayoutModelTests, LayoutUITests))
-        result = unittest.TextTestRunner(verbosity=1).run(suite)
-        assert result.wasSuccessful(), "Bracing location planning regression failed"
-    with timed_step("fixed-layout 3D bracing mechanics and desktop checks"):
-        import unittest
-        from bracing_analysis_regression import MechanicsTests, DesktopTests
-        suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(test) for test in (MechanicsTests, DesktopTests))
-        result = unittest.TextTestRunner(verbosity=1).run(suite)
-        assert result.wasSuccessful(), "Fixed-layout 3D bracing analysis regression failed"
-    with timed_step("bracing section checks, sizing and combined workspace"):
-        import unittest
-        from bracing_design_regression import DesignMechanicsTests, WorkspaceTests
-        suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(test) for test in (DesignMechanicsTests, WorkspaceTests))
-        result = unittest.TextTestRunner(verbosity=1).run(suite)
-        assert result.wasSuccessful(), "Bracing design/workspace regression failed"
-    with timed_step('blocked-panel bracing layout search and transactional adoption'):
-        import bracing_layout_search_regression
-        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromModule(bracing_layout_search_regression))
-        assert result.wasSuccessful(), 'Bracing layout search regression failed'
-    with timed_step('brace family preferences and unclad-wall rod rules'):
-        import unittest
-        import bracing_policy_regression
-        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromModule(bracing_policy_regression))
-        assert result.wasSuccessful(), 'Bracing material policy regression failed'
-    with timed_step('saved bracing calculations and stale-result rejection'):
-        import unittest
-        import bracing_cache_regression
-        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromModule(bracing_cache_regression))
-        assert result.wasSuccessful(), 'Bracing saved-calculation regression failed'
-    with timed_step('bracing strength-only and serviceability design modes'):
-        import unittest
-        import bracing_serviceability_regression
-        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromModule(bracing_serviceability_regression))
-        assert result.wasSuccessful(), 'Bracing serviceability-mode regression failed'
-    with timed_step('eave tributaries and aligned main/bracing mullion checks'):
-        import unittest
-        import bracing_alignment_regression
-        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromModule(bracing_alignment_regression))
-        assert result.wasSuccessful(), 'Bracing alignment regression failed'
-    with timed_step('SLS stressed-skin diaphragms and conventional ULS independence'):
-        import bracing_diaphragm_regression
-        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromModule(bracing_diaphragm_regression))
-        assert result.wasSuccessful(), 'Bracing diaphragm regression failed'
-    with timed_step("rated ropes and per-location purlin strut checks"):
-        import unittest
-        from bracing_components_regression import RatedComponentTests, ComponentWorkspaceTests
-        suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(test) for test in (RatedComponentTests, ComponentWorkspaceTests))
-        result = unittest.TextTestRunner(verbosity=1).run(suite)
-        assert result.wasSuccessful(), "Bracing rated-component regression failed"
-    with timed_step("sheeted-purlin beam load sharing and workspace checks"):
-        import unittest
-        from purlin_beam_regression import BeamMechanicsTests, BeamWorkspaceTests
-        suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(test) for test in (BeamMechanicsTests, BeamWorkspaceTests))
-        result = unittest.TextTestRunner(verbosity=1).run(suite)
-        assert result.wasSuccessful(), "Sheeted-purlin beam regression failed"
-    with timed_step('50/50 purlin strut reference and sizing checks'):
-        import unittest
-        import purlin_strut_regression
-        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromModule(purlin_strut_regression))
-        assert result.wasSuccessful(), '50/50 purlin strut regression failed'
-    with timed_step("internal column layout checks"):
-        import unittest
-        from internal_columns_regression import InternalColumnsRegression
-        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromTestCase(InternalColumnsRegression))
-        assert result.wasSuccessful(), "Internal column layout regression failed"
-    with timed_step('automatic column flybrace segment checks'):
-        import unittest
-        from column_flybracing_regression import FlybraceRegression
-        result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromTestCase(FlybraceRegression))
-        assert result.wasSuccessful(), 'Automatic column flybrace regression failed'
-    with timed_step(f"{mode_name} UI checks"):
-        run_ui_smoke_checks(quick=args.quick)
-    print(f"{mode_name} smoke checks ok")
+    if args.jobs <= 1:
+        for label, function, _ in steps:
+            with timed_step(label):
+                function()
+        ok = True
+    else:
+        ok = run_parallel(steps, args.jobs, args.quick)
+    elapsed = time.perf_counter() - started
+    if not ok:
+        print(f"{mode_name} smoke checks FAILED ({elapsed:.0f}s)")
+        raise SystemExit(1)
+    print(f"{mode_name} smoke checks ok ({elapsed:.0f}s)")
 
 
 if __name__ == "__main__":

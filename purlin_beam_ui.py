@@ -113,4 +113,7 @@ class PurlinBeamResults(QWidget):
                 self.note.setText(f"{state}; k = {run['coupling_kn_m_per_mm']:g} kN/m per mm; direct pickup to added = {run['direct_roof_pickup_fraction']:.1%}. Existing: {run['span_type']}, releases after bays {run['roof_releases_after_bays']}; additions: single span. Demand plots do not establish member or connection acceptance.")
         else:
             self.note.setText("Select a sheeted single-span purlin in Components / ratings to analyse roof-load sharing.")
+        local = run.get('cases',[])[index].get('loads',{}).get('local_pressure') if index >= 0 else None
+        if local:
+            self.note.setText(self.note.text()+f"\nTable 5.6 {local['region']}: Kl {local['kl']:g}; a {local['a_m']:.3f} m; patch {local['patch_length_m']:.3f} m from {local['patch_start_from_end_m']:.3f} m at the named end. Local roof bending only; global bracing wind loads unchanged.")
         self.plot.update()

@@ -410,12 +410,34 @@ class WindCalculationResult:
                     q = source_zone.line_load_max_kn_m if use_max else source_zone.line_load_min_kn_m
                     return [(0.0, total_roof_length, q)]
                 return self._mirrored_roof_strips(use_max, total_roof_length, from_right=False)
-            q = self.end_wind_critical_roof_line_load_kn_m(use_max)
-            return [(0.0, total_roof_length, q)]
+            return self._skillion_high_side_strips(use_max, total_roof_length)
 
         from_right = case.startswith("Right")
 
         return self._mirrored_roof_strips(use_max, total_roof_length, from_right)
+
+    def _skillion_high_side_strips(self, use_max: bool, total_roof_length: float) -> List[Tuple[float, float, float]]:
+        """Wind on the high (right) side of a monoslope roof, at any pitch.
+
+        Table 5.3(A) bands are measured horizontally from the windward high
+        edge and converted to distance along the slope. This is the same basis
+        as the 3D bracing side-wind model. Each band takes its own area
+        reduction, as for the other roof zones.
+        """
+        cos_pitch = max(math.cos(math.radians(self.inputs.roof_pitch_deg)), 1e-9)
+        kce = action_combination_factors(self.inputs)[0]
+        strips = []
+        for _, from_h, to_h, cpe_max, cpe_min in low_pitch_cpe_values(self.h_over_d):
+            a = min(from_h * self.h_m / cos_pitch, total_roof_length)
+            b = min(to_h * self.h_m / cos_pitch, total_roof_length)
+            if b <= a:
+                continue
+            factor = max(area_reduction_factor(self.inputs, "roof", (b - a) * self.inputs.bay_size_m) * kce, 0.8)
+            cpe = cpe_max if use_max else cpe_min
+            q = (-cpe) * self.wu_kn_m2 * factor * self.inputs.bay_size_m
+            strips.append((total_roof_length - b, total_roof_length - a, q))
+        strips.sort(key=lambda item: item[0])
+        return strips
 
     def _mirrored_roof_strips(self, use_max: bool, total_roof_length: float, from_right: bool) -> List[Tuple[float, float, float]]:
         strips = []
@@ -924,9 +946,14 @@ def calculate_wind(inputs: WindInputs) -> WindCalculationResult:
             start = start_basis
             end = end_basis
         else:
-            start = start_basis * h
-            end = end_basis * h
-        # Frame sign convention: positive roof wind acts upward in global Y.
+            # Table 5.3(A) bands are horizontal distances from the windward
+            # edge, in multiples of h. Zones are positioned along the roof
+            # slope, so convert; this also makes the Ka area the true roof area.
+            cos_pitch = max(math.cos(math.radians(inputs.roof_pitch_deg)), 1e-9)
+            start = start_basis * h / cos_pitch
+            end = end_basis * h / cos_pitch
+        # Frame sign convention: positive roof wind acts outward (uplift),
+        # normal to each roof panel.
         # Cpe and Cpi are deliberately kept as separate load cases so they can
         # be combined later using load combinations.
         zone_area_m2 = max(end - start, 0.0) * inputs.bay_size_m
@@ -986,14 +1013,40 @@ def wind_pressure_scale(result: WindCalculationResult, wind_pressure: str = "ult
     raise ValueError("wind_pressure must be 'ultimate' or 'serviceability'")
 
 
+def roof_outward_normal(n1, n2) -> Tuple[float, float]:
+    """Unit roof-panel normal with a non-negative global-Y component."""
+    dx = n2.x - n1.x
+    dy = n2.y - n1.y
+    length = math.hypot(dx, dy)
+    if length <= 1e-12:
+        return 0.0, 1.0
+    nx, ny = -dy / length, dx / length
+    return (-nx, -ny) if ny < 0.0 else (nx, ny)
+
+
+def add_roof_panel_pressure(structure, n1, n2, total_n: float) -> Tuple[float, float]:
+    """Lump a roof panel's pressure resultant onto its end nodes, normal to the panel.
+
+    Positive is outward (uplift), as in the wind strip and Cpi conventions.
+    Pressure acts normal to the surface, so a pitched panel also receives a
+    horizontal component. Returns the (X, Y) unit normal used.
+    """
+    nx, ny = roof_outward_normal(n1, n2)
+    for node in (n1, n2):
+        if abs(nx) > 0.0:
+            structure.add_load(node.ux, total_n * nx / 2)
+        structure.add_load(node.uy, total_n * ny / 2)
+    return nx, ny
+
+
 def apply_roof_wind_case_to_top_nodes(structure, top_nodes: Sequence, result: WindCalculationResult, case: WindCaseName, wind_pressure: str = "ultimate") -> List[LoadArrow]:
     """
     Apply a selected wind roof strip case to the portal frame top nodes.
 
-    The current implementation converts each top chord panel to a single average
-    vertical line load using the overlap of each wind strip with the panel's
-    distance along the roof from the left eave. Positive strip values are applied
-    upward in global Y, matching the spreadsheet's uplift-positive output.
+    Each top chord panel receives the overlap of each wind strip with the panel's
+    distance along the roof from the left eave, as a resultant normal to the
+    panel. Positive strip values act outward, matching the spreadsheet's
+    uplift-positive output.
     """
     scale = wind_pressure_scale(result, wind_pressure)
     strips = result.case_roof_strips(case)
@@ -1014,11 +1067,10 @@ def apply_roof_wind_case_to_top_nodes(structure, top_nodes: Sequence, result: Wi
             overlap = max(0.0, min(s2, b) - max(s1, a))
             total_kn += q_kn_m * scale * overlap
         total_n = total_kn * 1000.0
-        structure.add_load(n1.uy, total_n / 2)
-        structure.add_load(n2.uy, total_n / 2)
+        nx, ny = add_roof_panel_pressure(structure, n1, n2, total_n)
         mx = (n1.x + n2.x) / 2
         my = (n1.y + n2.y) / 2
-        arrows.append((mx, my + 800, 0, total_n))
+        arrows.append((mx, my + 800, total_n * nx, total_n * ny))
     return arrows
 
 
@@ -1051,11 +1103,10 @@ def apply_roof_cpi_to_top_nodes(structure, top_nodes: Sequence, result: WindCalc
         dy = (n2.y - n1.y) / 1000
         panel_len_m = math.hypot(dx, dy)
         total_n = line_kn_m * panel_len_m * 1000.0
-        structure.add_load(n1.uy, total_n / 2)
-        structure.add_load(n2.uy, total_n / 2)
+        nx, ny = add_roof_panel_pressure(structure, n1, n2, total_n)
         mx = (n1.x + n2.x) / 2
         my = (n1.y + n2.y) / 2
-        arrows.append((mx, my + 800, 0, total_n))
+        arrows.append((mx, my + 800, total_n * nx, total_n * ny))
     return arrows
 
 

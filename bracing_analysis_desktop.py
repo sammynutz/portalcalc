@@ -12,6 +12,7 @@ import numpy as np
 from bracing_layout import BracingLayout, LayoutGeometry
 from bracing_analysis import (AnalysisError, PortalReduction, build_braced_building,
                               solve_building_case)
+from bracing_restraint import OPTION as RESTRAINT_OPTION
 from wind import (CPI_CASE_OPTIONS, active_cpi_for_case, calculate_wind,
                   direction_bearing_degrees, area_reduction_factor,
                   leeward_wall_cpe, wind_pressure_scale)
@@ -178,11 +179,18 @@ def prepare_context(window, allow_unconfigured=False):
     for node in (left, right):
         structure.springs.pop(node.ux, None)
         structure.restrained_dofs = [d for d in structure.restrained_dofs if d != node.ux]
+    # Likewise any adopted 3D sway restraint: the network itself provides it.
+    structure.sway_springs = []
     points = [(left.x+x, g.roof_z(x)) for x in g.roof_stations]
     portal = PortalReduction(structure, points)
     wind_inputs = window.wind_inputs_from_ui(g.span_mm, g.pitch_deg, g.eave_mm)
     source = copy.deepcopy(window.collect_preset_data())
+    from bracing_spacing import max_bay_spacing
+    spacing_limit=max_bay_spacing({'source_preset':source})
     cases = end_wind_cases(wind_inputs,source['finishes']['roof_profile'])
+    from bracing_roof_loads import building_roof_cases
+    cases, roof_load_basis = building_roof_cases(cases,portal,g,wind_inputs,source,
+                                                window.snow_loads_from_ui()['service_kpa'])
     profile = (window.end_wall_mullion_design or {}).get("selected") or {}
     main_mullions = window.end_wall_mullion_design or {}
     governing = main_mullions.get('governing_mullion') or {}
@@ -280,6 +288,8 @@ def prepare_context(window, allow_unconfigured=False):
             installed[str(line)]['bending_ratio'] = max(loads['outward_kn_m']/match['outward_capacity_kn_m'],loads['inward_strength_kn_m']/match['inward_strength_capacity_kn_m'])
             installed[str(line)]['service_ratio'] = loads['service_kn_m']/match['inward_service_capacity_kn_m']
             eave_data.update(loaded_area_m2=area_m2,wind_upward_kpa=up,wind_downward_kpa=down)
+        from purlin_end_local import end_roof_local_cases
+        installed[str(line)]['beam_inputs']['end_roof_local_cases'] = end_roof_local_cases(wind_inputs,g,installed[str(line)])
         installed[str(line)]["bending_key"] = hashlib.sha256(json.dumps({
             key: installed[str(line)][key] for key in ("section", "area_mm2", "bending_ratio", "service_ratio",
                 "added_bending_ratio", "added_service_ratio", "basis_key", "bending_span_mm", "bending_snapshot", "beam_inputs",
@@ -288,6 +298,8 @@ def prepare_context(window, allow_unconfigured=False):
     from purlin_strut_tables import snapshot as strut_table_snapshot
     return {
         "layout": layout, "nominal_layout": saved.to_dict(), "nominal_geometry": nominal, "portal": portal, "cases": cases,
+        'roof_load_basis': roof_load_basis,
+        'max_braced_bay_spacing':spacing_limit,
         "roof_brace": copy.deepcopy(window.selected_brace_size(window.roof_brace_size_combo)),
         "wall_brace": copy.deepcopy(window.selected_brace_size(window.wall_brace_size_combo)),
         "end_brace": copy.deepcopy(window.selected_end_wall_brace_size()),
@@ -309,6 +321,9 @@ def prepare_context(window, allow_unconfigured=False):
                        "purlin": window.costing_rate_from_input(window.purlin_cost_input, "purlin_rate_per_kg"),
                        'braced_panel_installation': (window.bracing_3d_settings or {}).get('installation_cost_per_panel', 50.)},
         "installed_purlins": installed,
+        # The 2D portal's credited restraint: 3D sizing keeps at least its brace stiffness.
+        'adopted_restraint': (copy.deepcopy(getattr(window, 'bracing_3d_restraint', None))
+                              if window.eave_x_restraint_combo.currentText() == RESTRAINT_OPTION else None),
         'stressed_skin': copy.deepcopy((window.bracing_3d_settings or {}).get('stressed_skin')),
         "purlin_strut_tables": strut_table_snapshot(window.metroll_tables or {}),
     }
@@ -318,8 +333,8 @@ LIMITATIONS = [
     "Fixed pinned-panel layout; unmarked available panels are not installed braces. No automatic layout or section optimisation.",
     "First-order small-displacement elastic analysis, with tension-only rod slackening; no P-delta, buckling, prestress or connection slip.",
     "If zero-force rods are needed for the elastic tangent, equilibrium is reported with stability unverified. A positive taut-rod tangent is not a buckling or code stability check.",
-    "Longitudinal wind: simultaneous end-wall pressures and external roof friction, both directions and both Cpi branches, ULS and SLS. No G/Q, transverse wind, wall/underside/exposed-member drag or full design combinations.",
-    "Normal roof/side-wall pressures are not applied to the reduced 3D frame. Purlin bending uses a separate roof-load envelope; it is not a simultaneous whole-building pressure pattern.",
+    "ULS/SLS gravity and longitudinal wind combinations include G (solar/fire/HVAC/other and actual portal self-weight), Q/snow, simultaneous end-wall pressures, external roof friction and normal roof/clad side-wall pressures. Side winds include both directions, roof alternatives, internal pressure and end-wall suction: ULS with 0.9G/1.2G and SLS as Ws and G + Ws on the bare network. Transverse SLS frame sway is reported only and does not govern 3D sizing. Crane/storage actions and wall/underside/exposed-member drag remain outside scope.",
+    "Normal roof/side-wall loads act through full portal load condensation/recovery. Roof load tributaries use simply supported bay reactions with half tributaries at end frames; purlin continuity redistribution is excluded. Local Table 5.6 patches remain purlin bending checks only.",
     "Roof friction uses the projected external-roof portion of clause 5.5/Table 5.9, with sheeting running down-slope. For open-sided buildings this is a preliminary extension of the enclosed-building method, not a complete open-roof aerodynamic assessment.",
     "End-wall pressure uses simply supported vertical strips: half of each strip resultant goes to roof and half directly to ground. Open ends receive no cladding pressure.",
     "Identical actual 2D portal sections/supports repeat at every frame line. Legacy eave restraints are removed in a private copy. Portal attachment translations use work-conjugate beam interpolation.",
@@ -330,8 +345,143 @@ LIMITATIONS = [
 ]
 
 
-def analyse_context(context, strut_profile, end_post_profile):
-    start = time.perf_counter()
+def transverse_sls(case):
+    """Side-wind serviceability case: reported frame sway, not 3D acceptance."""
+    return case.get('level') == 'SLS' and case.get('wind_family') == 'transverse'
+
+
+def portal_eave_nodes(structure):
+    nodes = [n for e in structure.elements if e.group == 'TOP' for n in (e.start, e.end)]
+    return min(nodes, key=lambda n: n.x), max(nodes, key=lambda n: n.x)
+
+
+# Cases whose loads barely sway the unrestrained frame give an ill-conditioned
+# secant restraint. Judge on the unrestrained frame, not the restrained
+# movement, so well-restrained frames are kept.
+SECANT_MIN_SWAY_MM = 1.
+
+
+def frame_sway_rows(portal, cases):
+    """Per solved case and frame: eave movement, portal-alone sway and restraint.
+
+    Yields (case, frame index, recovered portal, row, portal-alone mean eave X).
+    The secant restraint is -sum(roof interface X)/mean eave X.
+    """
+    left, right = portal_eave_nodes(portal.structure)
+    free = portal.free
+    kff = portal.k[np.ix_(free, free)]
+    for case in cases:
+        loads = np.array([state['loads_n'] for state in case['case']['portal_loads']])
+        alone = np.zeros_like(loads)
+        alone[:, free] = np.linalg.solve(kff, loads[:, free].T).T
+        for index, recovered in enumerate(case['portals']):
+            displacement = {n['node']: n['ux_mm'] for n in recovered['node_displacements']}
+            ux = (displacement[left.id], displacement[right.id])
+            mean = .5*(ux[0]+ux[1])
+            interface_x = sum(force[0] for force in recovered['interface_forces_n'])
+            row = {'case': case['case']['name'], 'left_eave_mm': ux[0], 'right_eave_mm': ux[1],
+                   'movement_mm': max(abs(v) for v in ux),
+                   'portal_alone_mm': max(abs(alone[index, left.ux]), abs(alone[index, right.ux])),
+                   'roof_interface_x_kn': interface_x/1000,
+                   'secant_restraint_kn_mm': -interface_x/mean/1000 if abs(mean) > 1e-6 else None}
+            yield case, index, recovered, row, .5*(alone[index, left.ux]+alone[index, right.ux])
+
+
+def frame_restraint_summary(portal, cases):
+    """Roof-level sway restraint the 3D network gives each frame, for 2D adoption.
+
+    Uses every transverse case (ULS and SLS). The adoptable value is the least
+    secant restraint over interior frames and cases: the 2D model analyses one
+    representative frame with identical sections, so the least-restrained
+    interior frame governs. End frames are excluded because end posts and
+    end-wall bracing support them directly and they carry half the roof load;
+    a single eave spring cannot represent that. If any interior frame receives
+    zero or negative restraint, no credit is adoptable.
+    """
+    selected = [case for case in cases if case['case'].get('wind_family') == 'transverse']
+    if not selected:
+        return None
+    frames = {}
+    for case, index, recovered, row, alone_mean in frame_sway_rows(portal, selected):
+        frame = frames.setdefault(index, {'index': index, 'y_mm': recovered['y_mm'], 'least': None, 'greatest': None})
+        k = row['secant_restraint_kn_mm']
+        if k is None or abs(alone_mean) <= SECANT_MIN_SWAY_MM:
+            continue
+        if frame['least'] is None or k < frame['least']['secant_restraint_kn_mm']:
+            frame['least'] = {'level': case['case']['level'], **row}
+        if frame['greatest'] is None or k > frame['greatest']['secant_restraint_kn_mm']:
+            frame['greatest'] = {'level': case['case']['level'], **row}
+    ordered = [frames[i] for i in sorted(frames)]
+    interior = [f for f in ordered if 0 < f['index'] < len(ordered)-1]
+    reason = None
+    if not interior:
+        reason = 'No interior frames: end frames are not represented by an eave spring'
+    elif any(f['least'] is None for f in interior):
+        reason = 'An interior frame had no transverse case with measurable sway'
+    governing = None if reason else min(interior, key=lambda f: f['least']['secant_restraint_kn_mm'])
+    k = None if governing is None else governing['least']['secant_restraint_kn_mm']
+    if governing is not None and k <= 1e-6:
+        reason = (f"frame {governing['index']+1} is not restrained, as no roof bracing reaches it"
+                  if k > -1e-6 else f"frame {governing['index']+1} is loaded, not restrained, by the bracing (negative restraint)")
+    return {'frames': ordered, 'adoptable': reason is None,
+            'adoptable_kn_mm': k if reason is None else 0.,
+            'governing': None if governing is None else {'frame': governing['index'], **governing['least']},
+            'reason': reason,
+            'basis': 'Least secant roof-level sway restraint over interior frames and all transverse ULS/SLS cases, '
+                     'applied in 2D as one spring on the mean eave movement (frame sway only; eave spread is not resisted). '
+                     'End frames are excluded. Valid only with the bracing layout and sections it was derived from.'}
+
+
+def transverse_sls_summary(portal, cases, sls_basis):
+    """Per-frame eave sway under transverse SLS, with the bracing's restraint.
+
+    The governing ratio uses Ws-only cases, matching the main portal's column
+    top check. The portal-alone sway solves the same frame loads without the
+    3D network. The secant restraint is -sum(interface X)/mean eave X: the
+    roof-level stiffness the network actually provided to that frame in that
+    case. It is negative where roof bracing loads a frame by tying it to a
+    softer neighbour. REPORT ONLY: the production 2D check remains acceptance.
+    """
+    selected = [case for case in cases if transverse_sls(case['case'])]
+    if not selected:
+        return None
+    left, right = portal_eave_nodes(portal.structure)
+    divisor = (sls_basis or {}).get('divisor')
+    frames = {}
+    for case, index, recovered, row, alone_mean in frame_sway_rows(portal, selected):
+        ws_only = not case['case'].get('g_factor')
+        row['combination'] = 'Ws' if ws_only else 'G + Ws'
+        ux = (row['left_eave_mm'], row['right_eave_mm'])
+        if divisor:
+            limits = (left.y/divisor, right.y/divisor)
+            row.update(limit_mm=min(limits), ratio=max(abs(u)/limit for u, limit in zip(ux, limits)))
+        frame = frames.setdefault(index, {'index': index, 'y_mm': recovered['y_mm'],
+                                          'governing_ws': None, 'max_g_plus_ws_mm': 0.,
+                                          'secant_restraint_range_kn_mm': None})
+        if ws_only:
+            key = 'ratio' if divisor else 'movement_mm'
+            if frame['governing_ws'] is None or row[key] > frame['governing_ws'][key]:
+                frame['governing_ws'] = row
+        else:
+            frame['max_g_plus_ws_mm'] = max(frame['max_g_plus_ws_mm'], row['movement_mm'])
+        k = row['secant_restraint_kn_mm']
+        if k is not None and abs(alone_mean) > SECANT_MIN_SWAY_MM:
+            low, high = frame['secant_restraint_range_kn_mm'] or (k, k)
+            frame['secant_restraint_range_kn_mm'] = (min(low, k), max(high, k))
+    ordered = [frames[i] for i in sorted(frames)]
+    governing = max((f for f in ordered if f['governing_ws']),
+                    key=lambda f: f['governing_ws']['ratio' if divisor else 'movement_mm'], default=None)
+    return {'status': 'REPORT_ONLY', 'divisor': divisor, 'criterion_source': (sls_basis or {}).get('source'),
+            'eave_heights_mm': [left.y, right.y], 'case_count': len(selected), 'frames': ordered,
+            'governing': None if governing is None else {'frame': governing['index'], **governing['governing_ws']},
+            'basis': 'Transverse SLS at serviceability pressure (Ws and G + Ws), conventional bare bracing, no diaphragm credit. '
+                     'Eave sway is the larger column-top X movement; the ratio uses Ws-only cases against the main in-plane eave criterion. '
+                     'Portal-alone sway is the same frame and loads without the 3D network. Secant restraint is -sum(roof interface X)/mean eave X. '
+                     'Report only: the production 2D portal check remains the serviceability acceptance.'}
+
+
+def prepare_analysis_models(context, strut_profile, end_post_profile):
+    """Shared physical assembly for full checks and lightweight SLS trials."""
     layout, portal = context["layout"], context["portal"]
     post_faces = {face for face, clad in (("front_end", context["front_clad"]), ("back_end", context["back_clad"]))
                   if clad or any(layout.panels[p].face == face for p in layout.pinned)}
@@ -359,12 +509,34 @@ def analyse_context(context, strut_profile, end_post_profile):
                     **context.get('face_cladding',{})}
         sls_model, diaphragm = stressed_skin_model(model, layout, point_nodes, diaphragm_settings, cladding)
         align_fixed_nodes(model,sls_model)
+    return model, sls_model, roof_grid, portal_dofs, point_nodes, diaphragm
+
+
+def analyse_context(context, strut_profile, end_post_profile, reuse_cases=None):
+    """Solve every case. ``reuse_cases`` maps case names to solved results for
+    this same model and sections, which are used instead of re-solving.
+
+    ``context['search_only']`` (set by optimiser searches whose results are
+    discarded) omits the per-member portal end-force evidence, which only the
+    report/export reads; design and restraint checks are unchanged."""
+    start = time.perf_counter()
+    layout, portal = context['layout'], context['portal']
+    member_forces = not context.get('search_only')
+    model, sls_model, roof_grid, portal_dofs, point_nodes, diaphragm = prepare_analysis_models(
+        context, strut_profile, end_post_profile)
+    from bracing_components import StrutPlan, assembly_properties
+    from bracing_diaphragm import recover_diaphragm
     cases = []
     for case in context["cases"]:
+        reused = (reuse_cases or {}).get(case['name'])
+        if reused is not None and reused['case'] is case:
+            cases.append(reused)
+            continue
         try:
-            solved = solve_building_case(model, layout, portal, portal_dofs, point_nodes, case)
-            if diaphragm_settings.active and case['level'] == 'SLS':
-                enhanced = solve_building_case(sls_model, layout, portal, portal_dofs, point_nodes, case)
+            solved = solve_building_case(model, layout, portal, portal_dofs, point_nodes, case, member_forces)
+            # Transverse SLS uses the bare network: no diaphragm sway credit.
+            if diaphragm['active'] and case['level'] == 'SLS' and not transverse_sls(case):
+                enhanced = solve_building_case(sls_model, layout, portal, portal_dofs, point_nodes, case, member_forces)
                 solved = recover_diaphragm(enhanced, diaphragm['panels'], len(model.members), solved)
             cases.append(solved)
         except AnalysisError as error:
@@ -379,10 +551,10 @@ def analyse_context(context, strut_profile, end_post_profile):
                           "compression_n": max(0., -compression[0]), "compression_case": compression[1]})
     roof_nodes = {n for row in roof_grid for n in row}
     sls = [(float(np.linalg.norm(displacement)), case["case"]["name"], i, displacement)
-           for case in cases if case["case"]["level"] == "SLS"
+           for case in cases if case["case"]["level"] == "SLS" and not transverse_sls(case["case"])
            for i, displacement in enumerate(case["displacements_mm"]) if i in roof_nodes]
     governing = max(sls, key=lambda item: item[0])
-    if diaphragm_settings.active:
+    if diaphragm['active']:
         bare = [(float(np.linalg.norm(d)), case['case']['name'], i)
                 for case in cases if 'bare_sls' in case
                 for i,d in enumerate(case['bare_sls']['displacements_mm']) if i in roof_nodes]
@@ -400,6 +572,7 @@ def analyse_context(context, strut_profile, end_post_profile):
         'face_cladding': dict(context.get('face_cladding', {})),
         'mullion_basis':copy.deepcopy(context.get('mullion_basis')),
         'global_sls_basis':copy.deepcopy(context.get('global_sls_basis')),
+        'roof_load_basis':copy.deepcopy(context.get('roof_load_basis')),
         "schema": "portalcalc.fixed-bracing-analysis.v1", "status": "SOLVED_DEMANDS_ONLY",
         "created_utc": datetime.now(timezone.utc).isoformat(), "elapsed_seconds": time.perf_counter()-start,
         "source_hash": context["source_hash"], "source_preset": context["source_preset"],
@@ -413,9 +586,11 @@ def analyse_context(context, strut_profile, end_post_profile):
         'stressed_skin': diaphragm,
         "governing_sls_displacement": {"resultant_mm": governing[0], "case": governing[1],
                                        "node": governing[2], "components_mm": governing[3]},
+        'transverse_sls': transverse_sls_summary(portal, cases, context.get('global_sls_basis')),
+        'frame_restraint': frame_restraint_summary(portal, cases),
         "limitations": ([line.replace('No diaphragm or sheeting stiffness.',
                          'Enabled roof/wall diaphragm stiffness is included in SLS only.') for line in LIMITATIONS]
-                        + [diaphragm['basis']] if diaphragm_settings.active else list(LIMITATIONS)),
+                        + [diaphragm['basis']] if diaphragm['active'] else list(LIMITATIONS)),
     }
 
 
@@ -438,6 +613,17 @@ def text_report(result):
         else:
             lines.append(f"{kind.replace('_', ' ').title()}: {section.get('section', section.get('label', '-'))}; A = {section['area_mm2']:.1f} mm2; E = 200000 MPa")
     lines += ["", "SCOPE AND ASSUMPTIONS"] + [f"- {item}" for item in result["limitations"]]
+    spacing=result.get('design',{}).get('layout_spacing',{})
+    if 'anchor_bays' in spacing:
+        from bracing_spacing import spacing_text
+        lines += ['', 'PROJECT BRACED-BAY SPACING',spacing_text(spacing),spacing['basis']]
+    roof_basis = result.get('roof_load_basis')
+    if roof_basis:
+        lines += ['', 'SIMULTANEOUS ROOF LOAD BASIS',roof_basis['basis'],
+                  f"Permanent roof load {roof_basis['permanent_roof_kpa']:g} kPa; live/snow service load {roof_basis['live_or_snow_service_kpa']:g} kPa.",
+                  'Frame roof tributary widths (m): '+', '.join(f'{v/1000:g}' for v in roof_basis['frame_tributary_widths_mm']),
+                  'Roof load extents: '+json.dumps(roof_basis['placements'],sort_keys=True),roof_basis['source'],
+                  'Excluded: '+roof_basis['excluded']]
     diaphragm = result.get('stressed_skin', {})
     if diaphragm.get('active',diaphragm.get('settings', {}).get('enabled')):
         settings = diaphragm['settings']
@@ -474,17 +660,47 @@ def text_report(result):
         lines.append(f"{item['id']} | {item['kind']} | {item['tension_n']/1000:.3f} | {item['compression_n']/1000:.3f} | {source}")
     sls = result["governing_sls_displacement"]
     lines += ["", "SERVICEABILITY MOVEMENT (no acceptance limit applied)",
-              f"Maximum resultant: {sls['resultant_mm']:.4f} mm at node {sls['node']+1}; {sls['case']}", ""]
+              f"Maximum resultant, gravity/longitudinal SLS: {sls['resultant_mm']:.4f} mm at node {sls['node']+1}; {sls['case']}", ""]
+    transverse = result.get('transverse_sls')
+    if transverse:
+        criterion = f"H/{transverse['divisor']:g}" if transverse['divisor'] else 'no criterion'
+        lines += ['TRANSVERSE SLS FRAME SWAY (REPORT ONLY)', transverse['basis'],
+                  f"Criterion: {criterion}; {transverse.get('criterion_source') or '-'}. {transverse['case_count']} transverse SLS cases.",
+                  'Frame | Y m | Ws eave sway mm | limit mm | ratio | portal alone mm | secant restraint kN/mm | range kN/mm | max G + Ws mm | governing Ws case']
+        for frame in transverse['frames']:
+            row = frame['governing_ws'] or {}
+            k = row.get('secant_restraint_kn_mm')
+            span = frame['secant_restraint_range_kn_mm']
+            lines.append(f"{frame['index']+1} | {frame['y_mm']/1000:g} | {row.get('movement_mm', 0):.3f} | "
+                         f"{row.get('limit_mm', float('nan')):.1f} | {row.get('ratio', float('nan')):.3f} | "
+                         f"{row.get('portal_alone_mm', 0):.3f} | {'-' if k is None else f'{k:.4f}'} | "
+                         f"{'-' if span is None else f'{span[0]:.4f} to {span[1]:.4f}'} | "
+                         f"{frame['max_g_plus_ws_mm']:.3f} | {row.get('case', '-')}")
+        lines.append('')
+    restraint = result.get('frame_restraint')
+    if restraint:
+        lines += ['FRAME RESTRAINT FOR THE 2D PORTAL', restraint['basis'],
+                  (f"Adoptable: {restraint['adoptable_kn_mm']:.4f} kN/mm (frame {restraint['governing']['frame']+1}, "
+                   f"{restraint['governing']['case']})" if restraint['adoptable'] else f"Not adoptable: {restraint['reason']}"),
+                  'Frame | least kN/mm | case | greatest kN/mm']
+        for frame in restraint['frames']:
+            least, greatest = frame['least'] or {}, frame['greatest'] or {}
+            low = '-' if not least else '%.4f' % least['secant_restraint_kn_mm']
+            high = '-' if not greatest else '%.4f' % greatest['secant_restraint_kn_mm']
+            lines.append(f"{frame['index']+1} | {low} | {least.get('case', '-')} | {high}")
+        lines.append('')
     for case in result["cases"]:
         lines += ["="*75, case["case"]["name"], f"Source direction: {case['case']['source_direction']}; Cpi: {case['case']['cpi']:.4f}",
                   f"Signed front/back pressure (+Y): {case['case']['front_kpa']:.5f} / {case['case']['back_kpa']:.5f} kPa",
                   f"Nonlinear iterations: {case['iterations']}; free-DOF residual: {case['residual_n']:.3g} N",
-                  f"Elastic tangent status: {case['tangent_status']}",
+                  f"Elastic tangent status: {case['tangent_status']}"
+                  + (f"; slack play {case['slack_play']['play_mm']:.3f} mm over {case['slack_play']['modes']} mode(s), "
+                     f"taken up by {', '.join(case['slack_play']['rods'])}" if case.get('slack_play') else ''),
                   f"Global force residual [N]: {case['balance_force_error_n']}",
                   f"Global moment residual [Nmm]: {case['balance_moment_error_nmm']}"]
         if case['case'].get('pressure_basis'):
             b=case['case']['pressure_basis']
-            lines += [f"End-wind coefficient basis: d/b={b['d_over_b']:.5f} (length/span); leeward Cp,e={b['leeward_cpe']:.5f}; effective surfaces {b['effective_surface_count']}; Kce/Kci={b['kce']:g}/{b['kci']:g}.",b['source'],b['scope']]
+            lines += [f"Wind coefficient basis: d/b={b['d_over_b']:.5f} (along-wind depth/crosswind breadth); leeward Cp,e={b['leeward_cpe']:.5f}; effective surfaces {b['effective_surface_count']}; Kce/Kci={b['kce']:g}/{b['kci']:g}.",b['source'],b['scope']]
         if case['case'].get('components_windward_leeward'):
             lines += ['SIMULTANEOUS END-WALL PRESSURES (kPa; inward positive)',
                       'Common Cpi on both ends; net inward = external minus internal. Front inward acts +Y; back inward acts -Y.']
@@ -497,6 +713,24 @@ def text_report(result):
                       drag['application'],drag['basis'],drag['source']]
         for work in case["load_workings"]:
             lines.append(f"{work['face']}: roof {work['roof_resultant_n']/1000:.3f} kN; direct ground {work['direct_ground_resultant_n']/1000:.3f} kN")
+            if work.get('pressure_segments_mm_kpa'):
+                lines.append('Signed Y pressure bands [X start mm, X end mm, kPa]: '+json.dumps(work['pressure_segments_mm_kpa']))
+        if case['case'].get('transverse_pressure_pattern'):
+            pattern=case['case']['transverse_pressure_pattern']
+            lines += [f"{case['case']['level']} TRANSVERSE PRESSURE PATTERN",pattern['source'],
+                      'Roof Cpe bands [X start mm, X end mm, Cp,e]: '+json.dumps(pattern['roof_cpe_segments_mm']),
+                      'End-wall side-suction Cpe bands [X start mm, X end mm, Cp,e]: '+json.dumps(pattern['end_wall_cpe_segments_mm']),
+                      'Conventional bare bracing only; no transverse diaphragm credit. Scalar front/back pressure above is the peak; the applied bands are shown here.']
+            drag=case['case']['transverse_roof_drag']
+            lines.append(f"Transverse roof friction X {drag['signed_x_force_kn']:.3f} kN; Cf={drag['cf']:g}, X={drag['x_start_mm']/1000:g} to {drag['x_end_mm']/1000:g} m. "+drag['basis'])
+        if case.get('portal_load_workings'):
+            lines += ['SIMULTANEOUS PORTAL LOADS (physical applied X/Y/Z, kN)',
+                      f"G/Q factors: {case['case'].get('g_factor',0):g} / {case['case'].get('q_factor',0):g}"]
+            for work in case['portal_load_workings']:
+                lines.append(f"Portal {work['index']+1}: "+' / '.join(f'{v/1000:.3f}' for v in work['applied_force_n']))
+            lines.append('Whole-building applied resultant X/Y/Z kN: '+' / '.join(f'{v/1000:.3f}' for v in case['applied_resultant_n']))
+        if case['case'].get('equivalent_case_names'):
+            lines += ['Identical physical combination also represents: '+name for name in case['case']['equivalent_case_names']]
         if case.get('load_path'):
             path = case['load_path']
             lines += ['', 'LOAD PATH / BRACE DIRECTIONS',path['axes'],path['basis'],

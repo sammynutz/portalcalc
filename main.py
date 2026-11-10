@@ -14,19 +14,41 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
 
-def merge_web_member_demand(current, source):
+def plain_copy(value):
+    """Deep copy of plain JSON-like data (dict/list/scalars), much faster than
+    copy.deepcopy. Any other object is passed to copy.deepcopy, so the result
+    is never shared with the input."""
+    kind = type(value)
+    if kind is dict:
+        return {key: plain_copy(item) for key, item in value.items()}
+    if kind is list:
+        return [plain_copy(item) for item in value]
+    if kind in (str, int, float, bool, type(None)):
+        return value
+    if kind is tuple and all(type(item) in (str, int, float, bool, type(None)) for item in value):
+        return value
+    return copy.deepcopy(value)
+
+
+def merge_web_member_demand(current, source, *, owned=False):
     """Keep independent tension/compression envelopes for one physical web.
 
     A larger tension force must not discard a lower compression force: buckling
     capacity can be much lower than tensile capacity. Retain each force's source
     combination, and independently retain the governing connection context.
+
+    ``owned=True`` is for the envelope solver's own merges: ``current`` is
+    updated in place and ``source`` values are taken by reference, because the
+    caller built both and discards ``source``. Otherwise inputs are not mutated
+    or shared.
     """
+    copier = (lambda value: value) if owned else copy.deepcopy
     if current is None:
-        result = copy.deepcopy(source)
+        result = dict(source) if owned else copy.deepcopy(source)
         for kind in ("compression", "tension"):
             result.setdefault(f"{kind}_combo", source.get("combo", "-"))
         return result
-    result = copy.deepcopy(current)
+    result = current if owned else copy.deepcopy(current)
     for kind in ("compression", "tension"):
         key = f"{kind}_kn"
         if source.get(key, 0.0) > current.get(key, 0.0):
@@ -39,7 +61,7 @@ def merge_web_member_demand(current, source):
         result["combo"] = source.get("combo", "-")
     if source.get("connection_ratio", 0.0) > current.get("connection_ratio", 0.0):
         for key in ("connection_ratio", "connection_demand_kn", "connection_combo", "connection"):
-            result[key] = copy.deepcopy(source.get(key))
+            result[key] = copier(source.get(key))
     return result
 
 # The envelope solver can run load combinations in parallel. Keep BLAS from
@@ -86,7 +108,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QSplashScreen,
 )
-from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QDesktopServices, QFontMetrics, QIcon, QMatrix4x4, QPainter, QPen, QPixmap, QPolygonF, QSurfaceFormat, QTextDocument, QVector3D
+from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QDesktopServices, QFontMetrics, QIcon, QMatrix4x4, QPainter, QPalette, QPen, QPixmap, QPolygonF, QSurfaceFormat, QTextDocument, QVector3D
 from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtOpenGL import QOpenGLBuffer, QOpenGLShader, QOpenGLShaderProgram
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
@@ -94,7 +116,16 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
-from app_metadata import APP_COPYRIGHT, APP_DISPLAY_NAME, APP_RELEASE_DATE, APP_VERSION
+from app_metadata import (
+    APP_COPYRIGHT,
+    APP_DISPLAY_NAME,
+    APP_RELEASE_DATE,
+    APP_SETTINGS_NAME,
+    APP_TAGLINE,
+    APP_VERSION,
+    BRAND_NAVY,
+    BRAND_TEAL,
+)
 from configurator_review import (
     ReviewLaunchOptions,
     atomic_write_json,
@@ -121,6 +152,7 @@ from storage_loads import StorageLoadInputs, StoragePanelDesignInputs, apply_sto
 from member_checks import E_STEEL_MPA, MemberActions, SectionCheckProperties, check_member
 from end_wall import design_end_wall_mullions, mullion_layout, roof_height_mm
 from bracing import BracingInputs, approximate_purlin_weak_axis_inertia_mm4, calculate_preliminary_bracing
+from bracing_restraint import OPTION as BRACING_3D_RESTRAINT_OPTION, adoption_record as bracing_restraint_adoption_record, restraint_status as bracing_restraint_status
 from elevation_drawings import export_elevation_pdf
 from finishes import CLADDING_PROFILES, COLORBOND_CORE_COLOURS, DEFAULT_FINISHES, colour_hex
 import concept_3d
@@ -135,6 +167,7 @@ from wind import (
     apply_column_wind_cpe_loads,
     apply_roof_cpi_case_to_top_nodes,
     apply_roof_cpi_to_top_nodes,
+    add_roof_panel_pressure,
     apply_column_wind_cpi_loads,
     CPE_CASE_OPTIONS,
     CPI_CASE_OPTIONS,
@@ -428,46 +461,79 @@ def app_icon():
     return icon
 
 
+def brand_logo_pixmap(dark_background=False):
+    name = "portalcalc_logo_white.png" if dark_background else "portalcalc_logo.png"
+    return QPixmap(resource_path(os.path.join("assets", name)))
+
+
+def csb_logo_pixmap(dark_background=False):
+    name = "csb_logo_white.png" if dark_background else "csb_logo.png"
+    return QPixmap(resource_path(os.path.join("assets", name)))
+
+
+def apply_brand_palette(app):
+    """Use the BOLT navy for selection/focus accents instead of the OS accent colour."""
+    palette = app.palette()
+    for group in (QPalette.Active, QPalette.Inactive):
+        palette.setColor(group, QPalette.Highlight, QColor(BRAND_NAVY))
+        palette.setColor(group, QPalette.HighlightedText, QColor("#ffffff"))
+        palette.setColor(group, QPalette.Accent, QColor(BRAND_NAVY))
+        palette.setColor(group, QPalette.Link, QColor(BRAND_TEAL))
+    app.setPalette(palette)
+
+
 def create_startup_splash():
     pixmap = QPixmap(560, 300)
-    pixmap.fill(QColor("#f7f8fb"))
+    pixmap.fill(QColor("#ffffff"))
 
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
-    painter.setPen(QPen(QColor("#d6dbe6"), 1))
-    painter.drawRoundedRect(0, 0, pixmap.width() - 1, pixmap.height() - 1, 8, 8)
+    painter.setPen(QPen(QColor("#d5dcea"), 1))
+    painter.drawRect(0, 0, pixmap.width() - 1, pixmap.height() - 1)
+    # BOLT navy band with a teal keyline along the top edge.
+    painter.fillRect(0, 0, pixmap.width(), 8, QColor(BRAND_NAVY))
+    painter.fillRect(0, 8, pixmap.width(), 3, QColor(BRAND_TEAL))
 
-    logo = QPixmap(resource_path(os.path.join("assets", "portalcalc_logo.png")))
+    logo = brand_logo_pixmap()
     if not logo.isNull():
-        logo_width = min(360, pixmap.width() - 96)
+        logo_width = pixmap.width() - 112
         logo_scaled = logo.scaledToWidth(logo_width, Qt.SmoothTransformation)
-        painter.drawPixmap((pixmap.width() - logo_scaled.width()) // 2, 52, logo_scaled)
+        painter.drawPixmap((pixmap.width() - logo_scaled.width()) // 2, 70, logo_scaled)
     else:
         font = painter.font()
         font.setPointSize(28)
         font.setBold(True)
         painter.setFont(font)
-        painter.setPen(QColor("#1d2733"))
+        painter.setPen(QColor(BRAND_NAVY))
         painter.drawText(QRectF(0, 72, pixmap.width(), 52), Qt.AlignCenter, APP_DISPLAY_NAME)
 
     font = painter.font()
     font.setPointSize(10)
     font.setBold(False)
     painter.setFont(font)
-    painter.setPen(QColor("#566173"))
+    painter.setPen(QColor("#4d5b78"))
     painter.drawText(
         QRectF(0, 182, pixmap.width(), 24),
         Qt.AlignCenter,
         f"Version {APP_VERSION}",
     )
 
-    painter.setPen(QPen(QColor("#cad1dd"), 1))
+    painter.setPen(QPen(QColor(BRAND_TEAL), 2))
     painter.drawLine(72, 226, pixmap.width() - 72, 226)
+
+    csb_logo = csb_logo_pixmap()
+    if not csb_logo.isNull():
+        csb_scaled = csb_logo.scaledToWidth(92, Qt.SmoothTransformation)
+        painter.drawPixmap(
+            pixmap.width() - csb_scaled.width() - 16,
+            pixmap.height() - csb_scaled.height() - 14,
+            csb_scaled,
+        )
     painter.end()
 
     splash = QSplashScreen(pixmap)
     splash.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-    splash.showMessage("Starting...", Qt.AlignBottom | Qt.AlignHCenter, QColor("#1d2733"))
+    splash.showMessage("Starting...", Qt.AlignBottom | Qt.AlignHCenter, QColor(BRAND_NAVY))
     return splash
 
 
@@ -1064,6 +1130,8 @@ class Structure2D:
         self.loads = {}
         self.element_uniform_loads = {}
         self.springs = {}
+        # (dofs, stiffness) springs on the mean movement of several DOFs.
+        self.sway_springs = []
         self.restrained_dofs = []
 
     def add_node(self, node):
@@ -1177,10 +1245,24 @@ class Structure2D:
         if stiffness_n_per_mm > 0.0:
             self.springs[dof] = self.springs.get(dof, 0.0) + stiffness_n_per_mm
 
+    def add_sway_spring(self, dofs, stiffness_n_per_mm):
+        """Spring on the mean movement of several DOFs, e.g. both eave UX.
+
+        The force k * mean(u) is shared equally, so frame sway is resisted but
+        equal and opposite movements (eave spread under gravity) are not.
+        """
+        if stiffness_n_per_mm > 0.0 and dofs:
+            self.sway_springs.append((tuple(dofs), float(stiffness_n_per_mm)))
+
     def spring_reaction_vector(self, displacements):
         R = np.zeros(len(displacements))
         for dof, stiffness in self.springs.items():
             R[dof] += stiffness * displacements[dof]
+        for dofs, stiffness in getattr(self, "sway_springs", ()):
+            share = 1.0 / len(dofs)
+            force = stiffness * share * sum(displacements[dof] for dof in dofs)
+            for dof in dofs:
+                R[dof] += force * share
         return R
 
     def elastic_stiffness_matrix(self):
@@ -1194,6 +1276,11 @@ class Structure2D:
                     K[dofs[i], dofs[j]] += k[i, j]
         for dof, stiffness in self.springs.items():
             K[dof, dof] += stiffness
+        for dofs, stiffness in getattr(self, "sway_springs", ()):
+            share = 1.0 / len(dofs)
+            for a in dofs:
+                for b in dofs:
+                    K[a, b] += stiffness * share * share
         return K
 
     def load_vector(self):
@@ -3083,6 +3170,13 @@ class MainWindow(QMainWindow):
         self.bracing_location_layout = None
         self.bracing_3d_settings = None
         self.bracing_3d_calculation_cache = None
+        # Adopted 3D frame restraint record (bracing_restraint), its last status
+        # and why the last checked 3D result was not adopted, if it was not.
+        self.bracing_3d_restraint = None
+        self.bracing_3d_restraint_status = None
+        self.bracing_3d_restraint_note = None
+        # Optimiser-only trial sway restraint (kN/mm); None in normal use.
+        self.trial_sway_restraint_kn_mm = None
         self.load_combinations = build_load_combinations(CPE_CASE_OPTIONS, CPI_CASE_OPTIONS)
         self.factory_default_data = None
         self.factory_defaults_loaded_path = ""
@@ -3271,8 +3365,8 @@ class MainWindow(QMainWindow):
 
         return f"""<!doctype html><html><head><style>
         @page {{ size: A4; margin: 14mm; }} body {{ font-family: Arial, sans-serif; font-size: 9pt; color: #18222d; }}
-        h1 {{ color:#174f78; font-size:18pt; margin:0; }} h2 {{ color:#174f78; font-size:11pt; border-bottom:1px solid #8fa7b8; margin:12px 0 4px; }}
-        .meta {{ color:#52616d; margin:2px 0 10px; }} table {{ width:100%; border-collapse:collapse; }} th,td {{ border-bottom:1px solid #d8e0e5; padding:3px 5px; vertical-align:top; }} th {{ width:31%; text-align:left; background:#edf3f6; }}
+        h1 {{ color:#13377e; font-size:18pt; margin:0; }} h2 {{ color:#13377e; font-size:11pt; border-bottom:1px solid #00b5af; margin:12px 0 4px; }}
+        .meta {{ color:#4d5b78; margin:2px 0 10px; }} table {{ width:100%; border-collapse:collapse; }} th,td {{ border-bottom:1px solid #d5dcea; padding:3px 5px; vertical-align:top; }} th {{ width:31%; text-align:left; background:#eef2f9; }}
         ul {{ margin:4px 0; padding-left:18px; }} li {{ margin:2px 0; }} .note {{ margin-top:12px; font-size:8pt; color:#52616d; }}
         </style></head><body><h1>PortalCalc Engineering Summary</h1>
         <div class="meta">Issued {esc(datetime.now().astimezone().strftime('%d %b %Y, %H:%M %Z'))} &nbsp;|&nbsp; PortalCalc {esc(APP_VERSION)}</div>
@@ -3651,15 +3745,25 @@ class MainWindow(QMainWindow):
         about_layout = QVBoxLayout(about_tab)
         about_logo = QLabel()
         about_logo.setAlignment(Qt.AlignLeft)
-        about_logo_pixmap = QPixmap(resource_path(os.path.join("assets", "portalcalc_logo.png")))
+        dark_theme = getattr(self, "ui_theme_combo", None) is not None and self.ui_theme_combo.currentText() == "Dark"
+        about_logo_pixmap = brand_logo_pixmap(dark_background=dark_theme)
+        about_header = QHBoxLayout()
         if not about_logo_pixmap.isNull():
             about_logo.setPixmap(about_logo_pixmap.scaledToWidth(440, Qt.SmoothTransformation))
-            about_layout.addWidget(about_logo)
+            about_header.addWidget(about_logo, 0, Qt.AlignLeft | Qt.AlignVCenter)
+        about_header.addStretch(1)
+        about_csb_pixmap = csb_logo_pixmap(dark_background=dark_theme)
+        if not about_csb_pixmap.isNull():
+            about_csb_logo = QLabel()
+            about_csb_logo.setToolTip("Central Steel Build")
+            about_csb_logo.setPixmap(about_csb_pixmap.scaledToWidth(130, Qt.SmoothTransformation))
+            about_header.addWidget(about_csb_logo, 0, Qt.AlignRight | Qt.AlignTop)
+        about_layout.addLayout(about_header)
 
         about = QTextEdit()
         about.setReadOnly(True)
         about.setPlainText("\n".join([
-            APP_DISPLAY_NAME,
+            f"{APP_DISPLAY_NAME} - {APP_TAGLINE}",
             f"Version {APP_VERSION}",
             f"Release date: {APP_RELEASE_DATE}",
             APP_COPYRIGHT,
@@ -3728,6 +3832,7 @@ class MainWindow(QMainWindow):
         self.active_eave_x_restraint = "None"
         self.active_eave_x_spring_kn_mm = 0.0
         self.eave_bracing_info = None
+        self.bracing_3d_restraint_status = None
         self.longitudinal_bracing_design = None
         if getattr(self, "end_wall_layout_label", None) is not None:
             self.update_end_wall_results()
@@ -4300,7 +4405,7 @@ class MainWindow(QMainWindow):
         self.left_column_length_adjust_input = QLineEdit("0")
         self.right_column_length_adjust_input = QLineEdit("0")
         self.eave_x_restraint_combo = QComboBox()
-        self.eave_x_restraint_combo.addItems(["None", "One end", "Both ends"])
+        self.eave_x_restraint_combo.addItems(["None", "One end", "Both ends", BRACING_3D_RESTRAINT_OPTION])
         self.end_wall_braced_sides_combo = QComboBox()
         self.end_wall_braced_sides_combo.addItems(["One side", "Both sides"])
         self.end_wall_brace_size_combo = QComboBox()
@@ -4586,6 +4691,13 @@ class MainWindow(QMainWindow):
         layout_scope = QLabel("Mark blocked roof, side-wall and end-wall panels. Location planning is separate from the Phase 1 checks below.")
         layout_scope.setWordWrap(True)
         locations_layout.addRow(layout_scope)
+        self.combined_sizing_button = QPushButton("Optimise frame + bracing together...")
+        self.combined_sizing_button.setToolTip(
+            "Size the 2D frame and the 3D bracing together for the lowest total estimated cost. "
+            "Builds a frontier of bracing options and the restraint each gives, sizes the frame for the "
+            "promising ones and verifies the winner exactly. Takes a few minutes.")
+        self.combined_sizing_button.clicked.connect(self.run_combined_sizing)
+        locations_layout.addRow(self.combined_sizing_button)
 
         def add_brace_sizes(combo):
             for label, area_mm2, description in END_WALL_BRACING_SIZE_OPTIONS:
@@ -5644,7 +5756,7 @@ class MainWindow(QMainWindow):
             "left_support_combo": "Main left-column base idealisation: pinned, fixed or rotational spring.",
             "right_support_combo": "Main right-column base idealisation: pinned, fixed or rotational spring.",
             "base_x_spring_input": "Base rotational spring stiffness used when either base support is set to Spring, in kNm/rad.",
-            "eave_x_restraint_combo": "Number of longitudinal end walls contributing roof-level bracing stiffness: none, one end or both ends.",
+            "eave_x_restraint_combo": "Roof-level sway restraint from bracing: none; one or both end walls (calibrated hand spring); or the 3D bracing model, which applies the least interior-frame restraint adopted from the 3D bracing workspace as a spring on the mean eave movement.",
             "end_wall_braced_sides_combo": "One side restrains the left eave only. Both sides applies the same longitudinal spring to both eave nodes.",
             "end_wall_brace_size_combo": "Rod or angle used in the end-wall bracing stiffness model.",
             "end_wall_braced_bay_count_input": "Number of parallel longitudinal braced bays provided on each selected side wall.",
@@ -8049,6 +8161,7 @@ class MainWindow(QMainWindow):
                 "wall_brace_size": self.selected_brace_size(self.wall_brace_size_combo)["label"],
                 **({"layout": copy.deepcopy(self.bracing_location_layout)} if self.bracing_location_layout is not None else {}),
                 **({"analysis_3d": copy.deepcopy(self.bracing_3d_settings)} if self.bracing_3d_settings is not None else {}),
+                **({"restraint_3d": copy.deepcopy(self.bracing_3d_restraint)} if self.bracing_3d_restraint is not None else {}),
             },
             "canopies": {
                 "left_length_mm": mm_text_from_metres_widget(self.left_canopy_length_input),
@@ -8380,7 +8493,7 @@ class MainWindow(QMainWindow):
             end_wall_bracing = "One end"
         elif end_wall_bracing in {"Both eaves", "Both sides"}:
             end_wall_bracing = "Both ends"
-        elif end_wall_bracing not in {"None", "One end", "Both ends"}:
+        elif end_wall_bracing not in {"None", "One end", "Both ends", BRACING_3D_RESTRAINT_OPTION}:
             end_wall_bracing = "None"
         self.set_combo_text_if_present(self.eave_x_restraint_combo, end_wall_bracing)
         end_wall_braced_sides = geometry.get("end_wall_braced_sides")
@@ -8405,6 +8518,8 @@ class MainWindow(QMainWindow):
         self.bracing_location_layout = copy.deepcopy(bracing.get("layout"))
         self.bracing_3d_settings = copy.deepcopy(bracing.get("analysis_3d"))
         self.bracing_3d_calculation_cache = copy.deepcopy(bracing.get('calculation_3d'))
+        self.bracing_3d_restraint = copy.deepcopy(bracing.get('restraint_3d'))
+        self.bracing_3d_restraint_note = None
         self.longitudinal_bracing_enabled_checkbox.setChecked(bool(bracing.get("enabled", False)))
         self.set_combo_text_if_present(self.longitudinal_wall_sides_combo, bracing.get("wall_sides", "Both sides"))
         try:
@@ -8762,7 +8877,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Analysis failed", result_text or "The model could not be generated.")
 
     def recent_preset_settings(self):
-        return QSettings("Central Steel Build", APP_DISPLAY_NAME)
+        return QSettings("Central Steel Build", APP_SETTINGS_NAME)
 
     def recent_preset_paths(self):
         settings = self.recent_preset_settings()
@@ -10296,7 +10411,27 @@ class MainWindow(QMainWindow):
                     text += " Dimensions changed - review the saved locations."
             except (TypeError, ValueError, OverflowError) as error:
                 text = f"Saved locations need review: {error}"
-        self.bracing_layout_summary_label.setText(text)
+        restraint = self.bracing_3d_restraint_summary()
+        self.bracing_layout_summary_label.setText(text + ("\n" + restraint if restraint else ""))
+
+    def bracing_3d_restraint_summary(self):
+        """One line tracing the 3D frame restraint: adopted, in use, or why not."""
+        note = getattr(self, "bracing_3d_restraint_note", None)
+        record = getattr(self, "bracing_3d_restraint", None)
+        if note:
+            # Informational: the 2D frame is then checked without restraint credit.
+            text = f"No 2D frame restraint credit from this bracing: {note}."
+            if record:
+                return text + f" Earlier adopted restraint kept: {record['stiffness_kn_mm']:.3f} kN/mm."
+            return text + " The 2D frame is checked unrestrained; Optimise frame + bracing compares restraining layouts."
+        if not record:
+            return ""
+        text = f"2D frame restraint adopted from 3D: {record['stiffness_kn_mm']:.3f} kN/mm (frame {record['governing_frame']})."
+        if self.eave_x_restraint_combo.currentText() != BRACING_3D_RESTRAINT_OPTION:
+            return text + f" Not in use: set End-wall portal restraint to {BRACING_3D_RESTRAINT_OPTION}."
+        state = (getattr(self, "bracing_3d_restraint_status", None) or {}).get("state")
+        return text + {"applied": " In use.", "recheck": " In use - RECHECK 3D (sections, loads or wind changed).",
+                       "stale": " STALE - bracing changed; not applied.", None: ""}.get(state, "")
 
     def edit_bracing_locations(self):
         try:
@@ -10345,8 +10480,89 @@ class MainWindow(QMainWindow):
                 if settings.get('adopted_mullion_section'):
                     self.generate_and_solve()
                 self.record_model_snapshot()
+            if dialog.result and not dialog.result.get('sizing_failure'):
+                self.adopt_bracing_3d_restraint(dialog.result)
         if accepted or (dialog.snapshot()==opening_settings and dialog.layout_snapshot()==opening_layout):
             self.bracing_3d_calculation_cache = dialog.calculation_cache()
+
+    def run_combined_sizing(self):
+        """Frontier optimiser for the frame and 3D bracing together (frontier_sizing)."""
+        from bracing_analysis import AnalysisError
+        import combined_sizing
+        import frontier_sizing
+        if self.configurator_review is not None:
+            QMessageBox.information(self, "Optimise frame + bracing", "Configurator Review is read-only.")
+            return
+        answer = QMessageBox.question(
+            self, "Optimise frame + bracing",
+            "Re-size the 2D frame and the 3D bracing together for the lowest total estimated cost?\n\n"
+            "This replaces the current frame sections, bracing layout and bracing sections, and can take a few minutes. "
+            "Cancel restores the current design.")
+        if answer != QMessageBox.Yes:
+            return
+        before = combined_sizing.capture_state(self)
+        progress = QProgressDialog("Preparing...", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Optimise frame + bracing")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        def note(message):
+            progress.setLabelText(message)
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                raise AnalysisError("Optimisation cancelled; the previous design is restored.")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            report = frontier_sizing.optimise(self, progress=note)
+        except (AnalysisError, ValueError, ArithmeticError) as error:
+            combined_sizing.restore_state(self, before)
+            self.update_bracing_layout_summary()
+            QApplication.restoreOverrideCursor()
+            progress.close()
+            QMessageBox.warning(self, "Optimise frame + bracing", str(error))
+            return
+        QApplication.restoreOverrideCursor()
+        progress.close()
+        self.update_bracing_layout_summary()
+        self.record_model_snapshot()
+        best = report['best']
+        text = frontier_sizing.report_text(report)
+        self.combined_sizing_report_text = text
+        check = best.get('workspace_check') or {}
+        if check.get('matches'):
+            review = ("The 3D workspace's Analyse and check gives the same result and it is saved: "
+                      "open the 3D bracing workspace to inspect members.")
+        else:
+            review = (f"The 3D workspace's Analyse and check differs ({'PASS' if check.get('passes') else 'FAIL / UNVERIFIED'}, "
+                      f"bracing ${check.get('estimated_cost') or 0:,.2f}); review it in the 3D bracing workspace.")
+        box = QMessageBox(self)
+        box.setWindowTitle("Optimise frame + bracing")
+        box.setText(f"Adopted: {best['frame']} + {best['bracing']}.\n"
+                    f"Estimated total ${best['total']:,.2f} (frame ${best['frame_cost']:,.2f}, "
+                    f"bracing ${best['bracing_cost']:,.2f}).\n\n"
+                    f"{review} Show Details has the full comparison.")
+        box.setDetailedText(text)
+        box.exec()
+
+    def adopt_bracing_3d_restraint(self, result):
+        """Record the frame restraint from a checked 3D result for the 2D portal.
+
+        Uses the saved bracing layout/settings, so call after they are stored.
+        Returns (record, reason); an unadoptable result leaves any earlier
+        record in place, which its fingerprint will mark stale if it no longer
+        matches the bracing.
+        """
+        record, reason = bracing_restraint_adoption_record(
+            result, self.bracing_location_layout, self.bracing_3d_settings, self.collect_preset_data())
+        self.bracing_3d_restraint_note = reason
+        if record is not None and record != self.bracing_3d_restraint:
+            self.bracing_3d_restraint = record
+            if self.eave_x_restraint_combo.currentText() == BRACING_3D_RESTRAINT_OPTION:
+                self.generate_and_solve()
+            self.record_model_snapshot()
+        self.update_bracing_layout_summary()
+        return record, reason
 
     def calculate_longitudinal_bracing_design(self, wind_inputs, span_mm, eave_height_mm, pitch_deg, roof_shape, bay_size_m):
         if not self.longitudinal_bracing_enabled_checkbox.isChecked():
@@ -11092,6 +11308,7 @@ class MainWindow(QMainWindow):
         for widget in getattr(self, "end_wall_brace_rows", []):
             if widget is not None:
                 widget.setVisible(show_end_brace)
+        self.update_bracing_layout_summary()
 
     def update_base_spring_visibility(self):
         show_spring = (
@@ -11172,7 +11389,11 @@ class MainWindow(QMainWindow):
             app.setStyleSheet("")
             return
         app.setStyleSheet("""
-            QWidget { background: #1f2328; color: #e6edf3; }
+            QWidget { background: #1f2328; color: #e6edf3; selection-background-color: #13377e; selection-color: #ffffff; }
+            QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+                border: 1px solid #00b5af;
+            }
+            QPushButton:default { border: 1px solid #00b5af; }
             QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
                 background: #0d1117; color: #e6edf3; border: 1px solid #48515c; border-radius: 4px; padding: 3px;
             }
@@ -11184,7 +11405,7 @@ class MainWindow(QMainWindow):
             QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }
             QTabWidget::pane { border: 1px solid #48515c; }
             QTabBar::tab { background: #30363d; color: #e6edf3; padding: 6px 10px; border: 1px solid #48515c; }
-            QTabBar::tab:selected { background: #0d1117; }
+            QTabBar::tab:selected { background: #0d1117; border-bottom: 2px solid #00b5af; }
             QScrollArea, QFrame { background: #1f2328; }
             QLabel { background: transparent; }
         """)
@@ -12226,6 +12447,26 @@ class MainWindow(QMainWindow):
                 else "Left eave"
             )
             active_eave_x_spring_kn_mm = eave_bracing_info["effective_spring_kn_mm"]
+        self.bracing_3d_restraint_status = None
+        trial_restraint_kn_mm = getattr(self, "trial_sway_restraint_kn_mm", None)
+        if trial_restraint_kn_mm is not None:
+            # Headless optimisers check frame candidates against a trial
+            # restraint; it is never saved and overrides any adopted record.
+            if trial_restraint_kn_mm > 0.0:
+                structure.add_sway_spring((top_nodes[0].ux, top_nodes[-1].ux), trial_restraint_kn_mm * 1000.0)
+            active_eave_x_spring_kn_mm = trial_restraint_kn_mm
+        elif eave_x_restraint == BRACING_3D_RESTRAINT_OPTION:
+            # One spring on the mean eave movement: the 3D network restrains
+            # frame sway, not eave spread. Stale records give no credit.
+            state, restraint_kn_mm, message = bracing_restraint_status(
+                self.bracing_3d_restraint, self.bracing_location_layout,
+                self.bracing_3d_settings, self.collect_preset_data())
+            self.bracing_3d_restraint_status = {"state": state, "stiffness_kn_mm": restraint_kn_mm, "message": message}
+            if restraint_kn_mm > 0.0:
+                structure.add_sway_spring((top_nodes[0].ux, top_nodes[-1].ux), restraint_kn_mm * 1000.0)
+            active_eave_x_spring_kn_mm = restraint_kn_mm
+        if self.bracing_3d_restraint is not None:
+            self.update_bracing_layout_summary()
         eave_x_spring_n_mm = active_eave_x_spring_kn_mm * 1000.0
         base_moment_spring_nmm_rad = base_moment_spring_knm_rad * 1_000_000.0
         self.apply_base_support(structure, left_base, left_support, base_moment_spring_nmm_rad)
@@ -12515,10 +12756,12 @@ class MainWindow(QMainWindow):
                     )
                     continue
                 total_n = total_kn * 1000.0
-                target_structure.add_load(n1.uy, total_n / 2.0)
-                target_structure.add_load(n2.uy, total_n / 2.0)
+                # Pressure acts normal to the roof panel, including its
+                # horizontal component on pitched roofs.
+                nx, ny = add_roof_panel_pressure(target_structure, n1, n2, total_n)
                 display_n_per_m = (total_kn / panel_len) * 1000.0
-                arrows.append(((n1.x + n2.x) / 2.0, (n1.y + n2.y) / 2.0 + 800.0, 0.0, display_n_per_m))
+                arrows.append(((n1.x + n2.x) / 2.0, (n1.y + n2.y) / 2.0 + 800.0,
+                               display_n_per_m * nx, display_n_per_m * ny))
             return arrows
 
         def canopy_wind_model(side_key):
@@ -14216,7 +14459,7 @@ class MainWindow(QMainWindow):
             for group, items in source.items():
                 group_target = target.setdefault(group, {})
                 for member_id, source_item in items.items():
-                    group_target[member_id] = merge_web_member_demand(group_target.get(member_id), source_item)
+                    group_target[member_id] = merge_web_member_demand(group_target.get(member_id), source_item, owned=True)
 
         def merge_doubled_chord_zones(target, source):
             for zone in source.values():
@@ -14749,7 +14992,7 @@ class MainWindow(QMainWindow):
                                     "length_mm": element.length(),
                             }
                             local_web_member_demands[group_key][element.id] = merge_web_member_demand(
-                                local_web_member_demands[group_key].get(element.id), source_demand)
+                                local_web_member_demands[group_key].get(element.id), source_demand, owned=True)
                     elif group_key in local_chord_envelopes:
                         if is_canopy_chord_end_panel(element, group_key):
                             continue
@@ -14966,6 +15209,7 @@ class MainWindow(QMainWindow):
                     tuple((round(node.x, 6), round(node.y, 6), node.ux, node.uy, node.rz) for node in structure.nodes),
                     tuple((element.start.id, element.end.id, element.group) for element in structure.elements),
                     tuple(sorted(structure.springs.items())),
+                    tuple(getattr(structure, "sway_springs", ())),
                     tuple(sorted(structure.restrained_dofs)),
                 )
                 case_signature = tuple(
@@ -15031,7 +15275,11 @@ class MainWindow(QMainWindow):
                 )
                 for index, evaluation_case in enumerate(evaluation_cases)
             ]
-        max_workers = parallel_worker_count(len(evaluation_cases))
+        # First-order cases are already solved together above; what remains per
+        # combination is pure-Python post-processing, which threads cannot run
+        # in parallel (the GIL), so pool overhead only slows it (measured
+        # 1.08 s threaded v 0.96 s serial per factory-default solve).
+        max_workers = parallel_worker_count(len(evaluation_cases)) if use_second_order else 1
         if max_workers > 1:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 for result in executor.map(evaluate_combination, evaluation_items):
@@ -16009,7 +16257,7 @@ class MainWindow(QMainWindow):
         demands = ((self.design_envelope_actions or {}).get("web_member_demands", {}).get(web_group) or {}).values()
         for demand in demands:
             envelope = self.web_design_envelope(demand, assignments=single_assignments)
-            envelope["connection"] = copy.deepcopy(envelope.get("connection", {}))
+            envelope["connection"] = plain_copy(envelope.get("connection", {}))
             connection_contexts = envelope["connection"] if isinstance(envelope["connection"], dict) else {}
             for context in connection_contexts.values():
                 if isinstance(context, dict):
@@ -17723,7 +17971,7 @@ class MainWindow(QMainWindow):
         analysis members or the force envelope.
         """
         envelope = self.web_member_demand_envelope(demand)
-        envelope["connection"] = copy.deepcopy(envelope.get("connection", {}))
+        envelope["connection"] = plain_copy(envelope.get("connection", {}))
         contexts = envelope["connection"] if isinstance(envelope["connection"], dict) else {}
         assignments = assignments or {}
         joint_doubler_sides = joint_doubler_sides or set()
@@ -21370,11 +21618,18 @@ class MainWindow(QMainWindow):
         if eave_x_restraint in {"One end", "Both ends"}:
             sides_braced = self.end_wall_braced_sides_combo.currentText().lower()
             eave_restraint_text = f"End wall bracing - {eave_x_restraint.lower()}, {sides_braced}"
-        if eave_x_restraint != "None" and eave_x_spring_kn_mm > 0.0:
+        restraint_status = self.bracing_3d_restraint_status if eave_x_restraint == BRACING_3D_RESTRAINT_OPTION else None
+        if restraint_status is not None:
+            eave_restraint_text += (f" sway spring {eave_x_spring_kn_mm:.3f} kN/mm on mean eave movement"
+                                    if eave_x_spring_kn_mm > 0.0 else " - no restraint applied")
+        elif eave_x_restraint != "None" and eave_x_spring_kn_mm > 0.0:
             eave_restraint_text += f" spring {eave_x_spring_kn_mm:.3f} kN/mm"
         elif eave_x_restraint != "None":
             eave_restraint_text += " rigid"
         results.append(f"Eave X restraint: {eave_restraint_text}\n")
+        if restraint_status is not None:
+            label = {"applied": "", "recheck": "RECHECK 3D: ", "stale": "STALE: ", "missing": "NOT ADOPTED: "}[restraint_status["state"]]
+            results.append(f"3D bracing restraint: {label}{restraint_status['message']}\n")
         if eave_bracing_info is not None:
             results.append(
                 "End-wall portal restraint model: "
@@ -21509,8 +21764,28 @@ class MainWindow(QMainWindow):
         """Backward-compatible resolver for the original column hover overlay."""
         return self.resolved_deflection_hover_overlay()
 
+    def suspended_plotting(self):
+        """Context manager: skip frame redraws (e.g. during a batch optimiser)
+        and redraw once at the end. Plotting only reads the solved state."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def suspended():
+            self._plot_suspended = getattr(self, "_plot_suspended", 0) + 1
+            try:
+                yield
+            finally:
+                self._plot_suspended -= 1
+                if not self._plot_suspended and getattr(self, "_plot_stale", False):
+                    self._plot_stale = False
+                    self.refresh_plot()
+        return suspended()
+
     def refresh_plot(self):
         if self.structure is None:
+            return
+        if getattr(self, "_plot_suspended", 0):
+            self._plot_stale = True
             return
         try:
             deflection_scale = float(self.deflection_scale_input.text())
@@ -21565,6 +21840,11 @@ class MainWindow(QMainWindow):
 # ==========================================================
 
 if __name__ == "__main__":
+    # The frame + bracing optimiser runs 3D checks in worker processes
+    # (bracing_parallel). In the frozen app a worker re-launches this EXE;
+    # freeze_support() makes it run the worker instead of the application.
+    import multiprocessing
+    multiprocessing.freeze_support()
     if "--packaged-computation-smoke-test" in sys.argv[1:]:
         # Exercise the bundled PDF library/fonts and a real report export.
         import tempfile
@@ -21602,6 +21882,7 @@ if __name__ == "__main__":
         raise SystemExit(2) from exc
     app = QApplication([sys.argv[0], *qt_arguments])
     app.setWindowIcon(app_icon())
+    apply_brand_palette(app)
     splash = create_startup_splash()
     splash.show()
     splash_started_at = time.perf_counter()
@@ -21610,7 +21891,7 @@ if __name__ == "__main__":
         splash.showMessage(
             "Loading sections, presets and design data...",
             Qt.AlignBottom | Qt.AlignHCenter,
-            QColor("#1d2733"),
+            QColor(BRAND_NAVY),
         )
         app.processEvents()
         window = MainWindow()
@@ -21619,7 +21900,7 @@ if __name__ == "__main__":
         splash.showMessage(
             "Preparing workspace...",
             Qt.AlignBottom | Qt.AlignHCenter,
-            QColor("#1d2733"),
+            QColor(BRAND_NAVY),
         )
         window.show()
 

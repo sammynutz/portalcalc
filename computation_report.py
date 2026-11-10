@@ -4,6 +4,7 @@ from html import escape
 import math
 import os
 from pathlib import Path
+import sys
 import tempfile
 
 from loads import GRAVITY_M_S2, STEEL_DENSITY_KG_M3
@@ -16,16 +17,19 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import (BaseDocTemplate, Flowable, Frame, LongTable,
+from reportlab.lib.utils import ImageReader
+from reportlab.platypus import (BaseDocTemplate, Flowable, Frame, Image, LongTable,
                                PageBreak, PageTemplate, Paragraph, Spacer, TableStyle)
 from reportlab.platypus.tableofcontents import TableOfContents
 
 
-INK = colors.HexColor("#182d3b")
-BLUE = colors.HexColor("#175d78")
-PALE = colors.HexColor("#eef4f7")
-GREY = colors.HexColor("#576b78")
-RULE = colors.HexColor("#d7e2e8")
+# BOLT brand: navy #13377E primary, teal #00B5AF accent.
+INK = colors.HexColor("#17213a")
+BLUE = colors.HexColor("#13377e")
+TEAL = colors.HexColor("#00b5af")
+PALE = colors.HexColor("#eef2f9")
+GREY = colors.HexColor("#4d5b78")
+RULE = colors.HexColor("#d5dcea")
 RED = colors.HexColor("#ac3030")
 GREEN = colors.HexColor("#226a51")
 PAGE_W, PAGE_H = A4
@@ -43,6 +47,21 @@ def fonts():
     pdfmetrics.registerFont(TTFont("Calc", str(regular)))
     pdfmetrics.registerFont(TTFont("Calc-Bold", str(bold)))
     pdfmetrics.registerFontFamily("Calc", normal="Calc", bold="Calc-Bold", italic="Calc", boldItalic="Calc-Bold")
+
+
+def brand_logo(width):
+    """PortalCalc logo flowable for the cover, or None if the asset is unavailable."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    path = base / "assets" / "portalcalc_logo.png"
+    if not path.exists():
+        return None
+    try:
+        image_w, image_h = ImageReader(str(path)).getSize()
+    except Exception:
+        return None
+    logo = Image(str(path), width=width, height=width * image_h / image_w)
+    logo.hAlign = "LEFT"
+    return logo
 
 
 def clean(value):
@@ -200,7 +219,9 @@ class ComputationDoc(BaseDocTemplate):
         c.setStrokeColor(RULE)
         c.setLineWidth(0.6)
         if doc.page > 1:
+            c.setStrokeColor(TEAL)
             c.line(18 * mm, PAGE_H - 14 * mm, PAGE_W - 18 * mm, PAGE_H - 14 * mm)
+            c.setStrokeColor(RULE)
             c.setFillColor(BLUE)
             c.setFont("Calc-Bold", 8)
             c.drawString(18 * mm, PAGE_H - 11 * mm, "PORTALCALC / STRUCTURAL COMPUTATIONS")
@@ -308,7 +329,11 @@ class Report:
 
     def make(self):
         d, meta = self.data, self.data["metadata"]
-        self.items.append(Spacer(1, 18))
+        logo = brand_logo(70 * mm)
+        if logo is not None:
+            self.items.extend([logo, Spacer(1, 14)])
+        else:
+            self.items.append(Spacer(1, 18))
         self.p("PORTALCALC  /  CALCULATION RECORD", "h2")
         self.p("Structural<br/>computations", "h1", markup=True)
         self.p(meta.get("project") or "Portal frame", "h2")

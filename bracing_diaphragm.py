@@ -298,5 +298,6 @@ def recover_diaphragm(result, panels, conventional_count, bare_result):
     result['diaphragm_members'] = diagonals
     result['diaphragm_panels'] = list(recovered.values())
     result['bare_sls'] = {'displacements_mm': bare_result['displacements_mm'],
-                          'tangent_status': bare_result['tangent_status']}
+                          'tangent_status': bare_result['tangent_status'],
+                          **({'slack_play': bare_result['slack_play']} if 'slack_play' in bare_result else {})}
     return result

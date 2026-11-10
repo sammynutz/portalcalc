@@ -4,6 +4,7 @@ Units: N, mm, MPa. Rods use a unilateral elastic law, N = EA/L max(extension, 0)
 No penalty supports, compression stiffness in slack rods, sizing or code checks.
 """
 from dataclasses import dataclass, replace
+import copy
 import math
 
 import numpy as np
@@ -25,6 +26,10 @@ def positive(value, name):
 
 def elastic_solve(matrix, force):
     """Equilibrated positive-definite solve; reject mechanisms, never pin them."""
+    return _solve_factor(_elastic_factor(matrix), force)
+
+
+def _elastic_factor(matrix):
     diagonal = np.diag(matrix)
     if not len(diagonal) or np.any(diagonal <= 0) or not np.all(np.isfinite(matrix)):
         raise AnalysisError("Unstable model: a free movement has no stiffness")
@@ -34,10 +39,15 @@ def elastic_solve(matrix, force):
         factor = np.linalg.cholesky((scaled + scaled.T) * .5)
         if np.min(np.diag(factor)) < 1e-6:
             raise np.linalg.LinAlgError("near mechanism")
-        rhs = np.asarray(force) / (scale if np.ndim(force) == 1 else scale[:, None])
-        answer = np.linalg.solve(factor.T, np.linalg.solve(factor, rhs))
     except np.linalg.LinAlgError:
         raise AnalysisError("Unstable or ill-conditioned model: check brace continuity and supports") from None
+    return scale, factor
+
+
+def _solve_factor(factored, force):
+    scale, factor = factored
+    rhs = np.asarray(force) / (scale if np.ndim(force) == 1 else scale[:, None])
+    answer = np.linalg.solve(factor.T, np.linalg.solve(factor, rhs))
     return answer / (scale if answer.ndim == 1 else scale[:, None])
 
 
@@ -93,11 +103,15 @@ class AxialModel3D:
             raise AnalysisError("Invalid portal interface stiffness block")
         self.blocks.append((indices, (k + k.T) * .5))
 
-    def solve(self, loads, max_iterations=160):
+    def _prepare(self):
         size = 3 * len(self.nodes)
-        force = np.asarray(loads, dtype=float)
-        if force.shape != (size,) or not np.all(np.isfinite(force)):
-            raise AnalysisError("A load case needs one finite load per translational DOF")
+        # Load-independent geometry/assembly and active-set factors are shared
+        # by the simultaneous cases of one selected arrangement. Include fixed
+        # DOFs because diaphragm alignment also changes them directly.
+        key = (tuple(self.nodes),tuple(self.members),tuple(sorted(self.fixed)),
+               tuple((tuple(dofs),k.tobytes()) for dofs,k in self.blocks))
+        if getattr(self,'_prepared_key',None)==key:
+            return self._prepared
         free = np.array([i for i in range(size) if i not in self.fixed], dtype=int)
         if len(free) > 600:
             raise AnalysisError("This reduced solver supports up to 600 free DOFs; use fewer bays/panels")
@@ -126,10 +140,38 @@ class AxialModel3D:
         rod_ks = ks[rods]
         base = linear[np.ix_(free, free)]
         full = base + rod_rows.T @ (rod_ks[:, None] * rod_rows)
+        prepared = (free,linear,rows,ks,rods,lengths,rod_rows,rod_ks,base,full,
+                    {None:_elastic_factor(full)})
+        self._prepared_key,self._prepared=key,prepared
+        return prepared
+
+    def solve(self, loads, max_iterations=160, allow_neutral_equilibrium=False):
+        size = 3 * len(self.nodes)
+        force = np.asarray(loads, dtype=float)
+        if force.shape != (size,) or not np.all(np.isfinite(force)):
+            raise AnalysisError("A load case needs one finite load per translational DOF")
+        free,linear,rows,ks,rods,lengths,rod_rows,rod_ks,base,full,factors=self._prepare()
+
+        def active_solve(active, rhs):
+            key = None if active is None else active.tobytes()
+            if key not in factors:
+                matrix=base+rod_rows[active].T@(rod_ks[active,None]*rod_rows[active])
+                # Bound memory for large layouts with many different rod
+                # active sets; retain the all-rods factor used by line search.
+                if len(factors)>=32:
+                    del factors[next(k for k in factors if k is not None)]
+                try:
+                    factors[key]=_elastic_factor(matrix)
+                except AnalysisError:
+                    factors[key]=None
+            if factors[key] is None:
+                raise AnalysisError('Unstable or ill-conditioned model: check brace continuity and supports')
+            return _solve_factor(factors[key],rhs)
+
         f = force[free]
         # The all-rods system is an upper stiffness bound. If it is unstable,
         # removing compressive rods cannot produce a stable network.
-        initial = elastic_solve(full, f)
+        initial = active_solve(None, f)
         u = np.zeros(len(free))
         force_tolerance = max(1e-6, np.max(np.abs(f), initial=0) * 1e-8)
 
@@ -147,39 +189,64 @@ class AxialModel3D:
                 converged = True
                 break
             active = extension >= -1e-10
-            tangent = base + rod_rows[active].T @ (rod_ks[active, None] * rod_rows[active])
             try:
-                direction = initial if iteration == 1 else elastic_solve(tangent, -gradient)
+                direction = initial if iteration == 1 else active_solve(active, -gradient)
             except AnalysisError:
                 # A search direction only: the physical force law and final
                 # equilibrium always use zero compression force in slack rods.
-                direction = elastic_solve(full, -gradient)
+                if allow_neutral_equilibrium:
+                    # Find a gravity equilibrium step in the supported
+                    # subspace without adding stiffness. Neutral cases retain
+                    # an unverified tangent and cannot pass design checks.
+                    tangent = base + rod_rows[active].T @ (rod_ks[active, None] * rod_rows[active])
+                    diagonal=np.sqrt(np.maximum(np.diag(tangent),1e-30))
+                    direction=np.linalg.lstsq(tangent/diagonal[:,None]/diagonal[None,:],
+                                               -gradient/diagonal,rcond=1e-12)[0]/diagonal
+                    if np.max(np.abs(tangent@direction+gradient),initial=0)>force_tolerance:
+                        direction=active_solve(None,-gradient)
+                else:
+                    direction = active_solve(None, -gradient)
             slope = float(gradient @ direction)
             if not math.isfinite(slope) or slope >= 0:
                 raise AnalysisError("Tension-only analysis could not find an equilibrium direction")
             step = 1.
+            energy_roundoff = 32*np.finfo(float).eps*(abs(energy)+abs(f @ u)+1.)
             for _ in range(45):
                 candidate = u + step * direction
-                if state(candidate)[3] <= energy + 1e-4 * step * slope + 1e-12:
+                if state(candidate)[3] <= energy + 1e-4 * step * slope + energy_roundoff:
                     break
                 step *= .5
             else:
                 raise AnalysisError("Tension-only analysis did not converge")
             u = candidate
         if not converged:
-            raise AnalysisError("Tension-only analysis did not converge; layout may have a mechanism")
+            raise AnalysisError(f"Tension-only analysis did not converge; residual {np.max(np.abs(state(u)[2]),initial=0):.6g} N, tolerance {force_tolerance:.6g} N; layout may have a mechanism")
         extension, tension, gradient, _ = state(u)
         active = extension >= -1e-10
-        tangent = base + rod_rows[active].T @ (rod_ks[active, None] * rod_rows[active])
-        elastic_solve(tangent, np.zeros(len(free)))
-        # A zero-force rod has only one-sided tangent stiffness. Do not present
-        # equilibrium of a neutrally loaded direction as verified stability.
+        # Zero-force and slack rods have only one-sided stiffness, so stability
+        # is judged on the taut rods. A zero-stiffness mode left by them is not
+        # a mechanism if every movement along it extends some other rod (at
+        # once for zero-force rods, after the gap for slack ones); report the
+        # play instead. Acceptance is decided in the design checks.
         taut = extension > 1e-10
+        slack_play = None
         try:
-            elastic_solve(base + rod_rows[taut].T @ (rod_ks[taut, None] * rod_rows[taut]), np.zeros(len(free)))
+            active_solve(taut, np.zeros(len(free)))
             tangent_status = "positive_with_taut_rods"
         except AnalysisError:
-            tangent_status = "neutral_rods_required_stability_unverified"
+            taut_tangent = base + rod_rows[taut].T @ (rod_ks[taut, None] * rod_rows[taut])
+            slack_play = bounded_slack_play(taut_tangent, rod_rows, extension, taut)
+            try:
+                active_solve(active, np.zeros(len(free)))
+                slack_rods_only = False
+            except AnalysisError:
+                # Even the zero-force rods do not stiffen it: rods are slack.
+                slack_rods_only = True
+                if slack_play is None and not allow_neutral_equilibrium:
+                    raise AnalysisError("Unstable model: a mechanism remains with every slack rod considered; "
+                                        "check brace continuity and supports") from None
+            tangent_status = ("slack_play_stability_unverified" if slack_rods_only and not allow_neutral_equilibrium
+                              else "neutral_rods_required_stability_unverified")
         displacement = np.zeros(size)
         displacement[free] = u
         extensions = rows @ displacement
@@ -206,7 +273,90 @@ class AxialModel3D:
                         for i, m in enumerate(self.members)],
             "iterations": iteration, "free_dofs": len(free), "residual_n": residual,
             "tangent_status": tangent_status,
+            **({"slack_play": {**slack_play, "rods": [self.members[rods[i]].id for i in slack_play["rods"]]}}
+               if slack_play is not None else {}),
         }
+
+
+def bounded_slack_play(tangent, rod_rows, extension, taut, tolerance=1e-8):
+    """Play before zero-force or slack rods engage along zero-stiffness modes, or None.
+
+    The modes are the null space of ``tangent`` (the taut rods). The other
+    rods can take up a movement that extends them: zero-force rods at once,
+    slack rods after their gap. Each mode is checked both ways; a direction
+    that extends no rod is a mechanism (None). With several modes, a
+    combination could still escape every rod, so ``directions_verified``
+    records an exact test of all combinations (Stiemke's lemma). The play is
+    the movement before the first rod engages, with each mode scaled to 1 mm
+    largest component; with several modes it is taken along the modes.
+    """
+    scale = np.sqrt(np.maximum(np.diag(tangent), 1e-30))
+    values, vectors = np.linalg.eigh(tangent / scale[:, None] / scale[None, :])
+    modes = vectors[:, values < tolerance] / scale[:, None]
+    modes = modes / np.max(np.abs(modes), axis=0, initial=1e-30)
+    others = np.where(~taut)[0]
+    gaps_all = np.maximum(-extension[others], 0.)
+    rates = rod_rows[others] @ modes
+    plays, engaged = [], set()
+    for j in range(modes.shape[1]):
+        for sign in (1., -1.):
+            rate = sign * rates[:, j]
+            engaging = rate > 1e-9
+            if not engaging.any():
+                return None
+            gaps = gaps_all[engaging] / rate[engaging]
+            plays.append(float(np.min(gaps)))
+            engaged.update(int(i) for i in others[engaging][gaps <= np.min(gaps)*(1+1e-6)+1e-12])
+    verified = modes.shape[1] <= 1 or no_escaping_direction(rates)
+    neutral = int(np.sum(np.abs(extension[others]) <= 1e-10))
+    return {"modes": int(modes.shape[1]), "play_mm": max(plays, default=0.), "rods": sorted(engaged),
+            "directions_verified": bool(verified), "zero_force_rods": neutral,
+            "basis": "Zero-stiffness modes of the taut rods; every movement along them extends a zero-force or slack rod "
+                     "after the stated play (mode scaled to 1 mm largest movement)"
+                     + ("" if verified else "; a combination of modes may escape every rod") + ". Stability unverified."}
+
+
+def no_escaping_direction(rates, tolerance=1e-9):
+    """True if every non-zero combination ``a`` of modes extends some rod.
+
+    ``rates`` holds each rod's extension rate per unit mode (rods x modes). By
+    Stiemke's lemma no ``a`` has ``rates @ a <= 0`` (other than zero) exactly
+    when the rates have full column rank and a strictly positive weighting of
+    the rods balances them, ``rates.T @ y = 0`` with ``y > 0``. That is found as
+    ``y = 1 + z``, ``z >= 0``, by non-negative least squares.
+    """
+    rows = rates[np.any(np.abs(rates) > 1e-12, axis=1)]
+    if not len(rows) or np.linalg.matrix_rank(rows, tol=1e-9*np.abs(rows).max()) < rates.shape[1]:
+        return False
+    unit = rows / np.linalg.norm(rows, axis=1)[:, None]
+    ones = np.ones(len(unit))
+    z = _nnls(unit.T, -unit.T @ ones)
+    return float(np.linalg.norm(unit.T @ (ones + z))) <= tolerance * np.sqrt(len(unit))
+
+
+def _nnls(a, b, max_iterations=None):
+    """Lawson-Hanson non-negative least squares: min ||a x - b||, x >= 0."""
+    n = a.shape[1]
+    x = np.zeros(n)
+    passive = np.zeros(n, dtype=bool)
+    small = 10 * np.finfo(float).eps * max(a.shape) * max(np.abs(a).sum(axis=0).max(initial=0.), 1.)
+    for _ in range(max_iterations or 3*n+10):
+        gradient = a.T @ (b - a @ x)
+        if passive.all() or np.max(np.where(passive, -np.inf, gradient)) <= small:
+            break
+        passive[np.argmax(np.where(passive, -np.inf, gradient))] = True
+        for _ in range(n+1):
+            trial = np.zeros(n)
+            trial[passive] = np.linalg.lstsq(a[:, passive], b, rcond=None)[0]
+            if np.all(trial[passive] > small):
+                break
+            blocking = passive & (trial <= small)
+            step = np.min(x[blocking] / np.maximum(x[blocking] - trial[blocking], 1e-300))
+            x = x + step * (trial - x)
+            passive &= x > small
+            x[~passive] = 0.
+        x = trial
+    return x
 
 
 class PortalReduction:
@@ -270,21 +420,37 @@ class PortalReduction:
         internal = coordinate_scale[:, None] * q[:, count:]
         kii = internal.T @ kff @ internal
         kiu = internal.T @ kff @ prescribed
-        fi = internal.T @ self.loads[self.free]
         if internal.shape[1]:
-            solved = elastic_solve(kii, np.column_stack((kiu, fi)))
-            self.recovery = prescribed - internal @ solved[:, :-1]
-            self.particular = internal @ solved[:, -1]
-            self.stiffness = prescribed.T @ kff @ prescribed - kiu.T @ solved[:, :-1]
-            self.equivalent_load = prescribed.T @ self.loads[self.free] - kiu.T @ solved[:, -1]
+            # Retain the load response as well as the stiffness reduction. A
+            # loaded portal must recover its internal deformation, not merely
+            # receive an approximate force at the roof attachment points.
+            solved = elastic_solve(kii, np.column_stack((kiu, internal.T)))
+            self.recovery = prescribed - internal @ solved[:, :count]
+            self.load_flexibility = internal @ solved[:, count:]
+            self.stiffness = prescribed.T @ kff @ prescribed - kiu.T @ solved[:, :count]
         else:
             self.recovery = prescribed
-            self.particular = np.zeros(len(self.free))
+            self.load_flexibility = np.zeros((len(self.free), len(self.free)))
             self.stiffness = prescribed.T @ kff @ prescribed
-            self.equivalent_load = prescribed.T @ self.loads[self.free]
+        self.particular = self.load_flexibility @ self.loads[self.free]
+        self.equivalent_load = self.recovery.T @ self.loads[self.free]
+        self.member_equivalent_loads = {}
         self.stiffness = (self.stiffness + self.stiffness.T) * .5
 
-    def recover(self, translations):
+    def with_loads(self, loads, member_equivalent_loads=None):
+        """Reuse one stiffness reduction for a case-specific full portal load."""
+        loaded = copy.copy(self)
+        loaded.loads = np.asarray(loads, dtype=float)
+        if loaded.loads.shape != self.loads.shape or not np.all(np.isfinite(loaded.loads)):
+            raise AnalysisError("Invalid portal load vector")
+        loaded.particular = self.load_flexibility @ loaded.loads[self.free]
+        loaded.equivalent_load = self.recovery.T @ loaded.loads[self.free]
+        loaded.member_equivalent_loads = member_equivalent_loads or {}
+        return loaded
+
+    def recover(self, translations, member_forces=True):
+        """Recovered portal state. ``member_forces=False`` omits the per-member
+        end-force evidence (report/export only) for search checks."""
         movement = np.asarray(translations, dtype=float)
         interface_force = self.stiffness @ movement - self.equivalent_load
         d = np.zeros(len(self.k))
@@ -320,15 +486,22 @@ class PortalReduction:
             if max(abs(x) for x in values) > 1e-7:
                 supports.append({"node": node.id, "x_mm": node.x, "z_mm": node.y,
                                  "fx_n": values[0], "fz_n": values[1], "m_xz_nmm": values[2]})
-        return {
+        recovered = {
             "interface_forces_n": interface_force.reshape((-1, 2)).tolist(),
             "interior_attachment_point_loads": point_loads,
             "support_reactions": supports,
             "node_displacements": [{"node": n.id, "x_mm": n.x, "z_mm": n.y,
                                     "ux_mm": float(d[n.ux]), "uz_mm": float(d[n.uy]),
                                     "rotation_xz_rad": float(d[n.rz])} for n in self.structure.nodes],
+        }
+        if not member_forces:
+            return recovered
+        return {
+            **recovered,
             "member_end_forces": [{"element": e.id, "group": e.group, "section": e.profile.name,
-                                   "local_n_n_nmm": (e.local_end_forces(d)-member_point_loads.get(e.id, np.zeros(6))).tolist()}
+                                   "local_n_n_nmm": (e.local_end_forces(d)
+                                       -member_point_loads.get(e.id, np.zeros(6))
+                                       -np.asarray(self.member_equivalent_loads.get(str(e.id), self.member_equivalent_loads.get(e.id, np.zeros(6))))).tolist()}
                                   for e in self.structure.elements],
         }
 
@@ -395,7 +568,7 @@ def build_braced_building(layout, portal, strut_area_mm2, roof_brace_area_mm2,
     return model, roof_grid, portal_dofs, point_nodes
 
 
-def end_wall_load_vector(model, layout, point_nodes, front_kpa, back_kpa):
+def end_wall_load_vector(model, layout, point_nodes, front_kpa, back_kpa, pressure_segments=None):
     """Signed +Y net pressures. Integrate vertical-strip roof/base reactions.
 
     Half the strip resultant goes to its roof and half to ground. Two-point
@@ -410,10 +583,18 @@ def end_wall_load_vector(model, layout, point_nodes, front_kpa, back_kpa):
             raise AnalysisError("End-wall pressure must be finite")
         roof_total = 0.
         ground_total = 0.
-        for a, b in zip(g.roof_stations, g.roof_stations[1:]):
+        segments = (pressure_segments or {}).get(face,[(0.,g.span_mm,pressure)])
+        if (not segments or abs(segments[0][0])>1e-6 or abs(segments[-1][1]-g.span_mm)>1e-6
+                or any(len(s)!=3 or not all(math.isfinite(v) for v in s) or s[1]<=s[0] for s in segments)
+                or any(abs(a[1]-b[0])>1e-6 for a,b in zip(segments,segments[1:]))):
+            raise AnalysisError('End-wall pressure segments must cover the span continuously')
+        boundaries=sorted(set(g.roof_stations)|{x for a,b,p in segments for x in (a,b)})
+        for lo, hi in zip(boundaries,boundaries[1:]):
+            a,b=next((a,b) for a,b in zip(g.roof_stations,g.roof_stations[1:]) if a<=lo+1e-6 and b>=hi-1e-6)
+            local_pressure=next(p for start,end,p in segments if start <= (lo+hi)/2 <= end)
             for gauss in (-1/math.sqrt(3), 1/math.sqrt(3)):
-                x = (a+b)/2 + gauss*(b-a)/2
-                amount = float(pressure) / 1000. * g.roof_z(x) * .5 * (b-a)/2
+                x = (lo+hi)/2 + gauss*(hi-lo)/2
+                amount = float(local_pressure) / 1000. * g.roof_z(x) * .5 * (hi-lo)/2
                 ratio = (x-a)/(b-a)
                 for station, weight in ((a, 1-ratio), (b, ratio)):
                     index = point_nodes[tuple(round(v, 6) for v in (station, y, g.roof_z(station)))]
@@ -428,7 +609,8 @@ def end_wall_load_vector(model, layout, point_nodes, front_kpa, back_kpa):
                             ground_total += amount * weight
                         break
         workings.append({"face": face, "signed_y_pressure_kpa": pressure,
-                         "roof_resultant_n": roof_total, "direct_ground_resultant_n": ground_total})
+                         "roof_resultant_n": roof_total, "direct_ground_resultant_n": ground_total,
+                         **({'pressure_segments_mm_kpa':[list(s) for s in segments]} if pressure_segments else {})})
     return vector, workings
 
 
@@ -501,43 +683,86 @@ def load_path_evidence(nodes, result, workings):
             'roof_to_member_base_y_residual_n':float(roof_y+member_y),
             'peak_brace_tension_n':peaks,
             **({'diaphragm_base_reactions_n':{face:v.tolist() for face,v in diaphragm_ground.items()}} if diaphragm_ground else {}),
-            'basis':'End-wall pressure and any external roof friction act along Y. Roof/struts transfer the roof-applied forces to side-wall bracing and any enabled SLS side-wall diaphragms. Front/back end-wall braces/diaphragms lie in X/Z and have zero direct Y resistance. Transverse-wind cases are not included in this analysis.'}
+            'basis':'End-wall normal pressure acts along Y, including the varying front/back suction under transverse wind. Roof/struts transfer roof-applied Y forces to side-wall bracing and any enabled SLS side-wall diaphragms. Normal roof/side-wall pressures also act through the portals, producing transverse X/Z reactions and coupled tie/brace forces. Front/back end-wall braces lie in X/Z: they can resist transverse roof/portal actions but have zero direct Y resistance. ULS transverse cases use conventional bracing only.'}
 
 
-def solve_building_case(model, layout, portal, portal_dofs, point_nodes, case):
-    loads, workings = end_wall_load_vector(model, layout, point_nodes, case["front_kpa"], case["back_kpa"])
+def solve_building_case(model, layout, portal, portal_dofs, point_nodes, case, member_forces=True):
+    loads, workings = end_wall_load_vector(model, layout, point_nodes, case["front_kpa"], case["back_kpa"],case.get('end_wall_pressure_segments'))
     drag_loads,drag_workings=roof_drag_load_vector(model,layout,point_nodes,case.get('roof_drag'))
     loads+=drag_loads
     workings+=drag_workings
-    result = model.solve(loads)
+    network_loads = loads.copy()
+    portal_states = case.get('portal_loads')
+    if portal_states is not None and len(portal_states) != len(portal_dofs):
+        raise AnalysisError('Each frame line needs its own portal load vector')
+    loaded_portals = []
+    for index, dofs in enumerate(portal_dofs):
+        state = portal_states[index] if portal_states is not None else None
+        loaded = portal.with_loads(state['loads_n'], state.get('member_equivalent_loads')) if state else portal
+        loaded_portals.append(loaded)
+        loads[dofs] += loaded.equivalent_load
+    result = model.solve(loads, allow_neutral_equilibrium=case.get('gravity_only',False))
     displacements = np.asarray(result["displacements_mm"]).reshape(-1)
     portals = []
-    reactions = np.zeros(3)
-    moments = np.zeros(3)
-    for item in result["support_reactions_n"]:
-        value = np.asarray(item["force_n"])
-        reactions += value
-        moments += np.cross(item["point_mm"], value)
+    support_forces = np.array([item["force_n"] for item in result["support_reactions_n"]], dtype=float).reshape((-1, 3))
+    support_points = np.array([item["point_mm"] for item in result["support_reactions_n"]], dtype=float).reshape((-1, 3))
+    reactions = support_forces.sum(axis=0)
+    moments = np.cross(support_points, support_forces).sum(axis=0)
+    # Portal native coordinates may have an X origin offset. Transform every
+    # reaction and load into the same building coordinate system. In-plane
+    # (x, z) forces at (x, y, z): moment = (y*fz, z*fx - x*fz, -y*fx) plus
+    # the in-plane moment about -y.
+    x0 = portal.points[0][0]
     for index, dofs in enumerate(portal_dofs):
-        recovered = portal.recover(displacements[dofs])
+        loaded = loaded_portals[index]
+        recovered = loaded.recover(displacements[dofs], member_forces=member_forces)
         y = layout.geometry.bay_stations_mm[index]
-        for item in recovered["support_reactions"]:
-            value = np.array([item["fx_n"], 0., item["fz_n"]])
-            reactions += value
-            # Portal native coordinates may have an X origin offset. Transform
-            # every reaction into the same building coordinate system.
-            point = (item["x_mm"]-portal.points[0][0], y, item["z_mm"])
-            moments += np.cross(point, value) + np.array([0., -item["m_xz_nmm"], 0.])
+        supports = recovered["support_reactions"]
+        if supports:
+            fx = np.array([item["fx_n"] for item in supports])
+            fz = np.array([item["fz_n"] for item in supports])
+            x = np.array([item["x_mm"] for item in supports]) - x0
+            z = np.array([item["z_mm"] for item in supports])
+            reactions += (fx.sum(), 0., fz.sum())
+            moments += (y*fz.sum(), np.dot(z, fx)-np.dot(x, fz)-sum(item["m_xz_nmm"] for item in supports), -y*fx.sum())
         portals.append({"index": index, "y_mm": y, **recovered})
-    external = loads.reshape((-1, 3))
+    # Condensed portal loads are equivalent work at the interfaces, not the
+    # physical applied loads. Use original portal nodal forces/moments for
+    # global balance, including loads applied directly at native supports.
+    external = network_loads.reshape((-1, 3))
     external_moment = np.sum(np.cross(np.asarray(model.nodes), external), axis=0)
-    force_error = reactions + external.sum(axis=0)
+    applied_force = external.sum(axis=0)
+    full_load_scale = 0.
+    portal_workings = []
+    nodes = portal.structure.nodes
+    native_ux = np.array([n.native_ux for n in nodes], dtype=int)
+    native_uy = np.array([n.native_uy for n in nodes], dtype=int)
+    native_rz = np.array([n.native_rz for n in nodes], dtype=int)
+    node_x = np.array([n.x for n in nodes], dtype=float) - x0
+    node_z = np.array([n.y for n in nodes], dtype=float)
+    for index, loaded in enumerate(loaded_portals):
+        if loaded.structure is not portal.structure:
+            raise AnalysisError('Each loaded portal must share the building portal structure')
+        vector = loaded.loads
+        y = layout.geometry.bay_stations_mm[index]
+        fx, fz = vector[native_ux], vector[native_uy]
+        force = np.array([fx.sum(), 0., fz.sum()])
+        moment = np.array([y*fz.sum(), np.dot(node_z, fx)-np.dot(node_x, fz)-vector[native_rz].sum(), -y*fx.sum()])
+        full_load_scale += float(np.hypot(fx, fz).sum())
+        applied_force += force
+        external_moment += moment
+        if portal_states is not None:
+            portal_workings.append({'index': index, 'y_mm': layout.geometry.bay_stations_mm[index],
+                'applied_force_n': force.tolist(), 'applied_moment_nmm': moment.tolist()})
+    force_error = reactions + applied_force
     moment_error = moments + external_moment
-    force_scale = max(1., float(np.sum(np.linalg.norm(external, axis=1))))
+    force_scale = max(1., float(np.sum(np.linalg.norm(external, axis=1)))+full_load_scale)
     length_scale = max(layout.geometry.span_mm, layout.geometry.length_mm, layout.geometry.eave_mm)
     if np.max(np.abs(force_error)) > force_scale*1e-6 or np.max(np.abs(moment_error)) > force_scale*length_scale*1e-6:
         raise AnalysisError("Recovered support reactions failed the building force/moment balance check")
-    return {"case": case, "load_workings": workings, "nodal_loads_n": external.tolist(),
+    return {"case": case, "load_workings": workings, "nodal_loads_n": loads.reshape((-1,3)).tolist(),
+            'network_nodal_loads_n': external.tolist(), 'portal_load_workings': portal_workings,
+            'applied_resultant_n': applied_force.tolist(),
             'load_path':load_path_evidence(model.nodes,result,workings),
             **result, "portals": portals,
             "balance_force_error_n": force_error.tolist(), "balance_moment_error_nmm": moment_error.tolist()}

@@ -1224,7 +1224,7 @@ def export_elevation_pdf(data, path, metadata=None):
         path = f"{path}.pdf"
     writer = QPdfWriter(path)
     writer.setTitle(f"{metadata.get('project', 'Portal frame')} - Drawing Set")
-    writer.setCreator("Portal Calc")
+    writer.setCreator("PortalCalc")
     writer.setResolution(300)
     writer.setPageLayout(QPageLayout(QPageSize(QPageSize.A3), QPageLayout.Landscape, QMarginsF(0, 0, 0, 0)))
     painter = QPainter(writer)

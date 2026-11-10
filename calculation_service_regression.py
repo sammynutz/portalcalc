@@ -22,6 +22,10 @@ BASELINE_INPUT_DIGEST = "d27bc5545310f2dfaa95b316d3e595b28291d737fd535297412eda9
 # the former false pass and asserts that its buckling failure is now detected.
 # autoSize updated for automatic girt flybracing and same-case segment am.
 # Cached segment checks allow lighter columns; the final exact solve is retained.
+# autoSize re-baselined 2026-11-03 after roof wind was made to act normal to the
+# roof panels, with horizontal Table 5.3(A) bands. The previous autoSize values
+# were already stale: with those changes reverted in memory the run gave WEB
+# compression 0.9943 with 75*4 SHS chords, not the stored RIGHT_COLUMN result.
 BASELINE = {
     "checkSpecified": {
         "verified": False,
@@ -38,11 +42,11 @@ BASELINE = {
     },
     "autoSize": {
         "verified": True,
-        "ratio": 0.9912653065612982,
-        "group": "RIGHT_COLUMN",
+        "ratio": 0.9744532845912571,
+        "group": "BOTTOM",
         "check": "Combined",
         "sections": {
-            "left_column": "310 UB 32.0 (32.0 kg/m)",
+            "left_column": "250 UB 31.4 (31.5 kg/m)",
             "right_column": "250 UB 31.4 (31.5 kg/m)",
             "top_chord": "75*3 SHS (6.6 kg/m)",
             "bottom_chord": "75*3 SHS (6.6 kg/m)",

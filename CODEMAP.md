@@ -1,5 +1,11 @@
 # PortalCalc Code Map
 
+Working-folder cleanup, 2026-11-03: regression scripts, standalone hay-shed study
+tools, historical sample presets and selected completed review notes are archived
+outside this folder. References to them below describe the archived development
+workflow; restore those files before running their commands. Runtime calculation
+modules and factory defaults remain in this folder.
+
 This document is a fast navigation guide for future edits. It is not a full
 design spec; it points to the files and regions that usually matter first.
 
@@ -47,11 +53,21 @@ Release packaging is performed only when the user explicitly asks. Routine chang
 | `column_flybracing_regression.py` | Segment/load-case provenance, tall-column brace growth, LTB/in-plane separation, caching and export regression. |
 | `end_wall.py` | UI-independent end-wall mullion layout, pinned-member strength selection and H/150 deflection checks. |
 | `bracing_layout.py` | Qt-free versioned bracing geometry and blocked/pinned panel constraints for desktop/BOLT; no structural analysis. See `BRACING_LAYOUT.md`. |
-| `bracing_layout_search.py`, `bracing_layout_search_regression.py` | Practical end-load-path search with geometry-adaptive continuous eave roof girders, end-wall restraint and up to four compact installed-cost patterns; optional detailed cost search. Keeps passing input incumbents, blocked/required constraints and exact scoped strength/SLS/bare-stability acceptance. Fast sizing cost-orders local checks, ranks repeatable brace-EA steps and permits bounded brace balancing. See `BRACING_LAYOUT.md`. |
+| `bracing_layout_search.py`, `bracing_layout_search_regression.py` | Practical end-load-path search with geometry-adaptive continuous eave roof girders, end-wall restraint and bounded extra-wall-bay rod alternatives and up to four compact installed-cost patterns; optional detailed cost search. Keeps passing input incumbents, blocked/required constraints and exact scoped strength/SLS/bare-stability acceptance. Fast sizing cost-orders local checks, ranks repeatable brace-EA steps and permits bounded brace balancing. See `BRACING_LAYOUT.md`. |
 | `bracing_layout_ui.py` | Interactive Qt-painted 3D location editor, face filters, local undo/redo and geometry review. |
 | `bracing_layout_regression.py` | Geometry/constraint validation, real canvas clicks, preset persistence, read-only review and no structural-credit regressions. |
 | `bracing_analysis.py` | Axial 3D network, tension-only rod equilibrium, portal interface condensation/recovery, building assembly, integrated end-wall loads and reaction balance. |
-| `bracing_analysis_desktop.py` | Actual portal/section adapter, eight directional end-wind cases, frozen result evidence and readable report. See `BRACING_ANALYSIS.md`. |
+| `bracing_analysis_desktop.py` | Actual portal/section adapter, simultaneous gravity/end-wind combinations, frozen result evidence and readable report. See `BRACING_ANALYSIS.md`. |
+| `bracing_roof_loads.py` | Frame tributaries, G/Q/solar placements, end-wind normal roof/side-wall pressure patterns and full portal load snapshots; independent full-matrix/load conservation checks in `bracing_roof_loads_regression.py`. |
+| `bracing_side_wind.py` | ULS and SLS (Ws, G + Ws) left/right wind, roof alternatives, internal pressure, varying end-wall suction, exact partial-member pressure integration and applicable roof friction. Independent statics/mirroring/full-matrix checks in `bracing_side_wind_regression.py`. |
+| `bracing_transverse_sls_regression.py` | Factory-default transverse SLS scaling, per-frame sway/restraint evidence against an independent 2D solve, bare-network diaphragm exclusion and unchanged longitudinal acceptance. Also checks `wind.add_roof_panel_pressure` (roof wind normal to each panel) the banded Table 5.3(A) skillion high-side basis, and main/3D gable and skillion Ws sway agreement within 1%. |
+| `bracing_restraint.py` | Qt-free adoption of the 3D frame restraint into the 2D portal: record from a checked result, hard (stale) and soft (recheck) fingerprints, status for the 2D solve and brace-stiffness floors for 3D sizing. |
+| `combined_sizing.py` | Headless combined 2D portal + 3D bracing sizing over `MainWindow`: unrestrained 2D sizing, practical bracing, stiffer/eave-girder options, restraint adoption, 2D re-size, 3D recheck and total-cost ranking. |
+| `frontier_sizing.py`, `frontier_sizing_regression.py` | Frontier optimiser for the cheapest combined frame + bracing: lighter frames with bisected restraint requirements (check solves via `MainWindow.trial_sway_restraint_kn_mm`), a 3D cost/restraint frontier of bracing options, matching, and exact verification in rank order; the floor frame is tried with each option before any re-size. Tests use solver stand-ins. |
+| `bracing_parallel.py` | Qt-free process pool for independent 3D checks/sizings sharing one context (sent once via a temp file); in-order results, serial fallback, `PORTALCALC_BRACING_WORKERS`. Callers' scripts need a `__main__` guard. |
+| `bracing_restraint_regression.py` | Sway spring mechanics, adoption/staleness/recheck states, brace floors, 3D self-credit exclusion, deferred transverse SLS sizing and horizontal low-pitch roof bands. |
+| `restraint_feedback_prototype.py` | Study script: per-frame secant eave restraint from the 3D model versus the production hand spring, with 2D spring re-solves. Writes `output/restraint_feedback_prototype.*`. |
+| `bracing_spacing.py` | Default five-bay project rule, complete roof/side-wall anchor assessment and bounded intermediate-bay planning. See `bracing_spacing_regression.py`; small-screen/footer checks are in `bracing_workspace_fit_regression.py`. |
 | `bracing_diaphragm.py` | Revision B roof/wall reference calibrations (3/6 mm/kN), explicit empirical a/b² actual-panel c calculation or direct overrides; SLS equivalents, sloping-wall conversion, physical shear recovery and independent bare stability. Regression checks cover reference factors, geometry, reversal, open faces, ULS independence and saved UI behavior. |
 | `bracing_analysis_ui.py` | Compatibility import for the combined bracing workspace. |
 | `bracing_calculation_cache.py`, `bracing_cache_regression.py` | Compressed optional result cache with current-model/input/engine fingerprints; reopen/job persistence, stale/corrupt rejection, preserved failure diagnostics and input-hash separation. |
@@ -66,13 +82,13 @@ Release packaging is performed only when the user explicitly asks. Routine chang
 | `purlin_shared_design.py` | User-adopted single-addition 50/50 run/added allocation and two-addition equal-per-ply allocation; existing-run/added single-span beam demands and explicitly preliminary table-reference checks. Candidates/frozen checks enforce matching roof profile size; each added ply is checked and costed independently. |
 | `purlin_strut_tables.py` | In-range manufacturer UDL-table interpolation with stated bridging and frozen source rows; separate single/double/five-span reference arrangements. |
 | `purlin_strut_regression.py` | Independent asymmetric two-span statics, single-span responses, load conservation/self-weight, table/reference limits, sizing, UI invalidation and persistence. |
-| `purlin_beam.py`, `purlin_beam_design.py` | Roof-run Euler-Bernoulli model, finite distributed cladding coupling, direct load pickup, single-span additions, demand evidence and gated M/V/axial checks; local fast screens recover only the changed full roof run, final exact checks recover all affected lines. |
+| `purlin_beam.py`, `purlin_beam_design.py`, `purlin_end_local.py` | Roof-run Euler-Bernoulli model with separate Table 5.6 end-roof pressure patches, finite distributed cladding coupling, direct load pickup, single-span additions, demand evidence and gated M/V/axial checks; local fast screens recover only the changed full roof run, final exact checks recover all affected lines. |
 | `purlin_beam_ui.py`, `purlin_beam_regression.py` | Native moment/shear/deflection/transfer plots; independent beam and load-sharing benchmarks, whole-run sizing and workspace persistence tests. |
 | `bracing_schedule.py` | Supplied Grade 300 rod and Grade 1570 rope factored capacities, exact turnbuckle sizes and source image evidence. |
-| `bracing_mixed_sizing.py`, `bracing_components_regression.py` | Bounded per-location incremental-cost sizing with exact reanalysis; locally checked EA ceilings and coupled purlin/brace cost trials share the 18-analysis cap. Sharing, missing/stale ratings, schedule capacities and saved UI regression. |
+| `bracing_mixed_sizing.py`, `bracing_components_regression.py`, `bracing_sizing_recovery_regression.py` | Cost-ordered per-location screens and bounded exact reanalysis; reject unstable brace downgrades and retry sized struts/posts with last verified braces within the solve cap. Detailed callers also compare coupled purlin/brace costs. Sharing, missing/stale ratings, transactional recovery, schedule capacities and saved UI regression. |
 | `bracing_sizing_diagnostics.py` | Specific sizing-stop reasons and rejected alternatives; retains unchanged-input analysis and directs the workspace to the relevant rating row. |
 | `bracing_analysis_regression.py` | Closed-form mechanics, unreduced/reduced comparison, load/moment integration, missing-path failures and real offscreen desktop/export checks. |
-| `bracing_analysis_desktop.end_wind_cases` | End-pressure cases use along-wind length/span Cp,e, contributing end/internal surface Kc and explicit pressure-source evidence; frictional drag and transverse-wind cases remain excluded. |
+| `bracing_analysis_desktop.end_wind_cases` | Base end-pressure cases use along-wind length/span Cp,e, contributing end/internal surface Kc and external roof friction. `building_roof_cases` adds simultaneous normal roof/side-wall and gravity actions plus ULS and SLS side-wind cases. Transverse SLS gives report-only per-frame sway (`transverse_sls_summary`); it is excluded from longitudinal sway acceptance and the stiffness screen. |
 | `crane_beam.py` | Crane runway beam input/result dataclasses and section checks. |
 | `storage_loads.py` | Stored-material pressure/load calculations, storage panel design, storage load application and summary text. |
 | `elevation_drawings.py` | PDF elevation/plan/section drawing export using Qt painting. |
@@ -97,7 +113,7 @@ Release packaging is performed only when the user explicitly asks. Routine chang
 | `hay_shed_report.py`, `hay_shed_bale_comparison.py`, `hay_shed_pitch_bale_report.py` | Study-specific report generation and storage-capacity ranking of saved results. |
 | `purlin_selection_regression.py` | Compatible general/edge profile selection and real roof-selection integration checks. |
 | `storage_load_path_regression.py`, `wind_envelope_regression.py`, `web_force_envelope_regression.py` | Focused storage transfer, directional wind and web force-envelope regressions. |
-| `smoke_checks.py` | Compile checks plus non-visual and UI smoke tests; selected specialist suites are also invoked here. |
+| `smoke_checks.py` | Compile checks plus non-visual and UI smoke tests; selected specialist suites are also invoked here. Steps run in parallel processes (`--jobs`, `--jobs 1` serial) with single-threaded BLAS. |
 
 ## Key Data Files
 
@@ -105,7 +121,8 @@ Release packaging is performed only when the user explicitly asks. Routine chang
 - `metroll_megaspan_capacity_tables.json`: purlin/girt capacity data loaded by `main.py`.
 - `presets/factory_defaults.json`: packaged factory defaults.
 - `presets/*.json`: sample/customer/job presets used for manual regression and debugging.
-- `assets/CSB_logo.jpg`: drawing title block/logo asset.
+- `assets/CSB_logo.jpg`: drawing title block/logo asset (source for the derived `csb_logo.png` / `csb_logo_white.png` used on the splash and About tab).
+- `assets/portalcalc_logo*.{svg,png}`, `assets/portalcalc_icon*`: BOLT-family PortalCalc logo (navy and white variants) and app icon, generated by `make_brand_assets.py`. Brand colours live in `app_metadata.py` (`BRAND_NAVY`, `BRAND_TEAL`).
 
 ## Main.py Landmarks
 

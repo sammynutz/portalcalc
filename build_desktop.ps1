@@ -74,7 +74,7 @@ if (-not $Version) {
     }
 }
 
-if (-not $SkipSmoke) {
+if (-not $SkipSmoke -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot "smoke_checks.py"))) {
     $env:QT_QPA_PLATFORM = "offscreen"
     $smokeArg = "--$SmokeMode"
     try {
@@ -83,6 +83,9 @@ if (-not $SkipSmoke) {
     finally {
         Remove-Item Env:\QT_QPA_PLATFORM -ErrorAction SilentlyContinue
     }
+}
+elseif (-not $SkipSmoke) {
+    Write-Warning "Source regression checks are archived. Continuing with packaged startup and report-export checks."
 }
 
 Invoke-Native { & $Python -m PyInstaller --noconfirm --clean PortalCalc.spec } "PortalCalc PyInstaller build"

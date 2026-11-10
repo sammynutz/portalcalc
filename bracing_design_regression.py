@@ -257,6 +257,70 @@ class WorkspaceTests(unittest.TestCase):
         dialog.layout_editor.remember()
         return dialog
 
+    def test_member_check_force_follows_governing_case_while_diagram_follows_selection(self):
+        from bracing_sizing_diagnostics import governing_case_member
+        dialog = self.dialog()
+        try:
+            dialog.run_analysis()
+            result = copy.deepcopy(dialog.result)
+            identifier = result['cases'][0]['members'][0]['id']
+            selected = next(c for c in result['cases'] if c['case']['level'] == 'ULS')
+            reverse = next(c for c in result['cases'] if c['case']['level'] == 'ULS' and 'Back to front' in c['case']['name'])
+            # Synthetic display data reproduces differing assembly/ply actions;
+            # no engineering result or capacity calculation is changed by this test.
+            selected_member = next(m for m in selected['members'] if m['id'] == identifier)
+            reverse_member = next(m for m in reverse['members'] if m['id'] == identifier)
+            selected_member.update(axial_n=-25573., state='compression')
+            reverse_member.update(axial_n=-35436., state='compression')
+            row = {'case': reverse['case']['name'], 'ratio': .949, 'mode': 'Synthetic governing ply check',
+                   'component': 1, 'section': 'C/Z 250 15', 'load_share': .4412,
+                   'method': 'assigned_half_reference', 'roof_load_fraction': .5,
+                   'beam_role': 'added', 'beam_bay': 0, 'axial_kn': -15.635, 'beam_demands': []}
+            result['section_checks'][identifier] = {'id': identifier, 'section': 'Synthetic two-ply assembly',
+                'ratio': .949, 'case': reverse['case']['name'], 'mode': row['mode'],
+                'passes': True, 'case_checks': [row]}
+            second = selected['members'][1]['id']
+            selected['members'][1].update(axial_n=10000.,state='tension')
+            reverse['members'][1].update(axial_n=-40000.,state='compression')
+            second_row = {'case':selected['case']['name'],'ratio':.8,'mode':'Synthetic different governing case'}
+            result['section_checks'][second] = {'id':second,'section':'Synthetic second member','ratio':.8,
+                'case':selected['case']['name'],'mode':second_row['mode'],'passes':True,'case_checks':[second_row]}
+            dialog.display_result(result)
+            self.assertEqual(dialog.case_combo.currentData(),'governing')
+            self.assertTrue(dialog.canvas.governing_cases)
+            displayed = next(m for m in dialog.canvas.display_members() if m['id']==identifier)
+            self.assertEqual(displayed['axial_n'],-35436.)
+            self.assertEqual(next(m for m in dialog.canvas.display_members() if m['id']==second)['axial_n'],10000.)
+            self.assertNotIn('Selected display case:',dialog.check_description(identifier))
+            dialog.case_combo.setCurrentIndex(result['cases'].index(selected))
+            dialog.show_case()
+            dialog.inspect_member(identifier)
+            self.assertEqual(dialog.member_table.item(0,2).text(), '-35.436')
+            self.assertEqual(dialog.member_table.item(0,3).text(), '0.949')
+            detail = dialog.member_detail.text()
+            self.assertIn('Selected-case total axial: -25.573', detail)
+            self.assertIn('Governing-case total axial: -35.436', detail)
+            self.assertIn('Governing component 2: C/Z 250 15', detail)
+            self.assertIn('Governing component axial share: 44.12%', detail)
+            self.assertIn('governing ply axial -15.635', detail)
+            self.assertIn('Assigned roof load on this physical ply: 50.00%', detail)
+            dialog.case_combo.setCurrentIndex(result['cases'].index(reverse))
+            self.assertIn('Selected-case total axial: -35.436',dialog.member_detail.text())
+            self.assertEqual(dialog.member_table.item(0,2).text(), '-35.436')
+            self.assertEqual(dialog.member_table.item(0,3).text(), '0.949')
+            dialog.case_combo.setCurrentIndex(dialog.case_combo.findData('governing'))
+            self.assertTrue(dialog.canvas.governing_cases)
+            dialog.visual_mode.setCurrentIndex(dialog.visual_mode.findData('deformed'))
+            self.assertFalse(dialog.canvas.governing_cases)
+            self.assertEqual(dialog.case_combo.currentText(),result['design']['global_sls']['case'])
+            result['section_checks'][identifier]['case'] = 'Independent prerequisite'
+            self.assertIsNone(governing_case_member(result,identifier))
+            dialog.show_case()
+            self.assertEqual(dialog.member_table.item(0,2).text(), '-')
+            self.assertEqual(dialog.member_table.item(0,7).text(), '-')
+        finally:
+            dialog.reject()
+
     def test_blank_layout_can_be_edited_analysed_and_inspected_on_one_screen(self):
         from PySide6.QtCore import Qt
         from PySide6.QtTest import QTest
@@ -362,11 +426,20 @@ class WorkspaceTests(unittest.TestCase):
     def test_autosizing_updates_controls_only_after_a_verified_result(self):
         dialog = self.dialog()
         try:
+            # This success-path fixture now also needs a gravity-compatible
+            # two-end load path. The former one-end layout has neutral rods
+            # under pure gravity, which must not be reported as verified.
+            last=len(dialog.layout_editor.model.geometry.bay_stations_mm)-2
+            for panel in dialog.layout_editor.model.panels.values():
+                if panel.id.startswith((f'left_wall/bay/{last}',f'right_wall/bay/{last}',f'roof/bay/{last}/')) and panel.id not in dialog.layout_editor.model.pinned:
+                    dialog.layout_editor.model.toggle(panel.id,'pinned')
+            dialog.layout_editor.remember()
             before_layout = dialog.layout_snapshot()
             dialog.run_auto_size()
             self.assertIsNotNone(dialog.result)
             self.assertTrue(dialog.result["design"]["passes"])
             self.assertIn("sizing_search", dialog.result)
+            self.assertTrue(dialog.result['sizing_search']['fast'])
             self.assertEqual(dialog.snapshot()["strut_section"], dialog.result["sections"]["strut"]["section"])
             self.assertEqual(dialog.layout_snapshot(), before_layout)
             before_sections = dialog.snapshot()
@@ -374,6 +447,29 @@ class WorkspaceTests(unittest.TestCase):
                 dialog.run_auto_size()
             self.assertEqual(dialog.snapshot(), before_sections)
             self.assertIsNone(dialog.result)
+        finally:
+            dialog.reject()
+
+    def test_gravity_neutral_rods_are_accepted_only_within_the_play_limit(self):
+        dialog=self.dialog()
+        try:
+            dialog.run_analysis()
+            self.assertIsNotNone(dialog.result)
+            neutral=[c for c in dialog.result['cases'] if c['case'].get('gravity_only')
+                     and c['tangent_status']=='neutral_rods_required_stability_unverified']
+            self.assertTrue(neutral)
+            # Project-adopted (4 Nov 2026): zero-force and slack rods that take
+            # up every movement, including combinations of modes, within the
+            # 1 mm default play limit (here up to about 0.4 mm).
+            for case in neutral:
+                self.assertTrue(case['slack_play']['directions_verified'])
+                self.assertLessEqual(case['slack_play']['play_mm'], 1.)
+            self.assertTrue(dialog.result['design']['taut_tangent_verified'])
+            # A zero play limit accepts none: the former unverified behaviour.
+            dialog.criteria_inputs['slack_play_limit_mm'].setValue(0.)
+            dialog.run_analysis()
+            self.assertFalse(dialog.result['design']['taut_tangent_verified'])
+            self.assertFalse(dialog.result['design']['passes'])
         finally:
             dialog.reject()
 

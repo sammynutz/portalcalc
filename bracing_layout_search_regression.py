@@ -9,7 +9,8 @@ import bracing_design_regression as design_tests
 from bracing_layout import BracingLayout, LayoutGeometry
 from bracing_layout_search import (find_cost_layout as find_layout, find_layout as find_practical_layout,
                                    layout_context, LayoutSearchCancelled,
-                                   LayoutSearchStopped, structured_seeds, coherent_changes, practical_seeds)
+                                   LayoutSearchStopped, structured_seeds, coherent_changes, practical_seeds,
+                                   wall_rod_expansion_seeds)
 
 
 class LayoutSearchTests(unittest.TestCase):
@@ -305,9 +306,13 @@ class LayoutSearchWorkspaceTests(unittest.TestCase):
             before = d.layout_snapshot()
             context = d.current_context(require_selected=False)
             selected = fixed_layout(context['layout'].geometry).pinned - {blocked}
+            last=len(context['layout'].geometry.bay_stations_mm)-2
+            selected |= {p.id for p in context['layout'].panels.values()
+                         if p.id.startswith((f'left_wall/bay/{last}',f'right_wall/bay/{last}',f'roof/bay/{last}/'))}
             trial = layout_context(context, selected)
             chosen = d.selections(context)
             result = solve_selection(trial, chosen, d.criteria(), context['cost_rates'])
+            self.assertTrue(result['design']['passes'])
             # Adoption transaction is tested with a real analysis payload. The
             # engine's passing-only acceptance is exercised separately above.
             with mock.patch('bracing_workspace_ui.find_layout', return_value=(result, chosen, trial['layout'])) as search:
@@ -396,8 +401,9 @@ class PracticalLayoutTests(unittest.TestCase):
             return sized(context, chosen)[0]
         with mock.patch('bracing_layout_search.solve_selection', side_effect=screen), mock.patch('bracing_layout_search.auto_size', side_effect=sized) as size:
             result, chosen, layout = find_practical_layout(c,s,pool,criteria,rates)
-        self.assertEqual(size.call_count, 1)
-        self.assertFalse(result['layout_search']['trials'][0]['section_sizing'])
+        # The passing input is re-sized (finding nothing cheaper here), then compacted.
+        self.assertEqual(size.call_count, 2)
+        self.assertTrue(result['layout_search']['trials'][0]['section_sizing'])
         self.assertIn('Verify current layout', result['layout_search']['trials'][0]['reason'])
         self.assertIn('continuous supported left-eave', result['layout_search']['trials'][1]['reason'])
         self.assertEqual(len(layout.pinned), 15)
@@ -421,15 +427,144 @@ class PracticalLayoutTests(unittest.TestCase):
             self.assertNotIn('2-strip supported left-eave', label)
             self.assertTrue(selected <= c['layout'].available)
 
+    def test_extra_wall_anchor_preserves_girder_and_respects_blocks(self):
+        c, *_ = self.fixture()
+        selected = next(practical_seeds(c,set()))[1]
+        patterns = list(wall_rod_expansion_seeds(c,selected))
+        self.assertEqual(len(patterns), 2)
+        self.assertEqual(patterns[0][1]-selected, {'left_wall/bay/2'})
+        self.assertTrue({f'roof/bay/2/strip/{s}' for s in range(4)} <= patterns[1][1])
+        for label, panels in patterns:
+            self.assertTrue(selected <= panels <= c['layout'].available)
+        c['layout'].blocked.add('left_wall/bay/2')
+        patterns = list(wall_rod_expansion_seeds(c,selected))
+        self.assertEqual(patterns[0][1]-selected, {'left_wall/bay/1'})
+        # Without a continuous eave row the anchor alone is still tried first
+        # (struts can collect to it), then with its roof collector.
+        selected = {p for p in selected if p != 'roof/bay/2/strip/0'}
+        patterns = list(wall_rod_expansion_seeds(c,selected))
+        self.assertEqual(len(patterns), 2)
+        self.assertEqual(patterns[0][1]-selected, {'left_wall/bay/1'})
+        self.assertIn('full roof collector', patterns[1][0])
+        c['layout'].blocked.update(f'roof/bay/{bay}/strip/2' for bay in (1,3))
+        self.assertEqual(list(wall_rod_expansion_seeds(c,selected)), [])
+
+    def block_end_walls(self, c):
+        """Isolate the extra-bay comparison from the open-side end-wall comparison."""
+        c['layout'].blocked.update(p for p in list(c['layout'].panels) if p.startswith(('front_end/', 'back_end/')))
+
+    def end_bays(self, c):
+        return next(p for label, p in practical_seeds(c, set()) if label == 'End roof/wall bays')
+
+    def test_twist_restraint_seeds_target_the_open_side(self):
+        from bracing_layout_search import twist_restraint_seeds
+        c, *_ = self.fixture()                                   # right wall blocked: open on the right
+        selected = self.end_bays(c)
+        patterns = list(twist_restraint_seeds(c, selected))
+        self.assertEqual([p-selected for _, p in patterns],
+                         [{'front_end/panel/2', 'back_end/panel/2'},
+                          {'front_end/panel/0', 'front_end/panel/2', 'back_end/panel/0', 'back_end/panel/2'}])
+        self.assertEqual(list(twist_restraint_seeds(c, patterns[0][1])), [])   # already end-braced
+        c['layout'] = BracingLayout(c['layout'].geometry)                       # both side walls available
+        both = {'left_wall/bay/0', 'right_wall/bay/0'} | {f'roof/bay/0/strip/{s}' for s in range(4)}
+        self.assertEqual(list(twist_restraint_seeds(c, both)), [])
+
+    def test_one_sided_passing_layout_adopts_cheaper_open_side_end_walls(self):
+        c, s, pool, criteria, rates = self.fixture()
+        rates['braced_panel_installation'] = 0.
+        c['layout'].pinned = self.end_bays(c)
+        def cost(context):
+            ends = {p for p in context['layout'].pinned if p.startswith(('front_end/', 'back_end/'))}
+            return {0: 3000., 2: 2500., 4: 2700.}[len(ends)]
+        def sized(context, chosen, *args, **kwargs):
+            self.assertFalse(kwargs['retain_brace_stiffness'])
+            return LayoutSearchTests.checked(cost(context)), chosen
+        with mock.patch('bracing_layout_search.solve_selection', side_effect=lambda context, *a: LayoutSearchTests.checked(cost(context))), \
+                mock.patch('bracing_layout_search.auto_size', side_effect=sized):
+            result, chosen, layout = find_practical_layout(c, s, pool, criteria, rates)
+        self.assertTrue(result['layout_search']['twist_restraint_comparison']['adopted'])
+        self.assertEqual(result['design']['estimated_cost'], 2500.)
+        self.assertEqual(layout.pinned - c['layout'].pinned, {'front_end/panel/2', 'back_end/panel/2'})
+        # Not cheaper: the passing input is kept.
+        with mock.patch('bracing_layout_search.solve_selection', return_value=LayoutSearchTests.checked(3000.)), \
+                mock.patch('bracing_layout_search.auto_size', side_effect=lambda context, chosen, *a, **k: (LayoutSearchTests.checked(3000. if context['layout'].pinned == c['layout'].pinned else 3100.), chosen)):
+            result, chosen, layout = find_practical_layout(c, s, pool, criteria, rates)
+        self.assertFalse(result['layout_search']['twist_restraint_comparison']['adopted'])
+        self.assertEqual(layout.pinned, c['layout'].pinned)
+
+    def test_heavy_wall_compares_extra_rod_bay_before_compacting(self):
+        from bracing_policy import family
+        c, s, pool, criteria, rates = self.fixture()
+        rates['braced_panel_installation'] = 80.
+        self.block_end_walls(c)
+        c['layout'].pinned = next(practical_seeds(c,set()))[1]
+        original = c['layout'].to_dict()
+        s['wall_brace'] = s['strut']  # steel section standing in for an angle
+        def sized(context, chosen, candidates, *args, **kwargs):
+            if context['layout'].pinned == c['layout'].pinned:
+                return LayoutSearchTests.checked(3000.), chosen   # input re-size: nothing cheaper
+            self.assertEqual(family(chosen['wall_brace']), 'rod')
+            self.assertTrue(all(family(row) == 'rod' for row in candidates['wall_brace']))
+            self.assertEqual(context['layout'].pinned-c['layout'].pinned, {'left_wall/bay/2'})
+            self.assertFalse(kwargs['retain_brace_stiffness'])   # rods may be lighter than the stiffest
+            return LayoutSearchTests.checked(2900.), chosen
+        with mock.patch('bracing_layout_search.solve_selection', return_value=LayoutSearchTests.checked(3000.)), mock.patch('bracing_layout_search.auto_size', side_effect=sized) as size:
+            result, chosen, layout = find_practical_layout(c,s,pool,criteria,rates)
+        self.assertEqual(size.call_count, 2)
+        self.assertTrue(result['layout_search']['wall_rod_comparison']['adopted'])
+        self.assertNotIn('compact_comparison', result['layout_search'])
+        self.assertEqual(result['layout_search']['layout_trials'], 2)
+        self.assertEqual(result['design']['estimated_cost'], 2900.)
+        self.assertEqual(c['layout'].to_dict(), original)
+        self.assertEqual(len(layout.pinned), len(c['layout'].pinned)+1)
+
+    def test_extra_rod_bay_failures_cost_and_budget_keep_incumbent(self):
+        c, s, pool, criteria, rates = self.fixture()
+        rates['braced_panel_installation'] = 0.  # rods can help even without an installation allowance
+        self.block_end_walls(c)
+        c['layout'].pinned = next(practical_seeds(c,set()))[1]
+        s['wall_brace'] = s['strut']
+        for passing, cost in ((False, 1000.), (True, 3100.)):
+            with self.subTest(passing=passing), mock.patch('bracing_layout_search.solve_selection', return_value=LayoutSearchTests.checked(3000.)), mock.patch('bracing_layout_search.auto_size', side_effect=lambda context,chosen,*args,**kwargs:(LayoutSearchTests.checked(cost,passing),chosen)) as size:
+                result, chosen, layout = find_practical_layout(c,s,pool,criteria,rates,max_trials=2)
+            self.assertEqual(size.call_count, 2)   # input re-size, then the rod bay
+            self.assertFalse(result['layout_search']['wall_rod_comparison']['adopted'])
+            self.assertEqual(result['layout_search']['layout_trials'], 2)
+            self.assertEqual(layout.pinned, c['layout'].pinned)
+            self.assertEqual(chosen['wall_brace'], s['wall_brace'])
+            self.assertEqual(result['design']['estimated_cost'], 3000.)
+        with mock.patch('bracing_layout_search.solve_selection', return_value=LayoutSearchTests.checked(3000.)), mock.patch('bracing_layout_search.auto_size', side_effect=AnalysisError('No cheaper sizing')) as size:
+            result, chosen, layout = find_practical_layout(c,s,pool,criteria,rates,max_trials=1)
+        self.assertEqual(size.call_count, 1)   # only the input re-size; it keeps the checked input
+        self.assertEqual(result['design']['estimated_cost'], 3000.)
+        self.assertNotIn('wall_rod_comparison',result['layout_search'])
+
+    def test_unpriced_rods_and_cancelled_extra_bay_are_not_adopted(self):
+        c, s, pool, criteria, rates = self.fixture()
+        rates['braced_panel_installation'] = 0.
+        self.block_end_walls(c)
+        c['layout'].pinned = next(practical_seeds(c,set()))[1]
+        s['wall_brace'] = s['strut']
+        before = c['layout'].to_dict()
+        with mock.patch('bracing_layout_search.solve_selection', return_value=LayoutSearchTests.checked(3000.)), mock.patch('bracing_layout_search.group_cost', side_effect=AnalysisError('Missing fittings')), mock.patch('bracing_layout_search.auto_size', side_effect=lambda context,chosen,*a,**k:(LayoutSearchTests.checked(3000.),chosen)) as size:
+            result, chosen, layout = find_practical_layout(c,s,pool,criteria,rates)
+        self.assertEqual(size.call_count, 1)   # input re-size only; unpriced rods are never tried
+        self.assertNotIn('wall_rod_comparison',result['layout_search'])
+        with mock.patch('bracing_layout_search.solve_selection', return_value=LayoutSearchTests.checked(3000.)), mock.patch('bracing_layout_search.auto_size', side_effect=LayoutSearchCancelled('Cancelled')):
+            with self.assertRaises(LayoutSearchCancelled):
+                find_practical_layout(c,s,pool,criteria,rates)
+        self.assertEqual(c['layout'].to_dict(), before)
+
     def test_compact_failure_advances_family_and_stops_at_first_improvement(self):
         c, s, pool, criteria, rates = self.fixture()
         rates['braced_panel_installation'] = 80.
         c['layout'].pinned = set(c['layout'].available)
         before = c['layout'].to_dict()
         with mock.patch('bracing_layout_search.solve_selection', return_value=LayoutSearchTests.checked(5000.)), mock.patch(
-                'bracing_layout_search.auto_size', side_effect=[AnalysisError('SLS fails'), (LayoutSearchTests.checked(4000.),s)]) as size:
+                'bracing_layout_search.auto_size', side_effect=[(LayoutSearchTests.checked(5000.),s), AnalysisError('SLS fails'),
+                                                                (LayoutSearchTests.checked(4000.),s)]) as size:
             result, chosen, layout = find_practical_layout(c,s,pool,criteria,rates)
-        self.assertEqual(size.call_count, 2)
+        self.assertEqual(size.call_count, 3)   # input re-size, failed compact, adopted compact
         self.assertEqual(result['layout_search']['layout_trials'], 3)
         self.assertEqual(result['layout_search']['compact_comparison']['patterns_checked'], 2)
         self.assertEqual(result['layout_search']['winning_trial'], 3)
@@ -444,7 +579,7 @@ class PracticalLayoutTests(unittest.TestCase):
         with mock.patch('bracing_layout_search.solve_selection', return_value=LayoutSearchTests.checked(5000.)), mock.patch(
                 'bracing_layout_search.auto_size', side_effect=AnalysisError('SLS fails')) as size:
             result, chosen, layout = find_practical_layout(c,s,pool,criteria,rates)
-        self.assertEqual(size.call_count, 4)
+        self.assertEqual(size.call_count, 5)   # failed input re-size keeps the incumbent, then 4 compacts
         self.assertEqual(result['layout_search']['layout_trials'], 5)
         self.assertEqual(result['layout_search']['compact_comparison']['patterns_checked'], 4)
         self.assertFalse(result['layout_search']['compact_comparison']['adopted'])
@@ -497,7 +632,7 @@ class PracticalLayoutTests(unittest.TestCase):
             return sized(context, chosen)[0]
         with mock.patch('bracing_layout_search.solve_selection', side_effect=screen), mock.patch('bracing_layout_search.auto_size', side_effect=sized) as size:
             result, chosen, layout = find_practical_layout(c, s, pool, criteria, rates)
-        self.assertEqual(size.call_count, 1)
+        self.assertEqual(size.call_count, 2)   # input re-size, then the compact layout
         self.assertEqual(len(layout.pinned), 15)
         self.assertEqual(result['design']['estimated_cost'], 1770.)
         self.assertTrue(result['layout_search']['compact_comparison']['adopted'])
@@ -509,14 +644,15 @@ class PracticalLayoutTests(unittest.TestCase):
         c['layout'].pinned = set(c['layout'].available)
         with mock.patch('bracing_layout_search.solve_selection', return_value=LayoutSearchTests.checked(1800.)), mock.patch('bracing_layout_search.auto_size', side_effect=AnalysisError('SLS fails')) as size:
             result, chosen, layout = find_practical_layout(c, s, pool, criteria, rates, max_trials=2)
-        self.assertEqual(size.call_count, 1)
+        self.assertEqual(size.call_count, 2)   # failed input re-size keeps the incumbent; failed compact
         self.assertEqual(layout.pinned, c['layout'].pinned)
         self.assertEqual(result['design']['estimated_cost'], 1800.)
         self.assertFalse(result['layout_search']['compact_comparison']['adopted'])
         self.assertEqual(result['layout_search']['layout_trials'], 2)
         with mock.patch('bracing_layout_search.solve_selection', return_value=LayoutSearchTests.checked(200.)), mock.patch('bracing_layout_search.auto_size', return_value=(LayoutSearchTests.checked(1800.), s)) as size:
             result, chosen, layout = find_practical_layout(c, s, pool, criteria, rates, max_trials=1)
-        self.assertEqual(size.call_count, 0)
+        self.assertEqual(size.call_count, 1)   # the input re-size, which is not cheaper
+        self.assertEqual(result['design']['estimated_cost'], 200.)
         self.assertNotIn('compact_comparison', result['layout_search'])
 
     def test_severe_sway_tries_end_walls_before_repeated_member_growth(self):

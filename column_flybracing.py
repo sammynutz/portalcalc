@@ -4,7 +4,7 @@ No structural solve or connection-stiffness model lives here. Girt flybraces
 restrain weak-axis translation/twist; they never create an in-plane support.
 The receiving girt and effective lateral/twist restraint remain design assumptions.
 """
-from dataclasses import asdict
+from dataclasses import asdict, fields
 import math
 
 from member_checks import MemberActions, MemberCheckResult, check_member
@@ -105,6 +105,21 @@ def segment_demand(case, low, high):
             'moment_modifier': am, 'quarter_moments_knm': [m/1e6 for m in quarters]}
 
 
+_FIELD_NAMES = {}
+
+
+def section_key(section):
+    """Hashable key of a flat section dataclass: its field values in order.
+
+    The same values as ``tuple(asdict(section).values())`` for flat fields,
+    without asdict's recursive deep copy (this key is built for every
+    interval check during sizing)."""
+    names = _FIELD_NAMES.get(type(section))
+    if names is None:
+        names = _FIELD_NAMES[type(section)] = tuple(f.name for f in fields(section))
+    return tuple(getattr(section, name) for name in names)
+
+
 class FlybraceColumn:
     """A per-solve cache of interval demands and section/layout checks."""
     def __init__(self, basis):
@@ -119,7 +134,7 @@ class FlybraceColumn:
         self.plans = {}
 
     def interval(self, section, low, high):
-        key = (tuple(asdict(section).values()), low, high)
+        key = (section_key(section), low, high)
         if key in self.intervals:
             return self.intervals[key]
         demand_key = (low, high)
@@ -147,9 +162,9 @@ class FlybraceColumn:
         return intervals, worst
 
     def choose(self, section):
-        section_key = tuple(asdict(section).values())
-        if section_key in self.plans:
-            return self.plans[section_key]
+        plan_key = section_key(section)
+        if plan_key in self.plans:
+            return self.plans[plan_key]
         # Upper-quarter prediction, followed by its two neighbouring girts.
         prediction = self.base + .75*(self.basis['roof_node_mm']-self.base)
         positions = []
@@ -206,5 +221,5 @@ class FlybraceColumn:
             'restraint': 'Effective weak-axis lateral and twist restraint at scheduled girt flybraces; no in-plane support added.',
             'selection': 'Upper-quarter seed, adjacent girts, then cached splits of governing segments.',
         }
-        self.plans[section_key] = aggregate, worst[1], plan
-        return self.plans[section_key]
+        self.plans[plan_key] = aggregate, worst[1], plan
+        return self.plans[plan_key]

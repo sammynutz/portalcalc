@@ -33,6 +33,26 @@ def fixture(count=1, active=(0,)):
 
 
 class StrutTableTests(unittest.TestCase):
+    def test_cached_patch_actions_reuse_only_identical_physical_inputs(self):
+        from purlin_shared_design import _added_patch_actions, _cached_added_patch_actions
+        _cached_added_patch_actions.cache_clear()
+        segments=[[0.,4000.,2.]]
+        a=_added_patch_actions(segments,4000.,1e6,0.)
+        b=_added_patch_actions([list(s) for s in segments],4000.,1e6,0.)
+        self.assertEqual(a,b)
+        self.assertEqual(_cached_added_patch_actions.cache_info().hits,1)
+        self.assertAlmostEqual(a['positive_moment_knm'],2*4000**2/8/1e6)
+        self.assertAlmostEqual(a['deflection_mm'],5*2*4000**4/(384*200000*1e6))
+        stiff=_added_patch_actions(segments,4000.,2e6,0.)
+        self.assertAlmostEqual(stiff['deflection_mm'],a['deflection_mm']/2)
+        moved=_added_patch_actions([[1000.,5000.,2.]],4000.,1e6,1000.)
+        self.assertAlmostEqual(moved['positive_moment_knm'],a['positive_moment_knm'])
+        self.assertAlmostEqual(moved['samples'][0]['x_mm'],a['samples'][0]['x_mm']+1000.)
+        segments[0][2]=3.
+        changed=_added_patch_actions(segments,4000.,1e6,0.)
+        self.assertAlmostEqual(changed['positive_moment_knm'],a['positive_moment_knm']*1.5)
+        self.assertEqual(_cached_added_patch_actions.cache_info().misses,4)
+
     @classmethod
     def setUpClass(cls):
         cls.tables = json.loads(Path(__file__).with_name('metroll_megaspan_capacity_tables.json').read_text())

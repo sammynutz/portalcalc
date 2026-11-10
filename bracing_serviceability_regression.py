@@ -189,7 +189,7 @@ class StrengthModeWorkspaceTests(unittest.TestCase):
             os.environ['APPDATA']=settings
             w=MainWindow();w.confirm_on_close=False
             try:
-                w.bracing_location_layout=fixed_layout(w.current_bracing_layout_geometry()).to_dict()
+                w.bracing_location_layout=fixed_layout(w.current_bracing_layout_geometry(),both_ends=True).to_dict()
                 w.generate_and_solve();context=prepare_context(w)
                 d=BracingAnalysisDialog(context,w.catalog,{'mixed_struts':False})
                 try:

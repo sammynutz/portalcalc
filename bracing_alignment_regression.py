@@ -53,7 +53,7 @@ class AlignmentWorkspaceTests(unittest.TestCase):
 
     def setUp(self):
         w=self.w;w.apply_preset_data(copy.deepcopy(self.defaults))
-        w.bracing_location_layout=fixed_layout(w.current_bracing_layout_geometry(),end=True).to_dict()
+        w.bracing_location_layout=fixed_layout(w.current_bracing_layout_geometry(),end=True,both_ends=True).to_dict()
         w.bracing_3d_settings={'mixed_struts':False,'end_post_section':'100*3 SHS'}
         w.generate_and_solve()
 

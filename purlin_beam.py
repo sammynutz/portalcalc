@@ -39,9 +39,10 @@ def _roots(poly):
     return [float(r.real) for r in poly.roots() if abs(r.imag) < 1e-7 and 0 < r.real < 1]
 
 
-def _q(load, role, bay):
+def _q(load, role, bay, x_mm=None):
     values = load.get(role+"_n_mm_by_bay")
-    return float(values[bay] if values is not None else load[role+"_n_mm"])
+    value = float(values[bay] if values is not None else load[role+"_n_mm"])
+    return value+sum(q for a,b,q in load.get(role+'_patches',[]) if x_mm is not None and a <= x_mm < b)
 
 
 def solve_run(spans_mm, roof_i_mm4, added_i_mm4, roof_count=1, added_bays=(),
@@ -86,6 +87,10 @@ def solve_run(spans_mm, roof_i_mm4, added_i_mm4, roof_count=1, added_bays=(),
     if not loads:
         raise AnalysisError("At least one roof beam load case is required")
     for load in loads:
+        for role in ('roof','added'):
+            if any(not all(math.isfinite(v) for v in patch) or not 0 <= patch[0] < patch[1] <= sum(spans)+1e-6
+                   for patch in load.get(role+'_patches',[])):
+                raise AnalysisError('Roof beam patch loads need finite values within the run')
         if any(values is not None and len(values) != len(spans) for values in (load.get("roof_n_mm_by_bay"), load.get("added_n_mm_by_bay"))):
             raise AnalysisError("Per-bay roof loads must cover the entire run")
         if any(not math.isfinite(_q(load, role, bay)) for role in ("roof", "added") for bay in range(len(spans))):
@@ -97,13 +102,23 @@ def solve_run(spans_mm, roof_i_mm4, added_i_mm4, roof_count=1, added_bays=(),
         return dofs[key]
     offset = 0.
     for bay, length in enumerate(spans):
-        stations = {round(i/divisions, 12) for i in range(divisions+1)}
+        regular_stations = {round(i/divisions, 12) for i in range(divisions+1)}
+        stations = {0.,1.}
+        for load in loads:
+            for role in ('roof','added'):
+                for lo,hi,q in load.get(role+'_patches',[]):
+                    stations.update(round((x-offset)/length,12) for x in (lo,hi) if offset < x < offset+length)
         if span_type == "continuous_lapped":
             # Equal-section lap stiffness = sum of ply EIs; no composite I.
             if bay > 0 and bay not in releases:
                 stations.add(lap_ratio/2)
             if bay+1 < len(spans) and bay+1 not in releases:
                 stations.add(1-lap_ratio/2)
+        # Retain exact load/lap boundaries, but omit a regular mesh point very
+        # close to one. Millimetre sliver elements otherwise lose equilibrium
+        # precision through cancellation of large beam stiffness terms.
+        protected = tuple(stations)
+        stations.update(t for t in regular_stations if all(abs(t-c) > .05/divisions for c in protected))
         stations = sorted(stations)
         group = sum(b <= bay for b in releases)
         def roof_node(t):
@@ -144,7 +159,7 @@ def solve_run(spans_mm, roof_i_mm4, added_i_mm4, roof_count=1, added_bays=(),
             matrix[np.ix_(ids, ids)] += _beam(ei, length)
             unit = length*np.array([_integral(n) for n in shape])
             for j, load in enumerate(loads):
-                rhs[list(ids), j] += unit*_q(load, role, e["bay"])*count
+                rhs[list(ids), j] += unit*_q(load, role, e["bay"],e['x']+length/2)*count
         if e["added"] is not None and coupling:
             ids = (*e["roof"], *e["added"])
             for t, weight in zip((gauss+1)/2, weights/2):
@@ -168,6 +183,34 @@ def solve_run(spans_mm, roof_i_mm4, added_i_mm4, roof_count=1, added_bays=(),
             raise AnalysisError("Roof beam equilibrium did not converge")
         bays = [{"roof": [], "added": [], "transfer_kn": 0., "peak_transfer_kn_m": 0., "transfer_samples": []} for _ in spans]
         for e in elements:
+            if not e['added'] or not coupling:
+                # Uncoupled elements have constant UDL on each exact load
+                # interval. Recover directly from Hermite coefficients instead
+                # of constructing dozens of Polynomial objects per case.
+                length = e['length']
+                bay = bays[e['bay']]
+                bay['transfer_samples'].extend({'x_mm':e['x']+t*length,'transfer_kn_m':0.} for t in (0.,.25,.5,.75,1.))
+                for role,ei,count in (('roof',e['roof_ei'],roof_count),('added',e['added_ei'],1)):
+                    ids = e[role]
+                    if ids is None:
+                        continue
+                    d = displacement[list(ids),j]
+                    q = _q(load,role,e['bay'],e['x']+length/2)*count
+                    ends = _beam(ei,length)@d-q*np.array([length/2,length*length/12,length/2,-length*length/12])
+                    f = q*length**4/(24*ei)
+                    w = [d[0],length*d[1],-3*d[0]-2*length*d[1]+3*d[2]-length*d[3]+f,
+                         2*d[0]+length*d[1]-2*d[2]+length*d[3]-2*f,f]
+                    roots = np.polynomial.polynomial.polyroots([w[1],2*w[2],3*w[3],4*w[4]])
+                    positions = {0.,.25,.5,.75,1.,*[float(r.real) for r in roots if abs(r.imag)<1e-7 and 0<r.real<1]}
+                    if q and 0 < -ends[0]/(q*length) < 1:
+                        positions.add(float(-ends[0]/(q*length)))
+                    factor = e['roof_plies'] if role=='roof' else 1
+                    for t in sorted(positions):
+                        bay[role].append({'x_mm':e['x']+t*length,
+                            'moment_knm':float(ends[1]-ends[0]*length*t-q*length**2*t*t/2)/factor/1e6,
+                            'shear_kn':float(-ends[0]-q*length*t)/factor/1000,
+                            'deflection_mm':float(np.polynomial.polynomial.polyval(t,w)),'plies':factor})
+                continue
             length, shape = e["length"], _shape(e["length"])
             roof_w = sum((s*d for s, d in zip(shape, displacement[list(e["roof"]), j])), P([0.]))
             added_w = sum((s*d for s, d in zip(shape, displacement[list(e["added"]), j])), P([0.])) if e["added"] else P([0.])
@@ -181,7 +224,7 @@ def solve_run(spans_mm, roof_i_mm4, added_i_mm4, roof_count=1, added_bays=(),
                 ids = e[role]
                 if ids is None:
                     continue
-                q = P([_q(load, role, e["bay"])*count]) + transfer*(-1 if role == "roof" else 1)
+                q = P([_q(load, role, e["bay"],e['x']+length/2)*count]) + transfer*(-1 if role == "roof" else 1)
                 equivalent = length*np.array([_integral(s*q) for s in shape])
                 ends = _beam(ei, length)@displacement[list(ids), j]-equivalent
                 shear = P([-ends[0]])-q.integ()*length

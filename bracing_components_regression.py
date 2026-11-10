@@ -322,8 +322,11 @@ class ComponentWorkspaceTests(unittest.TestCase):
         cls.window.generate_and_solve()
         from bracing_layout import BracingLayout
         layout = BracingLayout(cls.window.current_bracing_layout_geometry())
+        last=len(layout.geometry.bay_stations_mm)-2
         for panel in layout.panels.values():
-            if "/bay/0" in panel.id and ("wall" in panel.face or panel.face.startswith("roof")):
+            # These success-path component tests need supported gravity load
+            # paths at both ends now that portal roof loads enter the 3D solve.
+            if any(f'/bay/{bay}' in panel.id for bay in (0,last)) and ("wall" in panel.face or panel.face.startswith("roof")):
                 layout.toggle(panel.id, "pinned")
         cls.window.bracing_location_layout = layout.to_dict()
 
@@ -390,8 +393,9 @@ class ComponentWorkspaceTests(unittest.TestCase):
         from PySide6.QtWidgets import QTableWidgetItem
         from PySide6.QtCore import Qt
         editor = dialog.component_editor
-        for combo in editor.purlin_methods.values():
-            combo.setCurrentIndex(combo.findData("declared"))
+        # Full roof-run reference checks use calculated compression, retaining
+        # the real section/length. This fixture supplies synthetic Nt and local
+        # added-ply ratings, not a declared general beam moment/shear capacity.
         for combo in editor.purlin_tension_methods.values():
             combo.setCurrentIndex(combo.findData("declared"))
         for row in range(editor.purlin_table.rowCount()):
@@ -418,10 +422,10 @@ class ComponentWorkspaceTests(unittest.TestCase):
             self.assertIsNotNone(dialog.result)
             self.assertFalse(dialog.result["design"]["passes"])
             self.assertTrue(any(r["ratio"] is None for r in dialog.result["section_checks"].values()))
-            worked = [r for checked in dialog.result["section_checks"].values() for r in checked["case_checks"] if r.get("method") == METHOD and "compression_capacity_kn" in r]
+            worked = [r for checked in dialog.result["section_checks"].values() for r in checked["case_checks"] if r.get("method") in {METHOD,'assigned_half_reference'} and "compression_capacity_kn" in r]
             self.assertTrue(worked)
             self.assertTrue(any(r["axial_kn"] < 0 and r["ratio"] is not None for r in worked))
-            self.assertIn("SIMPLIFIED PURLIN COMPRESSION", dialog.report_text)
+            self.assertIn("PRELIMINARY", dialog.report_text)
             before = dialog.snapshot()
             baseline_sections = copy.deepcopy(dialog.result["design_request"]["sections"])
             dialog.run_auto_size()
@@ -468,7 +472,8 @@ class ComponentWorkspaceTests(unittest.TestCase):
             for r in worked:
                 expected = .9*min(r['tension_gross_area_mm2']*450, .85*.85*.7*r['tension_gross_area_mm2']*480)/1000
                 self.assertAlmostEqual(r['tension_capacity_kn'], expected)
-                self.assertAlmostEqual(r['ratio'], r['axial_kn']/expected+r['bending_ratio'])
+                envelope = max((c['ratio'] for c in r.get('reference_comparisons',[])),default=r['bending_ratio'])
+                self.assertAlmostEqual(r['ratio'], r['axial_kn']/expected+envelope)
             preview = float(editor.purlin_table.item(0, 13).text())
             dialog.criteria_inputs['net_area_factor'].setValue(.5)
             self.assertLess(float(editor.purlin_table.item(0, 13).text()), preview)
@@ -494,6 +499,9 @@ class ComponentWorkspaceTests(unittest.TestCase):
     def test_one_sided_layout_sls_stop_points_to_system_movement_without_adopting_sections(self):
         d = self.dialog()
         try:
+            # Isolate longitudinal SLS navigation. Side-wind/neutral-gravity
+            # stability has separate mechanics and full-envelope regressions.
+            d.context['cases']=[c for c in d.context['cases'] if c.get('wind_family')!='transverse' and not c.get('gravity_only')]
             model = d.layout_editor.model
             for identifier in list(model.pinned):
                 model.toggle(identifier, 'pinned')
@@ -636,6 +644,9 @@ class ComponentWorkspaceTests(unittest.TestCase):
         from PySide6.QtWidgets import QTableWidgetItem
         dialog = self.dialog({'mixed_struts': False, 'wire_rope_ratings': {'12': {'price_per_m': None}}})
         try:
+            # This price/export fixture uses deliberately soft ropes. Keep its
+            # longitudinal cases; their side-wind stability is tested separately.
+            dialog.context['cases']=[c for c in dialog.context['cases'] if c.get('wind_family')!='transverse' and not c.get('gravity_only')]
             editor = dialog.component_editor
             for combo in dialog.brace_combos.values():
                 combo.setCurrentIndex(combo.findText('12 mm WIRE ROPE'))

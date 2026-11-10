@@ -38,10 +38,13 @@ def frame(g, fixed=False):
     return s
 
 
-def fixed_layout(g, end=False):
+def fixed_layout(g, end=False, both_ends=False):
     layout = BracingLayout(g)
+    last=len(g.bay_stations_mm)-2
     for p in layout.panels.values():
-        if p.id.startswith(("left_wall/bay/0", "right_wall/bay/0", "roof/bay/0/")) or (end and p.face == "front_end"):
+        if (p.id.startswith(("left_wall/bay/0", "right_wall/bay/0", "roof/bay/0/"))
+                or both_ends and p.id.startswith((f'left_wall/bay/{last}',f'right_wall/bay/{last}',f'roof/bay/{last}/'))
+                or end and p.face == "front_end"):
             layout.toggle(p.id, "pinned")
     return layout
 
@@ -450,7 +453,9 @@ class DesktopTests(unittest.TestCase):
         profile = min(w.catalog.shs_profiles(), key=lambda p: abs(p.A-1500))
         result = analyse_context(context, profile, profile)
         self.assertEqual(result["status"], "SOLVED_DEMANDS_ONLY")
-        self.assertEqual(len(result["cases"]), 8)
+        self.assertEqual(len(result["cases"]), len(context['cases']))
+        self.assertTrue(any(c['case'].get('gravity_only') for c in result['cases']))
+        self.assertTrue(all(c.get('portal_load_workings') for c in result['cases']))
         self.assertEqual(w.collect_preset_data(), before)
         self.assertEqual(w.structure.springs, springs)
         np.testing.assert_array_equal(w.displacements, movement)
@@ -495,7 +500,7 @@ class DesktopTests(unittest.TestCase):
             dialog.run_button.click()
             self.assertIsNotNone(dialog.result)
             self.assertGreater(dialog.member_table.rowCount(), 0)
-            self.assertEqual(dialog.case_combo.count(), 8)
+            self.assertEqual(dialog.case_combo.count(), len(dialog.result['cases'])+1)
             legacy_end = copy.deepcopy(dialog.context["end_brace"])
             dialog.end_brace_combo.setCurrentIndex((dialog.end_brace_combo.currentIndex()+1) % dialog.end_brace_combo.count())
             self.assertIsNone(dialog.result)

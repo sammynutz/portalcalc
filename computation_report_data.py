@@ -244,6 +244,9 @@ def build_report_data(window, metadata=None):
         "elements": [{"id": e.id, "start": e.start.id, "end": e.end.id, "group": e.group,
                       "analysis_profile": e.profile.name, "length_mm": e.length(), "E_mpa": e.E,
                       "area_mm2": e.A, "I_mm4": e.I} for e in structure.elements],
+        "sway_springs": [{"dofs": [dof + 1 for dof in dofs], "stiffness_n_per_mm": k,
+                          "basis": "Spring on the mean movement of these DOFs (adopted 3D bracing restraint)"}
+                         for dofs, k in getattr(structure, "sway_springs", ())],
     }
     ratio, group, check = window.auto_size_overall_ratio(window.active_auto_size_group_specs())
     from app_metadata import APP_VERSION

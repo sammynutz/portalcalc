@@ -5,6 +5,7 @@ Connection acceptance, geometric stability and production portal sizing remain
 separate. Catalogue search is grouped/iterative, not a global layout optimum.
 """
 from dataclasses import asdict, dataclass, replace
+import functools
 import hashlib
 import json
 import math
@@ -37,6 +38,10 @@ class DesignCriteria:
     sls_divisor: float = 150.
     include_serviceability: bool = True
     global_sls_divisor: float | None = None
+    # Project-adopted: bounded slack play in a single zero-stiffness rod mode
+    # up to this movement counts as stable (turnbuckle pretension takes it up).
+    # 0 accepts none.
+    slack_play_limit_mm: float = 1.
 
     def validate(self):
         for name, value in asdict(self).items():
@@ -45,6 +50,10 @@ class DesignCriteria:
             if name=='include_serviceability':
                 if not isinstance(value,bool):
                     raise AnalysisError('Include serviceability must be true or false')
+                continue
+            if name=='slack_play_limit_mm':
+                if isinstance(value, bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or value < 0:
+                    raise AnalysisError('Accepted slack play must be zero or a positive movement')
                 continue
             if isinstance(value, bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or value <= 0:
                 raise AnalysisError(f"Invalid section-check criterion: {name}")
@@ -341,6 +350,41 @@ def panel_installation_cost(result, rates):
             'allowance': 'Once per installed physical X panel, including both diagonals; roof, side and end walls. SLS diaphragm equivalents excluded.'}
 
 
+def slack_play_assessment(result, limit_mm):
+    """Rod stability over every case: taut tangents, or accepted bounded play.
+
+    Project-adopted: a case whose zero-stiffness modes are all taken up by
+    zero-force or slack rods (every direction and combination verified) within
+    ``limit_mm`` is accepted. Larger play or an escaping direction stays
+    unverified.
+    """
+    accepted, unverified = [], []
+    for case in result['cases']:
+        for status, play, label in ((case['tangent_status'], case.get('slack_play'), case['case']['name']),
+                                    (case.get('bare_sls', {}).get('tangent_status', 'positive_with_taut_rods'),
+                                     case.get('bare_sls', {}).get('slack_play'), case['case']['name']+' (bare SLS)')):
+            if status == 'positive_with_taut_rods':
+                continue
+            # Bounded play, including zero play at zero-force rods, with every
+            # direction (or combination of modes) shown to engage a rod.
+            if (limit_mm > 0 and status in ('slack_play_stability_unverified', 'neutral_rods_required_stability_unverified')
+                    and play and play.get('directions_verified', play['modes'] == 1)
+                    and play['play_mm'] <= limit_mm):
+                accepted.append((label, play['play_mm']))
+            else:
+                unverified.append((label, status, (play or {}).get('play_mm')))
+    evidence = None
+    if accepted or unverified:
+        evidence = {'limit_mm': limit_mm, 'accepted_cases': len(accepted),
+                    'max_accepted_play_mm': max((p for _, p in accepted), default=None),
+                    'unverified_cases': [{'case': c, 'status': s, 'play_mm': p} for c, s, p in unverified[:20]],
+                    'unverified_count': len(unverified),
+                    'basis': 'Project-adopted: zero-stiffness rod modes count as stable when every movement along them, including any combination of '
+                             'modes, extends a zero-force or slack rod within the play limit; turnbuckle pretension, not modelled, takes up the play. '
+                             'Larger play, or a movement that extends no rod, stays unverified.'}
+    return {'stable': not unverified, 'evidence': evidence}
+
+
 def attach_design(result, selections, criteria, rates, context=None):
     criteria.validate()
     if isinstance(selections["strut"], StrutPlan):
@@ -360,7 +404,9 @@ def attach_design(result, selections, criteria, rates, context=None):
     sway_basis=global_sway_basis(result,criteria,context)
     movements = []
     for case in result["cases"]:
-        if case["case"]["level"] != "SLS":
+        # Global longitudinal sway only. Transverse SLS frame sway is reported
+        # separately against the main in-plane criterion and does not govern.
+        if case["case"]["level"] != "SLS" or case["case"].get("wind_family") == "transverse":
             continue
         for node, displacement in zip(result["nodes"], case["displacements_mm"]):
             height = node["point_mm"][2]
@@ -371,18 +417,25 @@ def attach_design(result, selections, criteria, rates, context=None):
     drift = max(movements, key=lambda row: row["ratio"])
     drift.update(included_in_design=criteria.include_serviceability,passes=drift['ratio']<=1)
     drift.update(divisor=sway_basis['divisor'],basis=sway_basis)
-    stable = all(case["tangent_status"] == "positive_with_taut_rods"
-                 and case.get('bare_sls', {}).get('tangent_status', 'positive_with_taut_rods') == 'positive_with_taut_rods'
-                 for case in result["cases"])
+    play = slack_play_assessment(result, criteria.slack_play_limit_mm)
+    stable = play['stable']
     member_sls = [row for check in checks.values() for row in check['case_checks'] if row.get('level')=='SLS']
     sls_pass = drift['passes'] and all(row['ratio'] is not None and row['ratio']<=1 for row in member_sls)
-    passes = all(row["passes"] for row in checks.values()) and (not criteria.include_serviceability or drift["passes"]) and stable
+    from bracing_spacing import max_bay_spacing,spacing_assessment
+    from bracing_layout import BracingLayout
+    physical=(context or {}).get('layout')
+    if physical is None and 'pinned_panels' in result.get('analysis_layout',{}):
+        physical=BracingLayout.from_dict(result['analysis_layout'])
+    maximum=max_bay_spacing(context or {'source_preset':result.get('source_preset',{})})
+    spacing=spacing_assessment(physical,maximum) if physical is not None else {'passes':True,'enforced':False}
+    passes = all(row["passes"] for row in checks.values()) and (not criteria.include_serviceability or drift["passes"]) and stable and spacing['passes']
     request = {"source_hash": result["source_hash"], "sections": {g: candidate_name(c) for g, c in selections.items()},
                "section_properties": {g: candidate_properties(c, criteria) for g, c in selections.items()},
                "net_fracture_multiplier": .85, "criteria": asdict(criteria),
                "cost_rates": {**rates, 'braced_panel_installation': installation['rate_per_panel']}}
     request['stressed_skin'] = result.get('stressed_skin', {}).get('settings', {})
     request['global_sls_basis'] = sway_basis
+    request['max_braced_bay_spacing']=maximum
     if result.get('mullion_basis'):
         request['mullion_basis']=result['mullion_basis']
         request['section_properties']['end_post']=asdict(selections['end_post'].check_properties())
@@ -395,6 +448,7 @@ def attach_design(result, selections, criteria, rates, context=None):
     preliminary = any(c.get('method') == 'assigned_half_reference' for check in checks.values() for c in check.get('case_checks', []))
     brace_screen = any(c.get('method') == 'gross_yield_brace_tension' for check in checks.values() for c in check.get('case_checks', []))
     result["design"] = {"passes": passes, 'preliminary_reference_checks': preliminary,
+                        'layout_spacing':spacing,
                         'strut_sizing_basis':'ULS interaction and required local member/roof serviceability; no global-sway stiffness floor; actual EA retained in analysis',
                         'include_serviceability':criteria.include_serviceability,
                         'design_basis':'Strength + serviceability' if criteria.include_serviceability else 'Strength only',
@@ -402,6 +456,7 @@ def attach_design(result, selections, criteria, rates, context=None):
                         'preliminary_brace_tension_checks': brace_screen,
                         "member_checks_pass": all(r["passes"] for r in checks.values()),
                         "global_sls": drift, "taut_tangent_verified": stable,
+                        'slack_play': play['evidence'],
                         "estimated_cost": sum(row["total"] for row in costs), "cost_items": costs,
                         'materials_and_fittings_cost': materials_and_fittings,
                         'installation_cost': installation['total'],
@@ -412,7 +467,7 @@ def attach_design(result, selections, criteria, rates, context=None):
                                        "selected_scheduled_fittings": {g: {key: c.get(key) for key in
                                            ("forged_turnbuckle", "grade_s_turnbuckle", "fitting_unit_cost")}
                                            for g, c in selections.items() if isinstance(c, dict) and c.get("component_type") == "scheduled_rod"}},
-                        "basis": "Project-schedule rods/ropes use supplied factored brace strengths directly. Other members use the preliminary member engine with explicit 0.85 net-fracture multiplier and configured net-area/kt/effective lengths. One section per steel strut/post/brace group. Strong-axis bending orientation. Wind plus local member self-weight checks only; connections and full load combinations remain separate.",
+                        "basis": "Project-schedule rods/ropes use supplied factored brace strengths directly. Other members use the preliminary member engine with explicit 0.85 net-fracture multiplier and configured net-area/kt/effective lengths. One section per steel strut/post/brace group. Strong-axis bending orientation. Axial actions govern over the recorded 3D load combinations; local member self-weight and purlin bending use their scoped checks. Connections and the full production combination set remain separate.",
                         "cost_basis": "Current Costing rates, exact brace lengths, 7% hollow waste, rolled stock rounding, one listed turnbuckle per rod. Angle fittings, other connections and supplier availability/quotes are not priced."}
     result["limitations"] = [line for line in result["limitations"] if not line.startswith(("Forces are analysis demands only.", "Fixed pinned-panel layout;"))]
     result["limitations"] += [result["design"]["basis"], result["design"]["cost_basis"]]
@@ -455,9 +510,9 @@ def attach_design(result, selections, criteria, rates, context=None):
     return result
 
 
-def solve_selection(context, selections, criteria, rates):
+def solve_selection(context, selections, criteria, rates, reuse_cases=None):
     local = {**context, **{g: selections[g] for g in ("roof_brace", "wall_brace", "end_brace")}}
-    result = analyse_context(local, selections["strut"], selections["end_post"])
+    result = analyse_context(local, selections["strut"], selections["end_post"], reuse_cases=reuse_cases)
     return attach_design(result, selections, criteria, rates, context)
 
 
@@ -481,6 +536,23 @@ def bounded_stiffness_floor(previous, current, factor, ceiling):
 
 
 def fast_sway_proposal(context, result, chosen, candidates, criteria, rates, tried):
+    """Response-guided upgrade with the legacy ranking as a fallback."""
+    if context.get('stiffness_screening', True):
+        from bracing_stiffness_screen import sway_proposal
+        if all(g in tried or not group_members(result, g)
+               for g in ('roof_brace', 'wall_brace', 'end_brace')):
+            tried.clear()
+        try:
+            proposal, evidence = sway_proposal(context, result, chosen, candidates, criteria, rates, tried)
+        except AnalysisError as error:
+            proposal, evidence = None, {'fallback': str(error)}
+        result['stiffness_screening_trial'] = evidence
+        if proposal:
+            return proposal
+    return legacy_sway_proposal(context, result, chosen, candidates, criteria, rates, tried)
+
+
+def legacy_sway_proposal(context, result, chosen, candidates, criteria, rates, tried):
     """One cheap, targeted brace change after local strength sizing.
 
     Compare the cheapest stiffer choice in each brace group by incremental cost
@@ -633,6 +705,55 @@ def balance_compact_braces(context, best, candidates, criteria, rates, floors, b
     return best, records, used
 
 
+def deferred_transverse_sls(search=None, *, final_context=None):
+    """Search without transverse SLS cases, then check the adopted design with them.
+
+    Transverse SLS frame sway is report only. Within a search it can affect
+    only member local-deflection rows and taut-rod stability, so it is solved
+    once on the adopted design rather than on every trial. If that final
+    check fails where the reduced search passed, the search is repeated with
+    every case. The returned result always contains every case.
+    ``final_context(context, *extra_outputs)`` rebuilds the context for the
+    final check when the search also returns a layout.
+    """
+    if search is None:
+        return lambda function: deferred_transverse_sls(function, final_context=final_context)
+
+    @functools.wraps(search)
+    def run(context, selections, candidates, criteria, rates, *args, **kwargs):
+        from bracing_analysis_desktop import transverse_sls
+        if context.get('transverse_sls_deferred') or not any(transverse_sls(c) for c in context['cases']):
+            return search(context, selections, candidates, criteria, rates, *args, **kwargs)
+        reduced = {**context, 'cases': [c for c in context['cases'] if not transverse_sls(c)],
+                   'transverse_sls_deferred': True}
+        outcome = search(reduced, selections, candidates, criteria, rates, *args, **kwargs)
+        result, chosen, rest = outcome[0], outcome[1], tuple(outcome[2:])
+        final = final_context(context, *rest) if final_context is not None else context
+        # The search result is for these sections and layout: solve only the deferred cases.
+        try:
+            full = solve_selection(final, chosen, criteria, rates,
+                                   reuse_cases={c['case']['name']: c for c in result['cases']})
+            final_error = None
+        except AnalysisError as error:
+            # e.g. a Ws-only case with no gravity leaves an unstable rod set.
+            full, final_error = None, str(error)
+        deferral = {'deferred_cases': len(context['cases'])-len(reduced['cases']),
+                    'final_check_passes': bool(full and full['design']['passes']),
+                    **({'final_check_error': final_error} if final_error else {})}
+        if full is None or (result['design']['passes'] and not full['design']['passes']):
+            outcome = search({**context, 'transverse_sls_deferred': True}, selections, candidates, criteria, rates, *args, **kwargs)
+            result, chosen, rest = outcome[0], outcome[1], tuple(outcome[2:])
+            result['transverse_sls_search'] = {**deferral, 'repeated_with_all_cases': True}
+            return (result, chosen, *rest)
+        # Keep the search evidence; analysis and checks come from the full solve.
+        for key, value in result.items():
+            full.setdefault(key, value)
+        full['transverse_sls_search'] = {**deferral, 'repeated_with_all_cases': False}
+        return (full, chosen, *rest)
+    return run
+
+
+@deferred_transverse_sls
 def auto_size(context, selections, candidates, criteria, rates, progress=None, max_solves=18,
               *, fast=False, initial_result=None, retain_brace_stiffness=False):
     """Cheapest candidates for successive demand envelopes; always reanalyse.
@@ -648,6 +769,8 @@ def auto_size(context, selections, candidates, criteria, rates, progress=None, m
     current = dict(selections)
     result = initial_result if initial_result is not None else solve_selection(context, current, criteria, rates)
     initial = result
+    from bracing_sizing_diagnostics import require_layout_spacing
+    require_layout_spacing(result)
     solves = 1
     ceilings = {g: stiffness_ceiling(context, result, g, candidates[g], rates) for g in GROUPS}
     best = (result, dict(current)) if result["design"]["passes"] else None
@@ -656,6 +779,7 @@ def auto_size(context, selections, candidates, criteria, rates, progress=None, m
         floors.update({g: candidate_stiffness(current[g]) for g in ('roof_brace', 'wall_brace', 'end_brace')})
     screens = 0
     local_rounds, sway_tried, sway_adjustments = 0, set(), []
+    stiffness_screen_trials = []
     for iteration in range(max_solves-1):
         if progress:
             progress(iteration, max_solves, f"Sizing round {iteration+1}; best verified cost: " + (f"${best[0]['design']['estimated_cost']:,.2f}" if best else "none yet"))
@@ -667,9 +791,11 @@ def auto_size(context, selections, candidates, criteria, rates, progress=None, m
             best = (result, dict(current))
         if fast and iteration > 0 and result['design']['passes']:
             break
-        if (fast and (local_rounds or retain_brace_stiffness) and criteria.include_serviceability and result['design']['member_checks_pass']
+        if ((fast or context.get('stiffness_screening', True)) and (local_rounds or retain_brace_stiffness or not fast) and criteria.include_serviceability and result['design']['member_checks_pass']
                 and result['design']['taut_tangent_verified'] and result['design']['global_sls']['ratio'] > 1):
             adjustment = fast_sway_proposal(context, result, current, candidates, criteria, rates, sway_tried)
+            if 'stiffness_screening_trial' in result:
+                stiffness_screen_trials.append(result.pop('stiffness_screening_trial'))
             if adjustment:
                 proposed, group = adjustment
                 floors[group] = max(floors[group], candidate_stiffness(proposed[group]))
@@ -687,8 +813,13 @@ def auto_size(context, selections, candidates, criteria, rates, progress=None, m
                 continue
             if best:
                 break
-            raise stop_for_search(initial, result, 'Short targeted brace-stiffness checks exhausted; review the load path')
+            if fast:
+                raise stop_for_search(initial, result, 'Short targeted brace-stiffness checks exhausted; review the load path')
         if not result["design"]["taut_tangent_verified"]:
+            # Slack rod sets return a result rather than raising; as with a
+            # failed trial, keep the best verified design found so far.
+            if best:
+                break
             raise stop_for_search(initial, result, 'Auto-sizing requires verified taut-rod tangent stiffness for every case; review the layout/neutral rods')
         if not fast and criteria.include_serviceability and result["design"]["global_sls"]["ratio"] > 1:
             factor = min(max(result["design"]["global_sls"]["ratio"], 1.12), 2.)
@@ -743,6 +874,7 @@ def auto_size(context, selections, candidates, criteria, rates, progress=None, m
                                 'strut_sizing_basis':'ULS interaction and required local member/roof serviceability; no global-sway stiffness floor'}
     best[0]['sizing_search']['fast'] = fast
     best[0]['sizing_search']['targeted_sway_adjustments'] = sway_adjustments
+    best[0]['sizing_search']['stiffness_screening'] = stiffness_screen_trials
     if fast:
         best[0]['sizing_search']['scope'] = 'Demand-ranked local section sizing; stop after a verified resized pass; optional cost-polish analyses omitted. No least-cost claim.'
     return best

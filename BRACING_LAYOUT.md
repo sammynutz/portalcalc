@@ -22,6 +22,30 @@ an intermediate ridge point is not an invented ground support. A final partial
 longitudinal bay retains its actual length. These are geometric locations,
 not analysis elements or a declaration that every location is structurally suitable.
 
+## Maximum transfer length in bays
+
+The workspace's Maximum braced-bay spacing defaults to 5. Every consecutive
+five-bay group must include a full roof-braced bay aligned with side-wall
+bracing; up to four intervening unbraced bays are permitted. A braced eave
+strip alone is not an intermediate full roof/wall bay. The ends of the
+building are also checked for excessively long unbraced runs.
+
+Before sizing an initial proposal, a short path planner adds the fewest
+intermediate qualifying bays, then favours fewer added panels. It follows
+available full roof/side-wall locations with at most the permitted bay gap.
+This takes O(number of bays × permitted spacing), with no structural trials
+or brute-force panel enumeration to choose the intermediate locations.
+Existing selected/required panels remain. Blocks can move a proposed anchor
+to a nearer bay; if no compliant chain exists, the search reports the spacing
+constraint without silently increasing the limit. Later compaction, relocation
+and deletion proposals must still satisfy the rule before a structural solve.
+
+For 20 bays with retained end bracing, the default arrangement has qualifying
+bays 1, 6, 11, 16 and 20. The explicit project setting is saved at
+`bracing.analysis_3d.layout_search.max_braced_bay_spacing`; legacy jobs use 5.
+It applies to practical and detailed searches, fixed-layout acceptance and
+section-only sizing. Changing it invalidates the checked-result cache.
+
 ## Saved contract and BOLT integration
 
 The preset's optional `bracing.layout` object uses schema
@@ -101,8 +125,10 @@ topology. It adopts only a passing lower total cost
 the original passing layout after bounded alternatives are exhausted. Setting the allowance to zero restores first-pass
 stopping. This is not a single-panel deletion sweep or broad cost search. Default
 caps are six topology trials and twelve exact analyses per sized topology. The
-initial analysis is reused for sizing; a passing input incumbent is verified
-once without repeating catalogue sizing. Mixed strut options are cost-ordered,
+initial analysis is reused for sizing. A passing input layout is also re-sized
+with lighter braces allowed, because its sections may come from older rules or
+another layout; the checked input stays the incumbent if re-sizing fails or is
+not cheaper. Mixed strut options are cost-ordered,
 and the first locally passing priced option is selected; the combined plan and
 all affected adjoining roof runs still require exact acceptance. Local option
 screens recalculate only the changed roof line, including all adjoining bays;
@@ -119,6 +145,27 @@ wall/balanced-end brace proposal, with local refinement only within
 the same twelve-solve cap. Full coupled/group cost-polish searches are skipped.
 The report records total layout
 search time. These caps may stop without a passing result; exclusions never relax.
+
+A passing layout braced on only one side wall, with no end-wall bracing, first
+compares end-wall restraint: the open-side panel at each end, then both outer
+panels at each end. The open side lets the roof twist in plan, so longitudinal
+sway can drive the braced wall to heavy steel; end-wall braces resist the twist.
+Each comparison is re-sized freely and adopted only if exactly checked and
+preferred/cheaper (`twist_restraint_comparison` records it). This applies at any
+span/eave ratio. On a three-sided 24 x 40 m shed it reduced $9,964 (EA 75x75x6
+walls) to $7,654 (20 mm rod walls, 14 mm wire roof, 12 mm wire end walls).
+
+A passing layout with angle/other steel side-wall braces also compares up to two
+extra-bay rod alternatives before compacting, within the same total layout budget.
+The first missing wall bay is chosen in the largest gap between existing wall
+bracing. The additional wall X panel alone is tried first, since struts can
+collect to it without a roof girder; a complete available roof collector at that
+bay is the other alternative. All existing panels and required selections remain.
+The trial starts with the stiffest eligible priced rod, restricts that wall group
+to rods and may size lighter rods during fast section sizing. Missing fitting prices exclude an option. The incumbent angle EA is not imposed on the replacement rod group. Only an exactly checked
+preferred/lower-total-cost result replaces the incumbent, including the additional
+panel installation allowance. This comparison also operates at zero installation
+allowance. It does not change **Size selected layout**, which keeps its panel set.
 
 Older settings without a strategy now open in practical mode with six trials,
 rather than retaining the old 48-trial cost search as the default.
