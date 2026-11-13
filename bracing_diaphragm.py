@@ -25,6 +25,14 @@ BASIS = ('PRELIMINARY SLS roof stressed-skin model using adopted panel flexibili
          'scaling law or a complete ECCS component calculation. Direct-c overrides '
          'remain available. Current applied wind is longitudinal; transverse-wind '
          'response is outside this analysis.')
+CANOPY_BASIS = ('OPEN CANOPY ROOFS follow the main roof setting: one panel per canopy bay '
+                'from the main eave line to the canopy edge purlin, crossed tension-only '
+                'equivalent diagonals on the existing eave and edge nodes. The roof reference '
+                'c and the Rev B geometry proxy apply with a = bay length across ribs and '
+                'b = sloped canopy width along ribs; because the proxy scales with a/b^2, '
+                'a narrow canopy gets a much softer (larger) panel c than the main roof. '
+                'The canopy sheets, eave-line transfer into the main roof and the edge '
+                'purlin collector are assumed continuous; their fasteners are unchecked.')
 WALL_BASIS = ('WALL SENSITIVITY ASSUMPTION: independent trial panel flexibilities for '
               'clad side and end walls. Rev B reference c=6.0 mm/kN applies to a '
               '7 m wide by 6 m high pan-fixed wall; it is a provisional engineering '
@@ -187,6 +195,42 @@ def roof_diaphragm_model(model, layout, point_nodes, settings):
     return enhanced, {'settings': asdict(settings), 'source': NOTE, 'basis': BASIS, 'panels': panels}
 
 
+def canopy_diaphragm_panels(enhanced, layout, point_nodes, settings):
+    """Add one roof-calibrated panel per open-canopy bay; returns panel records.
+
+    Corners are the layout canopy panel vertices (main eave and canopy edge
+    strut-line nodes), so no node is added. The canopy follows the main roof
+    toggle, roof c and rib orientation (ribs fall from eave to canopy edge).
+    """
+    panels = []
+    for panel in layout.panels.values():
+        if not panel.face.startswith('canopy_'):
+            continue
+        bay = int(panel.id.rsplit('/',1)[1])
+        # Vertices: eave y0, edge y0, edge y1, eave y1; diagonals 0-2 and 1-3.
+        root, tip = panel.vertices[0], panel.vertices[1]
+        bay_length = abs(panel.vertices[3][1]-root[1])
+        width = math.hypot(tip[0]-root[0], tip[2]-root[2])
+        s, n = (width, bay_length) if settings.shear_direction == 'along_slope' else (bay_length, width)
+        c, calibration = panel_flexibility(settings,'roof',bay_length,width)
+        props = equivalent_diagonal(s,n,c)
+        identifier = 'diaphragm/'+panel.id
+        ids = []
+        for i,(a,b) in enumerate(panel.diagonals):
+            indices = [point_nodes[tuple(round(float(v),6) for v in point)] for point in (a,b)]
+            member_id = f'{identifier}/{i}'
+            enhanced.add_member(AxialMember(member_id, *indices, props['area_mm2'],
+                props['modulus_mpa'], tension_only=True, kind='roof_diaphragm', panel_id=identifier))
+            ids.append(member_id)
+        panels.append({**props, 'id':identifier, 'bay':bay, 'family':'canopy', 'face':panel.face,
+                       'shear_direction':settings.shear_direction, 'member_ids':ids,
+                       'slope_width_mm':width, 'bay_length_mm':bay_length, 'calibration':calibration,
+                       'implied_longitudinal_flexibility_mm_per_kn':
+                           props['length_mm']**3/(props['ea_kn']*bay_length**2),
+                       'longitudinal_projection':bay_length/props['length_mm']})
+    return panels
+
+
 def stressed_skin_model(model, layout, point_nodes, settings, face_cladding):
     """Add enabled roof/wall families, with fixed bases and no new free nodes."""
     settings.validate()
@@ -195,6 +239,10 @@ def stressed_skin_model(model, layout, point_nodes, settings, face_cladding):
         for panel in evidence['panels']:
             panel.update(family='roof', face='roof', longitudinal_projection=
                          panel['bay_length_mm']/panel['length_mm'])
+        canopy = canopy_diaphragm_panels(enhanced,layout,point_nodes,settings)
+        if canopy:
+            evidence['panels'] += canopy
+            evidence['basis'] += ' '+CANOPY_BASIS
     else:
         enhanced = copy.copy(model)
         enhanced.members = list(model.members)
@@ -253,8 +301,11 @@ def stressed_skin_model(model, layout, point_nodes, settings, face_cladding):
     if settings.side_walls_enabled or settings.end_walls_enabled:
         evidence['basis'] = (evidence['basis']+' '+WALL_BASIS).strip()
     evidence['active'] = settings.active
+    # The canopy count appears only for buildings with open canopies, so
+    # evidence for buildings without them is unchanged.
+    families = ('roof','side_wall','end_wall')+(('canopy',) if layout.geometry.canopies else ())
     evidence['panel_counts'] = {family:sum(p['family']==family for p in evidence['panels'])
-                                for family in ('roof','side_wall','end_wall')}
+                                for family in families}
     evidence['reference_calibrations'] = {family:reference_calibration(family) for family in ('roof','wall')}
     evidence['excluded_open_faces'] = [face for face in ('left_wall','right_wall','front_end','back_end')
         if not face_cladding.get(face,False) and

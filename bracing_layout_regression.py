@@ -165,7 +165,7 @@ class LayoutUITests(unittest.TestCase):
         w.apply_preset_data(saved)
         self.assertEqual(w.bracing_location_layout, saved["bracing"]["layout"])
         self.assertNotIn("Dimensions changed", w.bracing_layout_summary_label.text())
-        w.building_length_input.setText("48")
+        w.set_bays([8000.0] * 6)  # 48 m
         w.update_bracing_layout_summary()
         self.assertIn("Dimensions changed", w.bracing_layout_summary_label.text())
         self.assertEqual(w.bracing_location_layout, saved["bracing"]["layout"])

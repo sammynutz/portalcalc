@@ -159,7 +159,11 @@ def costing_from_structure(self, structure, building_length_m, bay_size_m):
     wb_rate = self.costing_rate_from_input(self.wb_cost_input, "wb_rate_per_kg")
     purlin_rate = self.costing_rate_from_input(self.purlin_cost_input, "purlin_rate_per_kg")
 
-    bay_count = max(1, math.ceil(max(building_length_m, 0.0) / max(bay_size_m, 1e-9)))
+    bays = self.bay_lengths_mm() if hasattr(self, "bay_lengths_mm") else None
+    if bays and abs(sum(bays) / 1000.0 - building_length_m) < 1e-3:
+        bay_count = len(bays)  # the entered bays (they may differ in length)
+    else:
+        bay_count = max(1, math.ceil(max(building_length_m, 0.0) / max(bay_size_m, 1e-9)))
     portal_count = bay_count + 1
 
     frame_weights = {"shs": 0.0, "ub": 0.0, "wb": 0.0}

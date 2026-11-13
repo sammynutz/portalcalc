@@ -14,7 +14,7 @@ from bracing_design import (auto_size, solve_selection, candidate_name, panel_in
                            candidate_stiffness, balance_compact_braces, group_cost,
                            deferred_transverse_sls)
 from bracing_components import StrutPlan, StrutAssembly
-from bracing_layout import BracingLayout
+from bracing_layout import BracingLayout, canopy_bracing
 from bracing_policy import selection_score, family, eligible as policy_eligible
 from bracing_spacing import max_bay_spacing,spacing_assessment,repair_spacing,spacing_text
 
@@ -32,7 +32,12 @@ class LayoutSearchStopped(AnalysisError):
 def layout_context(context, selected):
     """Keep actual and nominal grids aligned by panel ID, without mutating input."""
     original = context['layout']
-    layout = BracingLayout(original.geometry, original.blocked, selected)
+    # Open canopies are braced in the end roof-braced bays (plus spacing-rule bays).
+    selected = set(selected) | canopy_bracing(original.geometry, original.blocked, selected, max_bay_spacing(context))
+    # Portal frame braces placed by the user are retained in every trial; the
+    # X-brace search does not move or remove them.
+    selected |= original.portal_braces
+    layout = BracingLayout(original.geometry, sorted(original.all_blocked), sorted(selected))
     nominal = copy.deepcopy(context.get('nominal_layout', original.to_dict()))
     nominal.update(blocked_panels=sorted(layout.blocked), pinned_panels=sorted(layout.pinned))
     source = copy.deepcopy(context.get('source_preset', {}))
@@ -445,6 +450,111 @@ def practical_seeds(context, required):
         if key and key not in seen:
             seen.add(key)
             yield reason, selected
+
+
+FULL_ROOF = 'Full roof bracing in every bay'
+
+
+def full_roof_seeds(context):
+    """Roof bracing in every bay, for the frame + bracing optimiser.
+
+    A whole-roof plan girder spans between the end walls, so a shed braced on
+    one side wall can resist the plan twist with light braces instead of very
+    stiff end-bay bracing (30 x 40 m three-sided shed with a 6 m canopy:
+    16 mm wire roof, $13,610, against EA 75 roof braces in the end bays).
+    Walls and end-wall restraint follow the practical end-bay layout, with
+    intermediate wall bays added for the braced-bay spacing rule. Leaner
+    variants follow: full roof only in the spacing-rule anchor bays with
+    continuous girders at both eaves, and full roof in alternate bays. Not
+    used by the workspace's Find layout, whose practical sequence is unchanged.
+    """
+    layout = context['layout']
+    g = layout.geometry
+    roof = {p for p in layout.available if p.startswith('roof/')}
+    if not roof:
+        return
+    base = next((selected for reason, selected in practical_seeds(context, set())
+                 if reason == 'End roof/wall bays with end-wall twist restraint'), None)
+    if base is None:
+        base = next((selected for reason, selected in practical_seeds(context, set())
+                     if reason == 'End roof/wall bays'), None)
+    if base is None:
+        return
+    count, strips = len(g.bay_stations_mm)-1, len(g.roof_stations)-1
+    bay_roof = lambda bay: {f'roof/bay/{bay}/strip/{j}' for j in range(strips)} & roof
+    # Leaner whole-roof girders: full roof bays only where the spacing rule
+    # anchors them, with continuous eave girders collecting to them; or full
+    # roof in alternate bays. Exact sizing and the verified total decide.
+    eaves = {f'roof/bay/{bay}/strip/{j}' for bay in range(count) for j in {0, strips-1}} & roof
+    alternate = set().union(*(bay_roof(bay) for bay in range(0, count, 2))) | bay_roof(count-1)
+    patterns = [(FULL_ROOF, roof),
+                ('Full roof bracing in the anchor bays with roof girders at both eaves', eaves),
+                ('Full roof bracing in alternate bays', alternate)]
+    seen = set()
+    for reason, panels in patterns:
+        try:
+            selected = frozenset(repair_spacing(context, set(base) | panels))
+        except AnalysisError:
+            continue
+        if selected not in seen:
+            seen.add(selected)
+            yield reason, set(selected)
+
+
+def portal_brace_seeds(context):
+    """Layouts with portal frame braces on a side wall whose end bays can't take X bracing.
+
+    For the frame + bracing optimiser. The open (or blocked) side gets its own
+    longitudinal support from UB moment frames, instead of relying on the roof
+    to carry that eave's movement across to the braced wall. Patterns: portal
+    braces in that side's end bays with the end-bay roof/wall layout; the same
+    with portal braces in every spacing-rule anchor bay; and end-bay portal
+    braces with a continuous roof girder at that eave. The exact verified
+    total decides. Not used by the workspace's Find layout.
+    """
+    layout = context['layout']
+    g = layout.geometry
+    count = len(g.bay_stations_mm)-1
+    sides = [side for side in ('left', 'right')
+             if all(f'{side}_wall/bay/{b}' not in layout.available for b in {0, count-1})
+             and all(f'portal_{side}/bay/{b}' in layout.available_portals for b in {0, count-1})]
+    if not sides:
+        return
+    seeds = dict(practical_seeds(context, set()))
+    base = seeds.get('End roof/wall bays with end-wall twist restraint') or seeds.get('End roof/wall bays')
+    if base is None:
+        return
+    strips = len(g.roof_stations)-1
+    full_bay = lambda bay: {f'roof/bay/{bay}/strip/{j}' for j in range(strips)}
+    for side in sides:
+        ends = {f'portal_{side}/bay/{b}' for b in {0, count-1}}
+        label = f'{side} wall'
+        try:
+            anchored = repair_spacing(context, set(base) | ends)
+        except AnalysisError:
+            anchored = None
+        patterns = [(f'Portal braces in the {label} end bays', set(base) | ends)]
+        if anchored is not None:
+            # Every anchor bay the spacing rule adds also gets a portal brace on this side.
+            anchor_bays = {b for b in range(count) if full_bay(b) <= anchored}
+            portals = {f'portal_{side}/bay/{b}' for b in anchor_bays} & layout.available_portals
+            patterns.append((f'Portal braces in every {label} anchor bay',
+                             {p for p in anchored if not p.startswith(f'{side}_wall/')} | portals | ends))
+        strip = 0 if side == 'left' else strips-1
+        girder = {f'roof/bay/{b}/strip/{strip}' for b in range(count)}
+        if girder <= layout.available:
+            patterns.append((f'Portal braces in the {label} end bays with a continuous {side}-eave roof girder',
+                             set(base) | ends | girder))
+        seen = set()
+        for reason, selected in patterns:
+            try:
+                selected = repair_spacing(context, selected)
+            except AnalysisError:
+                continue
+            key = frozenset(selected)
+            if key not in seen:
+                seen.add(key)
+                yield reason, selected
 
 
 def twist_restraint_seeds(context, selected):

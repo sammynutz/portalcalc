@@ -147,7 +147,7 @@ class SavedCalculationTests(unittest.TestCase):
         blocked=next(p for p in saved.panels if p.startswith('roof/') and p not in saved.pinned)
         saved.blocked.add(blocked)
         w.bracing_location_layout=saved.to_dict()
-        w.building_length_input.setText(str(float(w.building_length_input.text())+6))
+        w.set_bays(w.bay_lengths_mm()+[6000.0])  # 6 m longer
         w.generate_and_solve()
         # The failure it prevents: the 3D context drops the old blocks, and saving
         # a search result onto the old layout pins a blocked panel.

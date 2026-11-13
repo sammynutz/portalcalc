@@ -18,8 +18,13 @@ def concept_3d_data(self):
 
     length_m = max(float(getattr(self, "concept_building_length_m", 0.0) or self.building_length_input.text()), 0.1)
     bay_size_m = max(float(getattr(self, "concept_bay_size_m", 0.0) or self.bay_size_m_from_ui()), 0.1)
-    bay_count = max(1, math.ceil(length_m / bay_size_m))
-    z_positions = [length_m * i / bay_count for i in range(bay_count + 1)]
+    stations = self.bay_stations_mm() if hasattr(self, "bay_stations_mm") else None
+    if stations and abs(stations[-1] / 1000.0 - length_m) < 1e-3:
+        z_positions = [y / 1000.0 for y in stations]  # the actual gridlines
+    else:
+        bay_count = max(1, math.ceil(length_m / bay_size_m))
+        z_positions = [length_m * i / bay_count for i in range(bay_count + 1)]
+    bay_count = len(z_positions) - 1
     nodes = self.structure.nodes
     node_index = {id(node): index for index, node in enumerate(nodes)}
 

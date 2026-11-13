@@ -1,4 +1,4 @@
-"""Off-screen comparison harness for the experimental Physics Optimise flow."""
+"""Off-screen harness for Optimise (run_physics_structure_optimisation), the only frame optimiser."""
 
 from __future__ import annotations
 
@@ -96,7 +96,6 @@ def evaluate(preset_path: Path) -> dict:
 def run(
     preset_path: Path,
     *,
-    compare_production: bool = False,
     max_truss_depth_mm: float | None = None,
 ) -> dict:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -149,28 +148,6 @@ def run(
                     "report": physics.get("report", ""),
                 },
             }
-            if compare_production:
-                window.apply_preset_data(copy.deepcopy(preset))
-                window.generate_and_solve()
-                production_started = time.perf_counter()
-                production = window.auto_size_current_preset(
-                    show_completion=False,
-                    save_learning=False,
-                )
-                production_wall_seconds = time.perf_counter() - production_started
-                result["production"] = {
-                    **{key: value for key, value in production.items() if key != "report"},
-                    "wall_seconds": production_wall_seconds,
-                    "depths_mm": {
-                        "main": window.depth_input.text(),
-                        "left_addition": window.left_canopy_shallow_depth_input.text(),
-                        "right_addition": window.right_canopy_shallow_depth_input.text(),
-                    },
-                    "sections": {
-                        group: combo.currentText()
-                        for _, combo, group in window.active_auto_size_group_specs()
-                    },
-                }
             return result
     finally:
         window.close()
@@ -184,7 +161,6 @@ def main() -> None:
         type=Path,
         default=Path(__file__).resolve().parent / "presets" / "Truss Deflection Weirdness.json",
     )
-    parser.add_argument("--compare-production", action="store_true")
     parser.add_argument("--evaluate-only", action="store_true")
     parser.add_argument(
         "--max-truss-depth-mm",
@@ -197,7 +173,6 @@ def main() -> None:
         if args.evaluate_only
         else run(
             args.preset,
-            compare_production=args.compare_production,
             max_truss_depth_mm=args.max_truss_depth_mm,
         )
     )

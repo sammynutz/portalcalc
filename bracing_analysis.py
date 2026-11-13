@@ -9,6 +9,8 @@ import math
 
 import numpy as np
 
+from bracing_layout import brace_group
+
 
 class AnalysisError(ValueError):
     pass
@@ -379,7 +381,10 @@ class PortalReduction:
             raise AnalysisError("Invalid portal load vector")
         h = np.zeros((2 * len(self.points), size))
         self.attachment_hosts = []
-        top = [element for element in structure.elements if element.group == "TOP"]
+        # Main roof members first, so a point at the eave keeps its main-roof
+        # host; open canopy roof members host the canopy edge points.
+        top = ([element for element in structure.elements if element.group == "TOP"]
+               + [element for element in structure.elements if element.group in ("LEFT_CANOPY_TOP", "RIGHT_CANOPY_TOP")])
         for index, point in enumerate(self.points):
             found = False
             p = np.asarray(point, dtype=float)
@@ -403,7 +408,7 @@ class PortalReduction:
                 found = True
                 break
             if not found:
-                raise AnalysisError(f"Portal roof attachment {point} does not lie on a TOP element")
+                raise AnalysisError(f"Portal roof attachment {point} does not lie on a TOP or canopy roof element")
         self.h = h
         hf = h[:, self.free]
         kff = self.k[np.ix_(self.free, self.free)]
@@ -506,15 +511,38 @@ class PortalReduction:
         }
 
 
+CANOPY_EDGE = "canopy edge"   # node label suffix for open-canopy edge nodes
+
+
+def building_sway_node(label, height_mm):
+    """True for a node whose longitudinal movement is global building sway.
+
+    Global sway is measured on the main building above ground (portal roof
+    nodes over the columns and roof), not at open canopy edges: a canopy edge
+    moves with its own canopy bracing beyond the column line.
+    """
+    return height_mm > 0 and not str(label).endswith(CANOPY_EDGE)
+
+
 def build_braced_building(layout, portal, strut_area_mm2, roof_brace_area_mm2,
                          wall_brace_area_mm2, end_brace_area_mm2, end_post_area_mm2,
-                         end_post_faces=("front_end", "back_end"), strut_overrides=None, brace_moduli=None):
-    if not layout.pinned:
+                         end_post_faces=("front_end", "back_end"), strut_overrides=None, brace_moduli=None,
+                         canopy_brace_area_mm2=None, portal_brace_sections=None):
+    """Assemble the braced building network.
+
+    ``portal_brace_sections`` is ``{'column': profile, 'beam': profile}`` for the
+    layout's portal frame braces; each is condensed onto the Y translations of
+    its two eave nodes (``bracing_portal_brace``) and listed in
+    ``model.portal_braces`` for recovery.
+    """
+    if not layout.selection:
         raise AnalysisError("Pin the brace panels to analyse in the 3D location editor first. Available panels are not installed braces.")
     if np.max(np.abs(portal.equivalent_load), initial=0) > 1e-8:
         raise AnalysisError("This building-analysis stage requires an unloaded portal macro")
     g = layout.geometry
-    if len(g.roof_stations) * len(g.bay_stations_mm) * 3 > 600:
+    if len(portal.points) != len(g.roof_stations) + len(g.canopies):
+        raise AnalysisError("The portal attachment points must be the roof stations followed by each canopy edge")
+    if (len(g.roof_stations) + len(g.canopies)) * len(g.bay_stations_mm) * 3 > 600:
         raise AnalysisError("This reduced solver supports up to 600 roof DOFs; use fewer bays/panels")
     model = AxialModel3D()
     point_nodes = {}
@@ -532,6 +560,10 @@ def build_braced_building(layout, portal, strut_area_mm2, roof_brace_area_mm2,
     portal_dofs = []
     for i, y in enumerate(g.bay_stations_mm):
         roof = [node((x, y, g.roof_z(x)), f"Portal {i+1}, roof x={x/1000:g} m") for x in g.roof_stations]
+        # Canopy edge nodes follow the roof stations, in the portal point order.
+        for side, _, _ in g.canopies:
+            tip_x, tip_z = g.canopy_tip(side)
+            roof.append(node((tip_x, y, tip_z), f"Portal {i+1}, {side} {CANOPY_EDGE}"))
         dofs = [dof for index in roof for dof in (3*index, 3*index+2)]
         model.add_block(dofs, portal.stiffness)
         roof_grid.append(roof)
@@ -543,6 +575,16 @@ def build_braced_building(layout, portal, strut_area_mm2, roof_brace_area_mm2,
             model.add_member(AxialMember(identifier, roof_grid[i][j], roof_grid[i+1][j],
                                         positive(properties.get("area_mm2", strut_area_mm2), "Strut area"),
                                         modulus_mpa=positive(properties.get("modulus_mpa", 200000.), "Strut modulus"), kind="longitudinal_strut"))
+        # The canopy edge purlin is the strut along each canopy's outer edge;
+        # canopy edge lines are numbered after the roof stations.
+        for k, (side, _, _) in enumerate(g.canopies):
+            j = len(g.roof_stations) + k
+            identifier = f"strut/bay/{i}/line/{j}"
+            properties = (strut_overrides or {}).get(identifier, {})
+            model.add_member(AxialMember(identifier, roof_grid[i][j], roof_grid[i+1][j],
+                                        positive(properties.get("area_mm2", strut_area_mm2), "Canopy edge strut area"),
+                                        modulus_mpa=positive(properties.get("modulus_mpa", 200000.), "Strut modulus"),
+                                        kind="longitudinal_strut"))
     # Intermediate end-wall posts are axial-only in this first model. Their
     # out-of-plane end-pressure bending is represented by the roof/base split.
     for face, y in (("front_end", 0.), ("back_end", g.length_mm)):
@@ -554,17 +596,41 @@ def build_braced_building(layout, portal, strut_area_mm2, roof_brace_area_mm2,
                                             positive(end_post_area_mm2, "End-post area"), kind="end_post"))
     for identifier in sorted(layout.pinned):
         panel = layout.panels[identifier]
-        is_roof = panel.face.startswith("roof")
-        is_end = panel.face in {"front_end", "back_end"}
-        area = roof_brace_area_mm2 if is_roof else end_brace_area_mm2 if is_end else wall_brace_area_mm2
+        kind = brace_group(panel.face)
+        area = {"roof_brace": roof_brace_area_mm2, "end_brace": end_brace_area_mm2,
+                "wall_brace": wall_brace_area_mm2, "canopy_brace": canopy_brace_area_mm2}[kind]
+        if area is None:
+            raise AnalysisError("Select a canopy brace section to analyse braced canopy panels")
         for j, (a, b) in enumerate(panel.diagonals):
             start = node(a, f"{identifier}, base", abs(a[2]) < 1e-6)
             end = node(b, f"{identifier}, base", abs(b[2]) < 1e-6)
             model.add_member(AxialMember(f"brace/{identifier}/{j}", start, end,
                                         positive(area, "Brace area"), tension_only=True,
-                                        modulus_mpa=positive((brace_moduli or {}).get("roof_brace" if is_roof else "end_brace" if is_end else "wall_brace", 200000.), "Brace modulus"),
-                                        kind="roof_brace" if is_roof else "end_brace" if is_end else "wall_brace",
-                                        panel_id=identifier))
+                                        modulus_mpa=positive((brace_moduli or {}).get(kind, 200000.), "Brace modulus"),
+                                        kind=kind, panel_id=identifier))
+    model.portal_braces = []
+    if layout.portal_braces:
+        from bracing_portal_brace import PortalBraceError, PortalBraceFrame
+        sections = portal_brace_sections or {}
+        if sections.get('column') is None or sections.get('beam') is None:
+            raise AnalysisError("Select portal brace column and beam sections to analyse portal braces")
+        for identifier in sorted(layout.portal_braces, key=lambda p: (p.split('/')[0], int(p.split('/')[2]))):
+            face, _, bay = identifier.split('/')
+            bay = int(bay)
+            line = 0 if face == 'portal_left' else len(g.roof_stations)-1
+            a, b = roof_grid[bay][line], roof_grid[bay+1][line]
+            height = model.nodes[a][2]
+            try:
+                frame = PortalBraceFrame(height, g.bay_stations_mm[bay+1]-g.bay_stations_mm[bay],
+                                         sections['column'], sections['beam'])
+            except PortalBraceError as error:
+                raise AnalysisError(str(error)) from None
+            dofs = [3*a+1, 3*b+1]
+            model.add_block(dofs, frame.stiffness)
+            model.portal_braces.append({'id': identifier, 'face': face, 'bay': bay, 'nodes': (a, b), 'dofs': dofs,
+                                        'block': len(model.blocks)-1,
+                                        'x_mm': model.nodes[a][0], 'y_mm': (model.nodes[a][1], model.nodes[b][1]),
+                                        'frame': frame})
     return model, roof_grid, portal_dofs, point_nodes
 
 
@@ -645,17 +711,51 @@ def roof_drag_load_vector(model, layout, point_nodes, drag):
                         for sy,wy in ((ya,1-ry),(yb,ry)):
                             index=point_nodes[tuple(round(v,6) for v in (sx,sy,g.roof_z(sx)))]
                             vector[3*index+1]+=force*wx*wy
-    return vector,[{'face':'roof_friction','signed_y_pressure_kpa':pressure,
-                   'roof_resultant_n':float(vector[1::3].sum()),'direct_ground_resultant_n':0.,
-                   'y_start_m':start/1000,'y_end_m':end/1000}]
+    workings=[{'face':'roof_friction','signed_y_pressure_kpa':pressure,
+               'roof_resultant_n':float(vector[1::3].sum()),'direct_ground_resultant_n':0.,
+               'y_start_m':start/1000,'y_end_m':end/1000}]
+    # Open canopy friction (top and underside) on each canopy's own strip,
+    # shared between the main eave line and the canopy edge nodes.
+    for canopy in drag.get('canopies',()):
+        side=canopy['side']
+        if g.canopy(side) is None:
+            raise AnalysisError(f'Canopy friction was given for a {side} canopy that is not in the bracing layout')
+        part=np.zeros(3*len(model.nodes))
+        c_start,c_end=float(canopy['y_start_m'])*1000,float(canopy['y_end_m'])*1000
+        c_pressure=float(canopy['signed_y_pressure_kpa'])
+        if not all(math.isfinite(v) for v in (c_start,c_end,c_pressure)) or not 0<=c_start<=c_end<=g.length_mm+1e-5:
+            raise AnalysisError('Invalid canopy-friction load strip or pressure')
+        root=g.canopy_root_x(side);tip,tip_z=g.canopy_tip(side)
+        height={root:g.roof_z(root),tip:tip_z}
+        xa,xb=min(root,tip),max(root,tip)
+        for ya,yb in zip(g.bay_stations_mm,g.bay_stations_mm[1:]):
+            lo,hi=max(ya,c_start),min(yb,c_end)
+            if hi<=lo:
+                continue
+            for gx in (-1/math.sqrt(3),1/math.sqrt(3)):
+                rx=.5+gx/2
+                for gy in (-1/math.sqrt(3),1/math.sqrt(3)):
+                    y=(lo+hi)/2+gy*(hi-lo)/2
+                    ry=(y-ya)/(yb-ya)
+                    force=c_pressure/1000*(xb-xa)/2*(hi-lo)/2
+                    for sx,wx in ((xa,1-rx),(xb,rx)):
+                        for sy,wy in ((ya,1-ry),(yb,ry)):
+                            index=point_nodes[tuple(round(v,6) for v in (sx,sy,height[sx]))]
+                            part[3*index+1]+=force*wx*wy
+        vector+=part
+        workings.append({'face':f'{side}_canopy_friction','signed_y_pressure_kpa':c_pressure,
+                         'roof_resultant_n':float(part[1::3].sum()),'direct_ground_resultant_n':0.,
+                         'y_start_m':c_start/1000,'y_end_m':c_end/1000})
+    return vector,workings
 
 
-def load_path_evidence(nodes, result, workings):
+def load_path_evidence(nodes, result, workings, portal_braces=()):
     """Resolve actual member forces at ground, independently of group naming.
 
     X is across the portals, Y is along the building and Z is vertical. End
     braces have no Y projection. Include direct end-post base load separately
     so the ground-applied half of end-wall pressure is not counted as bracing.
+    Portal frame brace base reactions are reported under their face.
     """
     peaks, ground, diaphragm_ground = {}, {}, {}
     for member in result['members']:
@@ -674,6 +774,10 @@ def load_path_evidence(nodes, result, workings):
                     diaphragm_ground[face] += sign*vector
                 ground.setdefault(face,np.zeros(3))
                 ground[face] += sign*vector
+    for brace in portal_braces:
+        ground.setdefault(brace['face'],np.zeros(3))
+        for base in brace['base_reactions_n']:
+            ground[brace['face']] += np.array([0.,base['fy_n'],base['fz_n']])
     roof_y = sum(w['roof_resultant_n'] for w in workings)
     direct_y = sum(w['direct_ground_resultant_n'] for w in workings)
     member_y = sum(v[1] for v in ground.values())
@@ -726,6 +830,20 @@ def solve_building_case(model, layout, portal, portal_dofs, point_nodes, case, m
             reactions += (fx.sum(), 0., fz.sum())
             moments += (y*fz.sum(), np.dot(z, fx)-np.dot(x, fz)-sum(item["m_xz_nmm"] for item in supports), -y*fx.sum())
         portals.append({"index": index, "y_mm": y, **recovered})
+    # Portal frame braces: unloaded condensed wall frames. Their pinned-base
+    # reactions (Y along the building, Z vertical) at (x, y, 0) enter the
+    # balance like the portal supports. Member forces are always recovered:
+    # the brace design checks need them.
+    portal_braces = []
+    for brace in getattr(model, 'portal_braces', ()):
+        recovered = brace['frame'].recover(displacements[brace['dofs']])
+        for base, y in zip(recovered['base_reactions_n'], brace['y_mm']):
+            fy, fz = base['fy_n'], base['fz_n']
+            base['point_mm'] = [brace['x_mm'], y, 0.]
+            reactions += (0., fy, fz)
+            moments += (y*fz, -brace['x_mm']*fz, brace['x_mm']*fy)
+        portal_braces.append({'id': brace['id'], 'face': brace['face'], 'bay': brace['bay'],
+                              'eave_y_mm': displacements[brace['dofs']].tolist(), **recovered})
     # Condensed portal loads are equivalent work at the interfaces, not the
     # physical applied loads. Use original portal nodal forces/moments for
     # global balance, including loads applied directly at native supports.
@@ -763,6 +881,6 @@ def solve_building_case(model, layout, portal, portal_dofs, point_nodes, case, m
     return {"case": case, "load_workings": workings, "nodal_loads_n": loads.reshape((-1,3)).tolist(),
             'network_nodal_loads_n': external.tolist(), 'portal_load_workings': portal_workings,
             'applied_resultant_n': applied_force.tolist(),
-            'load_path':load_path_evidence(model.nodes,result,workings),
-            **result, "portals": portals,
+            'load_path':load_path_evidence(model.nodes,result,workings,portal_braces),
+            **result, "portals": portals, **({"portal_braces": portal_braces} if portal_braces else {}),
             "balance_force_error_n": force_error.tolist(), "balance_moment_error_nmm": moment_error.tolist()}

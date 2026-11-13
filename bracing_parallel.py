@@ -68,6 +68,20 @@ def size_task(context, task):
     return sized if result['design']['passes'] else None
 
 
+def size_cost_task(context, task):
+    """As ``size_task``, but returns (estimated cost, sized selections), or None."""
+    import combined_sizing as shared
+    from bracing_analysis import AnalysisError
+    from bracing_design import auto_size
+    pinned, selections, candidates, criteria = task
+    local = shared._with_layout(context, pinned)
+    try:
+        result, sized = auto_size(local, selections, candidates, criteria, local['cost_rates'], fast=True)
+    except AnalysisError:
+        return None
+    return (result['design']['estimated_cost'], sized) if result['design']['passes'] else None
+
+
 def _run(function, task):
     return function(_CONTEXT, task)
 

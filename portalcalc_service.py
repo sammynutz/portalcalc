@@ -22,6 +22,10 @@ from app_metadata import APP_RELEASE_DATE, APP_VERSION
 
 REQUEST_SCHEMA = "portalcalc.calculation.request.v1"
 RESULT_SCHEMA = "portalcalc.calculation.result.v1"
+# v2: a 3D building (portalcalc.building.v1) checked with per-gridline loads.
+REQUEST_SCHEMA_V2 = "portalcalc.calculation.request.v2"
+RESULT_SCHEMA_V2 = "portalcalc.calculation.result.v2"
+LOAD_BASES = ("building", "legacy_2d")
 DOSSIER_SCHEMA = "portalcalc.calculation.dossier.v1"
 
 SNOW_REGION_K1 = {
@@ -67,6 +71,14 @@ class PreparedCalculationRequest:
     inputs: Mapping[str, Any]
     input_digest: str
     load_policy: Mapping[str, Any]
+    # v2 only: the validated building and the load basis it is checked with.
+    building: Mapping[str, Any] | None = None
+    load_basis: str | None = None
+    representative_gridline: str | None = None
+    # v2: one entry per sizing group, each a separate 2D frame:
+    # {"id", "gridlines", "representative", "inputs"}. ``inputs`` above is the
+    # largest group's.
+    groups: tuple = ()
 
 
 def _plain_json(value: Any) -> Any:
@@ -309,7 +321,7 @@ def prepare_request(raw: Mapping[str, Any]) -> PreparedCalculationRequest:
     if not isinstance(raw, Mapping):
         raise InvalidCalculationRequest("request must be an object")
     schema = str(raw.get("schema", REQUEST_SCHEMA))
-    if schema != REQUEST_SCHEMA:
+    if schema not in (REQUEST_SCHEMA, REQUEST_SCHEMA_V2):
         raise InvalidCalculationRequest(f"unsupported request schema {schema!r}")
     try:
         mode = CalculationMode(str(raw.get("mode")))
@@ -318,9 +330,144 @@ def prepare_request(raw: Mapping[str, Any]) -> PreparedCalculationRequest:
     request_id = str(raw.get("request_id") or "").strip()
     if not request_id:
         raise InvalidCalculationRequest("request_id is required")
+    if schema == REQUEST_SCHEMA_V2:
+        return _prepare_building_request(raw, request_id, mode)
     raw_inputs = raw.get("inputs")
     if not isinstance(raw_inputs, Mapping):
         raise InvalidCalculationRequest("inputs must be an object")
+    frozen_inputs, load_policy = _prepare_frame_inputs(raw_inputs)
+    return PreparedCalculationRequest(
+        schema=schema,
+        request_id=request_id,
+        mode=mode,
+        inputs=frozen_inputs,
+        input_digest=_digest(frozen_inputs),
+        load_policy=load_policy,
+    )
+
+
+def _prepare_building_request(raw: Mapping[str, Any], request_id: str,
+                              mode: CalculationMode) -> PreparedCalculationRequest:
+    """v2: validate the building, then derive and validate the 2D frame inputs.
+
+    The frame preset comes from the sizing group's widest-tributary gridline
+    (an interior frame). Its loads are replaced in the engine by every
+    gridline's own building loads. All v1 input policy applies to it.
+    """
+    from building_loads import scope_issues
+    from building_model import BuildingModel, BuildingModelError
+
+    if "inputs" in raw:
+        raise InvalidCalculationRequest("a v2 request carries 'building', not 'inputs'")
+    options = raw.get("options") or {}
+    if not isinstance(options, Mapping):
+        raise InvalidCalculationRequest("options must be an object")
+    load_basis = str(options.get("load_basis", "building"))
+    if load_basis not in LOAD_BASES:
+        raise InvalidCalculationRequest(f"options.load_basis must be one of {', '.join(LOAD_BASES)}")
+    raw_building = raw.get("building")
+    if not isinstance(raw_building, Mapping):
+        raise InvalidCalculationRequest("building must be an object")
+    try:
+        model = BuildingModel.from_dict(_plain_json(raw_building))
+    except BuildingModelError as exc:
+        raise InvalidCalculationRequest(f"building: {exc}") from exc
+    issues = list(scope_issues(model))
+    if issues:
+        raise UnsupportedCalculationInput("building: " + "; ".join(issues))
+    widths = dict(zip(model.gridline_ids, model.tributary_widths_mm))
+    groups, load_policy = [], None
+    for group in model.resolved_sizing_groups():
+        # Widest tributary; among equals the gridline nearest the group's middle.
+        middle = (len(group.gridlines) - 1) / 2.0
+        representative = max(group.gridlines, key=lambda g: (
+            widths[g], -abs(group.gridlines.index(g) - middle), -group.gridlines.index(g)))
+        inputs, policy = _prepare_frame_inputs(model.frame_preset(representative))
+        load_policy = load_policy or policy
+        groups.append({"id": group.id, "gridlines": list(group.gridlines),
+                       "representative": representative, "inputs": inputs})
+    primary = max(groups, key=lambda g: len(g["gridlines"]))
+    building = _plain_json(model.to_dict())
+    frozen_options = {"load_basis": load_basis}
+    return PreparedCalculationRequest(
+        schema=REQUEST_SCHEMA_V2,
+        request_id=request_id,
+        mode=mode,
+        inputs=primary["inputs"],
+        input_digest=_digest({"building": building, "options": frozen_options}),
+        load_policy=load_policy,
+        building=building,
+        load_basis=load_basis,
+        representative_gridline=primary["representative"],
+        groups=tuple(groups),
+    )
+
+
+def building_with_group_inputs(building: Mapping[str, Any], group_inputs: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """The building with each sizing group's sized frame written back.
+
+    One group: into the frame type and attachments (``building_with_frame_inputs``).
+    Several groups: into each sizing group's ``frame_inputs`` (preset-shaped
+    geometry/sections/canopies), which ``BuildingModel.frame_preset`` applies.
+    """
+    from building_model import BUILDING_GEOMETRY_PREFIXES, MAIN_GEOMETRY_KEYS, BuildingModel
+
+    if len(group_inputs) == 1:
+        return building_with_frame_inputs(building, next(iter(group_inputs.values())))
+    model = BuildingModel.from_dict(_plain_json(dict(building)))
+    result = _plain_json(dict(building))
+    groups = []
+    for group in model.resolved_sizing_groups():
+        inputs = group_inputs[group.id]
+        geometry = {key: value for key, value in (inputs.get("geometry") or {}).items()
+                    if key not in MAIN_GEOMETRY_KEYS and not key.startswith(BUILDING_GEOMETRY_PREFIXES)}
+        canopies = {key: value for key, value in (inputs.get("canopies") or {}).items() if key.endswith("_depth_mm")}
+        frame_inputs = {"geometry": geometry, "sections": dict(inputs.get("sections") or {})}
+        if canopies:
+            frame_inputs["canopies"] = canopies
+        if inputs.get("calculation_service"):
+            frame_inputs["calculation_service"] = dict(inputs["calculation_service"])
+        groups.append({"id": group.id, "gridlines": list(group.gridlines), "frame_inputs": _plain_json(frame_inputs)})
+    result["sizing_groups"] = groups
+    return result
+
+
+def building_with_frame_inputs(building: Mapping[str, Any], frame_inputs: Mapping[str, Any]) -> dict[str, Any]:
+    """The building with its frame type's sections and structural geometry from a sized frame preset.
+
+    Used to return a resubmittable building after autoSize or review. Only the
+    single (portal) frame type is updated; building-level geometry is untouched.
+    """
+    from building_model import BUILDING_GEOMETRY_PREFIXES, MAIN_GEOMETRY_KEYS
+
+    result = _plain_json(dict(building))
+    frame_type = result["frame_types"][0]
+    geometry = frame_inputs.get("geometry") or {}
+    frame_type["geometry"].update({
+        key: value for key, value in geometry.items()
+        if key not in MAIN_GEOMETRY_KEYS and not key.startswith(BUILDING_GEOMETRY_PREFIXES)
+    })
+    sections = frame_inputs.get("sections") or {}
+    attachment_prefixes = tuple(f"{side}_{part}" for side in ("left", "right") for part in ("canopy_", "lean_to_"))
+    frame_type["sections"].update({key: value for key, value in sections.items()
+                                   if not key.startswith(attachment_prefixes)})
+    # Canopy/lean-to members and the (optimised) addition depth belong to the attachment.
+    canopies = frame_inputs.get("canopies") or {}
+    for attachment in result.get("attachments", []):
+        prefix = f"{attachment['side']}_"
+        attachment.setdefault("sections", {}).update({
+            key[len(prefix):]: value for key, value in sections.items()
+            if key.startswith(prefix) and key.startswith(attachment_prefixes)})
+        if f"{prefix}depth_mm" in canopies:
+            attachment.setdefault("properties", {})["depth_mm"] = canopies[f"{prefix}depth_mm"]
+    service = frame_inputs.get("calculation_service")
+    if service:
+        result.setdefault("design_inputs", {})["calculation_service"] = _plain_json(service)
+    return result
+
+
+def _prepare_frame_inputs(raw_inputs: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """v1 input policy for one 2D frame preset: returns (frozen inputs, load policy)."""
     inputs = _plain_json(raw_inputs)
     if isinstance(inputs.get('bracing'),dict):
         # Optional saved UI calculations are evidence, never engine inputs.
@@ -348,15 +495,7 @@ def prepare_request(raw: Mapping[str, Any]) -> PreparedCalculationRequest:
         "effective_live_or_snow_kpa": max(entered_q_kpa, snow["service_kpa"]),
         "rule": "max(abs(Q), snow service pressure)",
     }
-    frozen_inputs = _plain_json(inputs)
-    return PreparedCalculationRequest(
-        schema=schema,
-        request_id=request_id,
-        mode=mode,
-        inputs=frozen_inputs,
-        input_digest=_digest(frozen_inputs),
-        load_policy=load_policy,
-    )
+    return _plain_json(inputs), load_policy
 
 
 class PortalCalcCalculationService:
@@ -380,8 +519,9 @@ class PortalCalcCalculationService:
         governing = dossier.get("overall_governing") or {}
         verified = bool(dossier.get("verified", governing.get("passes_ratio_screen", False)))
         sizing = json_safe((dossier.get("inputs") or request.inputs).get("sections", {}))
+        building_request = request.schema == REQUEST_SCHEMA_V2
         result = {
-            "schema": RESULT_SCHEMA,
+            "schema": RESULT_SCHEMA_V2 if building_request else RESULT_SCHEMA,
             "request_id": request.request_id,
             "status": "proposal" if request.mode is CalculationMode.AUTO_SIZE else "checked",
             "verified": verified,
@@ -398,7 +538,7 @@ class PortalCalcCalculationService:
                 "portalcalc_version": APP_VERSION,
                 "portalcalc_release_date": APP_RELEASE_DATE,
                 "request_schema": request.schema,
-                "result_schema": RESULT_SCHEMA,
+                "result_schema": RESULT_SCHEMA_V2 if building_request else RESULT_SCHEMA,
                 "request_digest_sha256": request.input_digest,
                 "calculated_at": datetime.now(timezone.utc).isoformat(),
                 "mode": request.mode.value,
@@ -411,6 +551,13 @@ class PortalCalcCalculationService:
                 },
             },
         }
+        if building_request:
+            building = dossier.get("building_results")
+            if not isinstance(building, Mapping):
+                raise RuntimeError("PortalCalc backend returned no building results for a v2 request")
+            result["building"] = json_safe(building)
+            result["provenance"]["calculation_policy"]["load_basis"] = request.load_basis
+            result["provenance"]["calculation_policy"]["frame_inputs_from_gridline"] = request.representative_gridline
         # Keep this guarantee at the application boundary, where NumPy scalars
         # and calculation dataclasses must not leak into an adapter response.
         json.dumps(result, sort_keys=True, allow_nan=False)

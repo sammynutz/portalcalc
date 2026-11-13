@@ -155,6 +155,7 @@ from bracing import BracingInputs, approximate_purlin_weak_axis_inertia_mm4, cal
 from bracing_restraint import OPTION as BRACING_3D_RESTRAINT_OPTION, adoption_record as bracing_restraint_adoption_record, restraint_status as bracing_restraint_status
 from elevation_drawings import export_elevation_pdf
 from finishes import CLADDING_PROFILES, COLORBOND_CORE_COLOURS, DEFAULT_FINISHES, colour_hex
+import bay_layout
 import concept_3d
 import costing
 from reduced_optimizer import (
@@ -182,6 +183,7 @@ from wind import (
     wall_surface_for_cpe_case,
     wall_cpe_for_surface,
     opening_area_reduction_factor,
+    open_canopy_cpi,
     free_roof_cpn,
     transverse_free_roof_cpn,
     local_pressure_dimension_a,
@@ -209,7 +211,7 @@ COSTING_DEFAULTS = {
 }
 
 SERVICEABILITY_LIMIT_DEFAULTS = {
-    "column_il1": 100.0,
+    "column_il1": 80.0,   # project-adopted IL1 eave sway H/80 (2026-11-11; was H/100)
     "column_standard": 150.0,
     "storage_eave": 100.0,
     "crane_rail_height": 250.0,
@@ -270,7 +272,19 @@ EAVE_BRACING_PATH_CALIBRATION_FACTOR = 4.0 / 53.0
 WEB_CONNECTION_CFW_LEG_MM = 6.0
 DOUBLED_CHORD_TRIGGER_RATIO = 0.9999
 MAX_DOUBLED_CHORD_LENGTH_FRACTION = 0.30
+# Frame load basis (BUILDING_LOADS_3D_PLAN.md): (combo label, preset value).
+# "single_frame" is today's one-frame "anywhere" envelope; the building
+# options check every gridline's own loads (MainWindow.building_load_mode).
+FRAME_LOAD_BASIS_OPTIONS = (
+    ("Single frame (2D envelope)", "single_frame"),
+    ("Building loads (per gridline)", "building"),
+    ("Building loads, 2D coefficients", "legacy_2d"),
+)
 MAIN_TRUSS_DEPTH_MIN_RATIO = 0.03
+# Eave height is the cladding pitching point; these set the top chord node
+# below it when no girt/purlin section is selected (MainWindow.eave_node_basis).
+GIRT_DEPTH_DEFAULT_MM = 200.0
+PURLIN_DEPTH_DEFAULT_MM = 200.0
 MAIN_TRUSS_DEPTH_START_RATIO = 0.033
 # The optimiser must be able to investigate deeper stiffness/cost basins. The
 # previous 4.5% automatic ceiling excluded verified economical designs such as
@@ -936,7 +950,31 @@ class FrameElement2D:
         dy = self.end.y - self.start.y
         return math.atan2(dy, dx)
 
+    def _cached_matrices(self):
+        """(T, k_local), rebuilt only when geometry or stiffness changes.
+
+        Post-processing evaluates every element for every load combination
+        and trial design; rebuilding these from Python lists each time was a
+        large share of a 2D solve. The arrays are read-only because they are
+        shared between calls.
+        """
+        key = (self.start.x, self.start.y, self.end.x, self.end.y, self.E, self.A, self.I)
+        cached = self.__dict__.get("_matrix_cache")
+        if cached is None or cached[0] != key:
+            transform = self._build_transformation_matrix()
+            stiffness = self._build_local_stiffness()
+            transform.setflags(write=False)
+            stiffness.setflags(write=False)
+            cached = self._matrix_cache = (key, transform, stiffness)
+        return cached[1], cached[2]
+
     def transformation_matrix(self):
+        return self._cached_matrices()[0]
+
+    def local_stiffness(self):
+        return self._cached_matrices()[1]
+
+    def _build_transformation_matrix(self):
         theta = self.angle()
         c = math.cos(theta)
         s = math.sin(theta)
@@ -950,7 +988,7 @@ class FrameElement2D:
             [ 0, 0, 0, 0, 0, 1]
         ])
 
-    def local_stiffness(self):
+    def _build_local_stiffness(self):
         L = self.length()
         E = self.E
         A = self.A
@@ -1035,13 +1073,16 @@ class FrameElement2D:
         f = self.local_end_forces(global_displacements, uniform_local_load)
         return (f[3] - f[0]) / 2.0
 
-    def section_forces_at(self, global_displacements, t, uniform_local_load=None):
-        """Return local axial, shear and bending moment at an element station."""
+    def section_forces_at(self, global_displacements, t, uniform_local_load=None, end_forces=None):
+        """Return local axial, shear and bending moment at an element station.
+
+        ``end_forces`` may pass this element's ``local_end_forces`` for the
+        same displacements and load, already computed, to avoid recomputing."""
         t = min(max(float(t), 0.0), 1.0)
         L = self.length()
         x = t * L
         qx1, qy1, qx2, qy2 = self.load_components(uniform_local_load)
-        f = self.local_end_forces(global_displacements, uniform_local_load)
+        f = end_forces if end_forces is not None else self.local_end_forces(global_displacements, uniform_local_load)
         return (
             -f[0] - qx1 * x - (qx2 - qx1) * x**2 / (2.0 * L),
             f[1] + qy1 * x + (qy2 - qy1) * x**2 / (2.0 * L),
@@ -1098,7 +1139,7 @@ class FrameElement2D:
                 if 0.0 < t < 1.0:
                     station_candidates.append(t)
         station_forces = [
-            self.section_forces_at(global_displacements, station, uniform_local_load)
+            self.section_forces_at(global_displacements, station, uniform_local_load, end_forces=f)
             for station in station_candidates
         ]
         axial_values = [item[0] for item in station_forces]
@@ -1121,6 +1162,72 @@ class FrameElement2D:
 # ==========================================================
 # STRUCTURE
 # ==========================================================
+
+def _element_end_global_load(element, xy, loads):
+    """Global (fx, fy) line load, N/mm, at the end of ``element`` at point ``xy``."""
+    stored = loads.get(element.id)
+    if not stored:
+        return 0.0, 0.0
+    qx1, qy1, qx2, qy2 = element.load_components(stored)
+    at_start = abs(element.start.x - xy[0]) < 1e-6 and abs(element.start.y - xy[1]) < 1e-6
+    qx, qy = (qx1, qy1) if at_start else (qx2, qy2)
+    theta = element.angle()
+    c, s = math.cos(theta), math.sin(theta)
+    return c * qx - s * qy, s * qx + c * qy
+
+
+def _element_at(structure, groups, xy):
+    """(element, end node) of the first element in ``groups`` with an end at ``xy``."""
+    for element in structure.elements:
+        if element.group not in groups:
+            continue
+        for node in (element.start, element.end):
+            if abs(node.x - xy[0]) < 1e-6 and abs(node.y - xy[1]) < 1e-6:
+                return element, node
+    return None, None
+
+
+def apply_eave_strip_loads(structure, strips, weighted_loads):
+    """Point loads at the eave nodes for the envelope outside the frame lines.
+
+    The eave height is the cladding pitching point, above the top chord node,
+    and the roof runs past the column centreline to the wall cladding line.
+    Each strip carries the wall above the node (``wall_mm`` of the column's
+    top line load) and the roof out to the cladding (``roof_mm`` along the
+    slope of the top chord's eave-end line load) to the eave node. A side
+    whose canopy/lean-to roof starts at the eave node has no roof strip: the
+    attachment's members already carry that roof.
+
+    ``weighted_loads`` is [(element load dict, weight)]: the caller excludes
+    loads that do not extend above the node (storage) by snapshot difference.
+    """
+    if not strips or not hasattr(structure, "element_uniform_loads"):
+        return []
+    arrows = []
+    for strip in strips:
+        xy = (strip["x"], strip["y"])
+        parts = []
+        column, node = _element_at(structure, {f"{strip['side']}_COLUMN"}, xy)
+        if column is not None and strip["wall_mm"] > 1e-9:
+            parts.append((column, strip["wall_mm"]))
+        roof, roof_node = _element_at(structure, {"TOP"}, xy)
+        canopy, _ = _element_at(structure, {f"{strip['side']}_CANOPY_TOP"}, xy)
+        if roof is not None and canopy is None and strip["roof_mm"] > 1e-9:
+            parts.append((roof, strip["roof_mm"]))
+            node = node or roof_node
+        fx = fy = 0.0
+        for element, length in parts:
+            for loads, weight in weighted_loads:
+                ex, ey = _element_end_global_load(element, xy, loads)
+                fx += weight * ex * length
+                fy += weight * ey * length
+        if node is None or (abs(fx) < 1e-9 and abs(fy) < 1e-9):
+            continue
+        structure.add_load(node.ux, fx)
+        structure.add_load(node.uy, fy)
+        arrows.append((node.x, node.y, fx, fy))
+    return arrows
+
 
 class Structure2D:
 
@@ -3121,10 +3228,19 @@ class MainWindow(QMainWindow):
         self.support_types = None
         self.load_arrows = None
         self.single_load_arrows = {}
+        # 3D building loads (BUILDING_LOADS_3D_PLAN.md phase 4): None checks the
+        # single "frame anywhere" 2D loads; "building" or "legacy_2d" checks
+        # every distinct gridline's loads instead.
+        self.building_load_mode = None
+        self.building_model_override = None
+        self.building_load_gridlines = None  # one sizing group's gridlines, or None for all
+        self.building_frame_loads = None
+        self._building_loads_cache = None
         self.design_envelope_actions = None
         self.member_check_restraints = None
         self.purlin_layout = None
         self.purlin_check = None
+        self.canopy_purlin_checks = {}
         self.extra_purlin_rows = 0
         self.wall_girt_check = None
         self.end_wall_mullion_design = None
@@ -3193,10 +3309,6 @@ class MainWindow(QMainWindow):
         self._model_history_index = -1
         self._history_suspended = False
         self._clean_model_snapshot = None
-        self.optimisation_surrogate_metrics = {}
-        self.optimisation_warm_start_distance = None
-        self.optimisation_warm_start_trusted = False
-        self.optimisation_learning_summary = "Learning warm start: no prior verified jobs used"
         self.optimisation_load_vector_cache = None
         self.concept_3d_dirty = True
         self.update_window_title()
@@ -3285,11 +3397,6 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.computation_report_action)
 
         file_menu.addSeparator()
-        warm_start_action = QAction("Import Optimiser &Warm Starts...", self)
-        warm_start_action.triggered.connect(self.import_optimiser_warm_starts_dialog)
-        file_menu.addAction(warm_start_action)
-
-        file_menu.addSeparator()
         drawing_action = QAction("Export &Drawing Set...", self)
         drawing_action.triggered.connect(self.export_elevation_sheet)
         file_menu.addAction(drawing_action)
@@ -3329,7 +3436,7 @@ class MainWindow(QMainWindow):
 
         geometry = [
             ("Building", f"{self.span_input.text()} m span x {self.building_length_input.text()} m long"),
-            ("Portal spacing", f"{self.load_bay_size_input.text()} m"),
+            ("Portal spacing", f"{bay_layout.format_bays(self._bay_lengths_mm)} mm"),
             ("Eave / roof", f"{self.eave_input.text()} m / {self.pitch_input.text()} deg {self.current_roof_shape().lower()}"),
             ("Frame", self.frame_system_combo.currentText()),
             ("Internal columns", (
@@ -3808,6 +3915,7 @@ class MainWindow(QMainWindow):
         self.member_check_restraints = None
         self.purlin_layout = None
         self.purlin_check = None
+        self.canopy_purlin_checks = {}
         self.wall_girt_check = None
         self.end_wall_mullion_design = None
         self.end_wall_girt_check = None
@@ -4297,50 +4405,43 @@ class MainWindow(QMainWindow):
         }
 
 
-    def auto_size_profile_step(self, combo, group, step):
-        """Move on a same-family stiffness ladder and describe the applied move."""
-        step = int(step or 0)
-        if step == 0 or combo is None or combo.currentIndex() < 0:
-            return None
-        current_profile = self.selected_profile(combo)
-        if current_profile is None:
-            return None
-        family = self.profile_family_name(current_profile)
-        candidates = []
-        for index in range(combo.count()):
-            profile = self.catalog.get(combo.itemText(index))
-            if profile is None or self.profile_family_name(profile) != family:
-                continue
-            if not self.auto_size_profile_allowed_for_group(profile, group):
-                continue
-            candidates.append((self.auto_size_profile_order_key(profile, group), index, profile))
-        candidates.sort(key=lambda item: item[0])
-        current_position = next(
-            (position for position, (_, index, _) in enumerate(candidates) if index == combo.currentIndex()),
-            None,
-        )
-        if current_position is None:
-            return None
-        target_position = min(max(current_position + step, 0), len(candidates) - 1)
-        _, target_index, target_profile = candidates[target_position]
-        if target_index == combo.currentIndex():
-            return None
-        before = current_profile.name
-        combo.setCurrentIndex(target_index)
-        return {
-            "parameter": group,
-            "before": before,
-            "after": target_profile.name,
-            "requested_steps": step,
-            "applied_steps": target_position - current_position,
-        }
-
-
     def load_catalog(self):
         catalog_path = resource_path("Shape_Catalog.xlsx")
         if not os.path.exists(catalog_path):
             raise FileNotFoundError(f"Could not find Shape_Catalog.xlsx at {catalog_path}")
         self.catalog = ShapeCatalog(catalog_path)
+
+    def canopy_purlin_preset(self, side):
+        """Canopy edge purlin inputs, saved only for an open canopy (so presets
+        and their fingerprints are unchanged for buildings without one)."""
+        if getattr(self, f"{side}_canopy_type_combo").currentText() != "Canopy":
+            return {}
+        return {f"{side}_purlin_section": getattr(self, f"{side}_canopy_purlin_combo").currentText(),
+                f"{side}_purlin_spacing_mm": getattr(self, f"{side}_canopy_purlin_spacing_input").text()}
+
+    def add_canopy_purlin_rows(self, form, side):
+        """Canopy edge purlin inputs and check (open canopies only)."""
+        combo = QComboBox()
+        combo.addItem("Auto (lightest passing)")
+        sections = []
+        for profile in (((self.metroll_tables or {}).get("tables", {}) or {}).get("1A", {}) or {}).get("profiles", []):
+            section = profile.get("section")
+            if section and section not in sections:
+                sections.append(section)
+        combo.addItems(sections)
+        combo.setToolTip("Purlin at the canopy's outer edge. It is also the canopy-edge strut in the 3D bracing model.")
+        spacing = QLineEdit("")
+        spacing.setPlaceholderText("main roof spacing")
+        spacing.setToolTip("Canopy purlin spacing (mm). Blank uses the main roof purlin spacing; the edge purlin carries half of it.")
+        check = QLabel("-")
+        setattr(self, f"{side}_canopy_purlin_combo", combo)
+        setattr(self, f"{side}_canopy_purlin_spacing_input", spacing)
+        setattr(self, f"{side}_canopy_purlin_check_label", check)
+        title = side.capitalize()
+        form.addRow(f"{title} canopy edge purlin", combo)
+        form.addRow(f"{title} canopy purlin spacing (mm)", spacing)
+        form.addRow(f"{title} canopy edge purlin check", check)
+        return [form.labelForField(combo), combo, form.labelForField(spacing), spacing, form.labelForField(check), check]
 
     def load_metroll_tables(self):
         tables_path = resource_path("metroll_megaspan_capacity_tables.json")
@@ -4380,6 +4481,14 @@ class MainWindow(QMainWindow):
             return layout
 
         self.span_input = QLineEdit("30")
+        # Bays are the length input (bay_layout). Building length and the
+        # design bay are derived from them into these two unshown fields, which
+        # the calculations read.
+        self.bays_input = QLineEdit("5*8000")
+        self.bays_input.setPlaceholderText(f"e.g. {bay_layout.EXAMPLE}")
+        self._bay_lengths_mm = [8000.0] * 5
+        self.bays_summary_label = QLabel(bay_layout.summary(self._bay_lengths_mm))
+        self.bays_summary_label.setWordWrap(True)
         self.building_length_input = QLineEdit("40.0")
         self.end_wall_mullion_spacing_override_input = QLineEdit("")
         self.pitch_input = QLineEdit("10")
@@ -4424,7 +4533,8 @@ class MainWindow(QMainWindow):
         supports_layout = geometry_group("Supports / bracing")
 
         main_geometry_layout.addRow("Span (m)", self.span_input)
-        main_geometry_layout.addRow("Building Length (m)", self.building_length_input)
+        main_geometry_layout.addRow("Bays (mm)", self.bays_input)
+        main_geometry_layout.addRow("", self.bays_summary_label)
         main_geometry_layout.addRow("Roof Pitch (deg)", self.pitch_input)
         main_geometry_layout.addRow("Eave Height (m)", self.eave_input)
         main_geometry_layout.addRow("Max truss depth (mm)", self.max_truss_depth_input)
@@ -4436,7 +4546,6 @@ class MainWindow(QMainWindow):
             main_geometry_layout.labelForField(self.rafter_haunch_length_input),
             self.rafter_haunch_length_input,
         ]
-        main_geometry_layout.addRow("Tributary bay size (m)", self.load_bay_size_input)
         internal_columns_layout.addRow("Internal columns", self.internal_column_count_combo)
         internal_columns_layout.addRow("Internal column offset from centre (m)", self.internal_column_offset_input)
         internal_columns_layout.addRow("Positions from left column centreline (m)", self.internal_column_positions_input)
@@ -4650,6 +4759,11 @@ class MainWindow(QMainWindow):
         wind_snow_layout.addRow("North direction in section view", self.wind_orientation_selector)
         wind_snow_layout.addRow("Wall enclosure", self.envelope_plan_selector)
         wind_snow_layout.addRow("Derived frame type", self.derived_frame_type_label)
+        self.frame_load_basis_combo = QComboBox()
+        for label, basis in FRAME_LOAD_BASIS_OPTIONS:
+            self.frame_load_basis_combo.addItem(label, basis)
+        self.frame_load_basis_combo.currentIndexChanged.connect(self.on_frame_load_basis_changed)
+        wind_snow_layout.addRow("Frame loads", self.frame_load_basis_combo)
         geometry_wind_layout.addStretch(1)
 
         tabs.addTab(geometry_wind_tab, "Geometry/Wind")
@@ -4752,16 +4866,11 @@ class MainWindow(QMainWindow):
 
         self.optimise_structure_button = QPushButton("Optimise")
         self.optimise_structure_button.setToolTip(
-            "Adjust truss depth and search catalogue sections for a low-cost verified design, "
-            "including automatic two-size web and doubled-chord assignments."
+            "Search for a low-cost verified design: a fast elastic screen finds the frame's stiffness "
+            "distribution (sections and truss depth), projects it to catalogue sections, then verifies, "
+            "repairs and locally refines the leading designs, including two-size web assignments."
         )
-        self.optimise_structure_button.clicked.connect(self.run_structure_optimisation)
-        self.physics_optimise_button = QPushButton("Physics Optimise")
-        self.physics_optimise_button.setToolTip(
-            "Experimental two-level optimiser: find a low-cost global stiffness distribution in a fast elastic "
-            "screen, project it to catalogue sections, then verify and locally refine only the leading designs."
-        )
-        self.physics_optimise_button.clicked.connect(lambda: self.run_physics_structure_optimisation())
+        self.optimise_structure_button.clicked.connect(lambda: self.run_structure_optimisation())
         self.future_canopy_optimise_button = QPushButton("Future Canopy Optimise")
         self.future_canopy_optimise_button.setToolTip(
             "Optimise with and without the configured cantilever canopy, combine the primary "
@@ -4770,7 +4879,6 @@ class MainWindow(QMainWindow):
         self.future_canopy_optimise_button.clicked.connect(lambda: self.run_future_canopy_optimisation())
         optimiser_buttons = QHBoxLayout()
         optimiser_buttons.addWidget(self.optimise_structure_button)
-        optimiser_buttons.addWidget(self.physics_optimise_button)
         sections_layout.addRow(optimiser_buttons)
         sections_layout.addRow(self.future_canopy_optimise_button)
         self.left_column_profile_combo = QComboBox()
@@ -5008,6 +5116,7 @@ class MainWindow(QMainWindow):
         canopy_layout.addRow("Left canopy bottom check", self.left_canopy_bottom_check_label)
         self.left_canopy_bottom_check_rows = [canopy_layout.labelForField(self.left_canopy_bottom_check_label), self.left_canopy_bottom_check_label]
         self.left_canopy_check_rows.extend(self.left_canopy_bottom_check_rows)
+        self.left_canopy_purlin_rows = self.add_canopy_purlin_rows(canopy_layout, "left")
         canopy_layout.addRow("Left canopy tip deflection", self.left_canopy_deflection_check_label)
         self.left_canopy_deflection_check_rows = [canopy_layout.labelForField(self.left_canopy_deflection_check_label), self.left_canopy_deflection_check_label]
         self.left_canopy_check_rows.extend(self.left_canopy_deflection_check_rows)
@@ -5046,6 +5155,7 @@ class MainWindow(QMainWindow):
         canopy_layout.addRow("Right canopy bottom check", self.right_canopy_bottom_check_label)
         self.right_canopy_bottom_check_rows = [canopy_layout.labelForField(self.right_canopy_bottom_check_label), self.right_canopy_bottom_check_label]
         self.right_canopy_check_rows.extend(self.right_canopy_bottom_check_rows)
+        self.right_canopy_purlin_rows = self.add_canopy_purlin_rows(canopy_layout, "right")
         canopy_layout.addRow("Right canopy tip deflection", self.right_canopy_deflection_check_label)
         self.right_canopy_deflection_check_rows = [canopy_layout.labelForField(self.right_canopy_deflection_check_label), self.right_canopy_deflection_check_label]
         self.right_canopy_check_rows.extend(self.right_canopy_deflection_check_rows)
@@ -5694,7 +5804,7 @@ class MainWindow(QMainWindow):
         self.storage_panel_auto_thickness_checkbox.toggled.connect(lambda _: self.calculate_storage_load_report())
         self.storage_panel_selected_thickness_input.valueChanged.connect(lambda _: self.calculate_storage_load_report())
         self.crane_rating_input.editingFinished.connect(self.apply_crane_rating_to_crane_beam_inputs)
-        self.load_bay_size_input.editingFinished.connect(self.sync_crane_beam_span_to_bay_size)
+        self.bays_input.editingFinished.connect(self.on_bays_edited)
         self.internal_column_count_combo.currentTextChanged.connect(lambda _: self.update_internal_column_visibility())
         self.frame_system_combo.currentTextChanged.connect(lambda _: self.update_frame_system_visibility())
         self.left_support_combo.currentTextChanged.connect(lambda _: self.update_base_spring_visibility())
@@ -5707,8 +5817,8 @@ class MainWindow(QMainWindow):
         self.roof_brace_size_combo.currentTextChanged.connect(lambda _: self.generate_and_solve())
         self.wall_brace_size_combo.currentTextChanged.connect(lambda _: self.generate_and_solve())
         self.end_wall_braced_bay_count_input.valueChanged.connect(lambda _: self.generate_and_solve())
-        for field in (self.span_input, self.building_length_input, self.eave_input, self.pitch_input,
-                      self.load_bay_size_input, self.end_wall_mullion_spacing_override_input):
+        for field in (self.span_input, self.eave_input, self.pitch_input,
+                      self.end_wall_mullion_spacing_override_input):
             field.editingFinished.connect(self.update_bracing_layout_summary)
         self.roof_shape_combo.currentTextChanged.connect(lambda _: self.update_bracing_layout_summary())
         self.ui_theme_combo.currentTextChanged.connect(lambda _: self.apply_ui_theme())
@@ -5737,16 +5847,20 @@ class MainWindow(QMainWindow):
 
     def apply_engineering_tooltips(self):
         tooltips = {
-            "span_input": "Outside-to-outside building span in metres. Column offsets are applied separately when forming the analysis span.",
-            "building_length_input": "Overall building length in metres. Used for wind geometry, bay count, longitudinal bracing paths and costing.",
+            "span_input": "Outside building span (width) in metres, to the outside of the column flanges. The analysis span is between the column centrelines.",
+            "bays_input": ("Portal bays front to back, in mm. Repeat a bay with count*length; separate with commas or spaces, "
+                           "e.g. 7*8000, 7000 or 3*8000 2*7500 8000. The building length is their sum. A single-frame "
+                           "design uses the longest bay as its tributary width and purlin/girt span; building loads give "
+                           "every gridline its own tributary."),
             "pitch_input": "Main roof pitch in degrees.",
-            "eave_input": "Main-frame eave height above the column bases, in metres.",
+            "eave_input": ("Eave height in metres at the roof cladding pitching point (outside of the girts). The top chord "
+                           "node at the column centrelines is lower: eave + (girt + column depth/2) x tan(pitch) - "
+                           "(purlin + top chord depth/2) / cos(pitch). See the results for the working."),
             "max_truss_depth_input": "Optional hard cap for optimiser truss depth, in millimetres. Leave blank to use the automatic maximum: 6% of span plus 5% of eave height above 6 m. An entered value replaces that automatic ceiling.",
             "depth_input": "Main truss outside-to-outside depth in millimetres. Truss analysis offsets chord centrelines inward by half the selected top and bottom chord depths.",
             "roof_shape_combo": "Choose a gable or skillion main roof. This changes geometry and wind-pressure zoning.",
             "frame_system_combo": "Truss uses separate chords and pin-ended webs. Rafter uses a flexural roof member with optional eave haunches.",
             "rafter_haunch_length_input": "Length of the rafter stiffness haunch from each eave, in metres. Used only for rafter frames.",
-            "load_bay_size_input": "Tributary portal spacing in metres. Converts area loads to frame line loads and sets secondary-member spans.",
             "internal_column_count_combo": "Adds internal supports beneath the main roof truss.",
             "internal_column_positions_input": "Enter one distance per internal column, separated by commas, in metres from the left main column centreline. Example: 5, 12, 20 adds three columns. All positions must lie between the main column centrelines.",
             "internal_column_offset_input": "Horizontal offset from building centreline, in metres. Single columns use the signed value; paired columns use +/- the absolute value.",
@@ -5785,6 +5899,13 @@ class MainWindow(QMainWindow):
             ),
             "wind_orientation_selector": "Direction of north when viewing the frame elevation. Used to map regional directional multipliers to frame wind cases.",
             "internal_pressure_combo": "Internal-pressure treatment. Availability depends on wind region and enclosure configuration.",
+            "frame_load_basis_combo": (
+                "Single frame: today's 2D envelope, a full bay of load with the worst end-wind zone on one representative frame.\n"
+                "Building loads: every gridline is checked with its own loads, i.e. half bays at the end frames, end-wind "
+                "roof and side-wall bands by position, Md for each direction, Cpi by opening position and Kc by "
+                "effective surfaces. The optimiser sizes on the governing combinations and verifies on all of them.\n"
+                "Building loads, 2D coefficients: every gridline with today's coefficients, for comparison."
+            ),
             "envelope_plan_selector": "Toggle clad/open walls in plan. These states determine frame enclosure, Cpi treatment and column wind loading.",
             "derived_frame_type_label": "Frame enclosure classification derived from the selected wall states.",
             "wind_case_combo": "Single wind case shown in the load display. Design envelopes still check all generated wind combinations.",
@@ -5916,7 +6037,63 @@ class MainWindow(QMainWindow):
         return self.catalog.get(combo.currentText())
 
     def bay_size_m_from_ui(self):
+        """The design bay (longest bay), m."""
         return float(self.load_bay_size_input.text())
+
+    def bay_lengths_mm(self):
+        """The building's bays front to back, mm (the last valid bay list)."""
+        return list(self._bay_lengths_mm)
+
+    def bay_stations_mm(self):
+        return bay_layout.stations(self._bay_lengths_mm)
+
+    def set_bays(self, bays, text=None):
+        """Adopt a bay list: derive the building length and design bay from it."""
+        bays = [float(b) for b in bays]
+        self._bay_lengths_mm = bays
+        self.bays_input.setText(bay_layout.format_bays(bays) if text is None else text)
+        self.building_length_input.setText(f"{bay_layout.length_mm(bays) / 1000.0:.6f}".rstrip("0").rstrip("."))
+        self.load_bay_size_input.setText(f"{bay_layout.design_bay_mm(bays) / 1000.0:.6f}".rstrip("0").rstrip("."))
+        self.bays_summary_label.setStyleSheet("")
+        self.bays_summary_label.setText(bay_layout.summary(bays))
+
+    def on_bays_edited(self):
+        try:
+            bays = bay_layout.parse_bays(self.bays_input.text())
+        except bay_layout.BayListError as error:
+            self.bays_summary_label.setStyleSheet("color: #c0392b;")
+            self.bays_summary_label.setText(
+                f"{error}. Still using {bay_layout.format_bays(self._bay_lengths_mm)}.")
+            return
+        if bays == self._bay_lengths_mm:
+            self.bays_summary_label.setStyleSheet("")
+            self.bays_summary_label.setText(bay_layout.summary(bays))
+            return
+        self.set_bays(bays, text=self.bays_input.text().strip())
+        self.sync_crane_beam_span_to_bay_size()
+        self.update_bracing_layout_summary()
+        self.mark_concept_3d_dirty()
+
+    def apply_bays_from_preset(self, geometry, loads, wind):
+        """The bay list from a preset; older presets convert from length + bay size."""
+        text = (geometry or {}).get("bays_mm")
+        if text not in (None, ""):
+            try:
+                self.set_bays(bay_layout.parse_bays(text))
+                return
+            except bay_layout.BayListError:
+                pass  # unreadable: fall back to the length and bay size
+        try:
+            length = float((wind or {}).get("building_length_m", self.building_length_input.text())) * 1000.0
+            if (loads or {}).get("bay_size_mm") not in (None, ""):
+                bay = float(loads["bay_size_mm"])
+            elif (loads or {}).get("bay_size_m") not in (None, ""):
+                bay = float(loads["bay_size_m"]) * 1000.0
+            else:
+                bay = float(self.load_bay_size_input.text()) * 1000.0
+            self.set_bays(bay_layout.bays_from_length(length, bay))
+        except (TypeError, ValueError):
+            pass  # keep the current bays
 
     def sync_crane_beam_span_to_bay_size(self):
         try:
@@ -7477,230 +7654,6 @@ class MainWindow(QMainWindow):
     def default_settings_path(self):
         return os.path.join(self.default_preset_dir(), "portal_frame_defaults.json")
 
-    def optimisation_learning_path(self):
-        from licensing import app_data_dir
-
-        return os.path.join(str(app_data_dir()), "optimisation_learning.json")
-
-    def optimisation_job_features(self):
-        def number(widget, default=0.0):
-            try:
-                value = widget.text() if hasattr(widget, "text") else widget.currentText()
-                return float(value)
-            except (AttributeError, TypeError, ValueError):
-                return default
-
-        left_projection = number(self.left_canopy_length_input)
-        right_projection = number(self.right_canopy_length_input)
-
-        def effective_addition_type(type_combo, projection):
-            return type_combo.currentText() if projection > 1e-6 else "None"
-
-        wall_states = self.envelope_plan_selector.wall_states()
-        return {
-            "span_m": number(self.span_input),
-            "eave_m": number(self.eave_input),
-            "pitch_deg": number(self.pitch_input),
-            "bay_m": number(self.load_bay_size_input),
-            "g_kpa": number(self.g_load_input),
-            "q_kpa": number(self.q_load_input),
-            "left_projection_m": left_projection,
-            "right_projection_m": right_projection,
-            "importance": number(self.importance_combo, 2.0),
-            "terrain": number(self.terrain_combo, 2.0),
-            "shs_rate": number(self.shs_cost_input),
-            "ub_rate": number(self.ub_cost_input),
-            "wb_rate": number(self.wb_cost_input),
-            "frame_system": self.frame_system_combo.currentText(),
-            "roof_shape": self.roof_shape_combo.currentText(),
-            "wind_region": self.wind_region_combo.currentText(),
-            "left_type": effective_addition_type(self.left_canopy_type_combo, left_projection),
-            "right_type": effective_addition_type(self.right_canopy_type_combo, right_projection),
-            "left_wall_clad": bool(wall_states.get("left")),
-            "right_wall_clad": bool(wall_states.get("right")),
-            "front_wall_clad": bool(wall_states.get("front")),
-            "back_wall_clad": bool(wall_states.get("back")),
-        }
-
-    def load_optimisation_learning_records(self):
-        path = self.optimisation_learning_path()
-        try:
-            with open(path, "r", encoding="utf-8") as file:
-                data = json.load(file)
-        except (OSError, json.JSONDecodeError, TypeError):
-            return []
-        records = data.get("records", []) if isinstance(data, dict) else []
-        return [record for record in records if isinstance(record, dict)]
-
-    def record_is_warm_start_eligible(self, record):
-        if not isinstance(record.get("sections"), dict) or not record.get("sections"):
-            return False
-        if not isinstance(record.get("section_metrics"), dict) or not record.get("section_metrics"):
-            return False
-        if record.get("verified"):
-            return True
-        return (
-            record.get("quality") == "historical_matrix_seed"
-            and record.get("warm_start_eligible")
-            and isinstance(record.get("features"), dict)
-        )
-
-    def load_optimisation_learning(self):
-        return [
-            record for record in self.load_optimisation_learning_records()
-            if self.record_is_warm_start_eligible(record)
-        ]
-
-    def import_optimiser_warm_starts_dialog(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Import Optimiser Warm Starts",
-            "",
-            "Engineering Matrix (*.xls *.xml *.xlsx);;All files (*.*)",
-        )
-        if not path:
-            return
-        try:
-            summary = self.import_optimiser_warm_starts(path)
-        except Exception as exc:
-            QMessageBox.warning(self, "Import Optimiser Warm Starts", f"Import failed:\n{exc}")
-            return
-        QMessageBox.information(
-            self,
-            "Import Optimiser Warm Starts",
-            (
-                f"Imported {summary['imported']} historical warm-start seed(s).\n"
-                f"Skipped {summary['skipped']} row(s).\n\n"
-                "These seeds guide optimisation starts only; they never bypass final verification."
-            ),
-        )
-
-    def xml_spreadsheet_rows(self, path):
-        namespace = {"ss": "urn:schemas-microsoft-com:office:spreadsheet"}
-        root = ET.parse(path).getroot()
-        worksheet = root.find("ss:Worksheet", namespace)
-        if worksheet is None:
-            worksheet = root.find(".//ss:Worksheet", namespace)
-        if worksheet is None:
-            return []
-        rows = []
-        for row in worksheet.findall(".//ss:Table/ss:Row", namespace):
-            values = []
-            column = 1
-            for cell in row.findall("ss:Cell", namespace):
-                index_text = cell.attrib.get("{urn:schemas-microsoft-com:office:spreadsheet}Index")
-                if index_text:
-                    while column < int(index_text):
-                        values.append("")
-                        column += 1
-                data = cell.find("ss:Data", namespace)
-                values.append("" if data is None or data.text is None else str(data.text).strip())
-                column += 1
-            rows.append(values)
-        return rows
-
-    def workbook_rows_for_warm_start_import(self, path):
-        with open(path, "rb") as file:
-            signature = file.read(64).lstrip()
-        if signature.startswith(b"<?xml") or b"<Workbook" in signature:
-            return self.xml_spreadsheet_rows(path)
-        workbook = load_workbook(path, read_only=True, data_only=True)
-        worksheet = workbook[workbook.sheetnames[0]]
-        return [
-            ["" if value is None else str(value).strip() for value in row]
-            for row in worksheet.iter_rows(values_only=True)
-        ]
-
-    def parse_matrix_number(self, value, default=0.0):
-        match = re.search(r"-?\d+(?:\.\d+)?", str(value or ""))
-        return float(match.group(0)) if match else default
-
-    def parse_matrix_bay_metres(self, value):
-        text = str(value or "")
-        matches = re.findall(r"(?:(\d+)\s*\*)?\s*(\d+(?:\.\d+)?)", text)
-        total_length = 0.0
-        total_count = 0
-        for count_text, length_text in matches:
-            count = int(count_text) if count_text else 1
-            length = float(length_text)
-            if length > 50.0:
-                length /= 1000.0
-            total_length += count * length
-            total_count += count
-        return total_length / total_count if total_count else 0.0
-
-    def parse_matrix_roof(self, value):
-        text = str(value or "").strip()
-        pitch = self.parse_matrix_number(text, 0.0)
-        roof_shape = "Curved" if "CURVED" in text.upper() else "Gable"
-        return roof_shape, pitch
-
-    def parse_matrix_importance(self, value):
-        return self.parse_matrix_number(value, 2.0)
-
-    def parse_matrix_wind_region(self, value):
-        text = str(value or "").upper()
-        match = re.search(r"REGION\s*([A-D]\d?|N\d?|W\d?)", text)
-        if not match:
-            match = re.search(r"\b([A-D]\d?|N\d?|W\d?)\b", text)
-        return match.group(1) if match else ""
-
-    def matrix_addition_type(self, canopy_value, lean_to_value):
-        if str(lean_to_value or "").strip():
-            return "Lean-to"
-        if str(canopy_value or "").strip():
-            return "Canopy"
-        return "None"
-
-    def catalog_profile_key(self, value):
-        text = str(value or "").upper().replace("×", "X")
-        family = ""
-        if "SHS" in text:
-            family = "SHS"
-        elif "RHS" in text:
-            family = "RHS"
-        elif re.search(r"(^|[^A-Z])UB([^A-Z]|$)|UB", text):
-            family = "UB"
-        else:
-            return None
-        numbers = [float(number) for number in re.findall(r"\d+(?:\.\d+)?", text)]
-        if family == "UB" and len(numbers) >= 2:
-            return family, round(numbers[0], 1), round(numbers[1], 1)
-        if family == "SHS":
-            if len(numbers) >= 3 and abs(numbers[0] - numbers[1]) < 1e-6:
-                return family, round(numbers[0], 1), round(numbers[2], 2)
-            if len(numbers) >= 2:
-                return family, round(numbers[0], 1), round(numbers[1], 2)
-        if family == "RHS" and len(numbers) >= 3:
-            return family, round(numbers[0], 1), round(numbers[1], 1), round(numbers[2], 2)
-        return None
-
-    def profile_from_matrix_text(self, value):
-        key = self.catalog_profile_key(value)
-        if key is None:
-            return None
-        exact = []
-        same_family = []
-        for profile in self.catalog.all_profiles():
-            profile_key = self.catalog_profile_key(profile.name)
-            if profile_key is None or profile_key[0] != key[0]:
-                continue
-            if profile_key == key:
-                exact.append(profile)
-            same_family.append((profile_key, profile))
-        if exact:
-            return min(exact, key=lambda profile: profile.name)
-        if key[0] == "UB" and len(key) == 3:
-            depth, mass = key[1], key[2]
-            candidates = [
-                (abs(profile_key[1] - depth), abs(profile_key[2] - mass), profile)
-                for profile_key, profile in same_family
-                if len(profile_key) == 3 and abs(profile_key[1] - depth) <= 1.0
-            ]
-            if candidates:
-                return min(candidates, key=lambda item: (item[0], item[1], item[2].name))[2]
-        return None
-
     def profile_family_name(self, profile_or_name):
         name = profile_or_name.name if hasattr(profile_or_name, "name") else str(profile_or_name or "")
         text = name.upper()
@@ -7708,374 +7661,6 @@ class MainWindow(QMainWindow):
             if re.search(rf"(^|[^A-Z]){token}([^A-Z]|$)", text):
                 return token
         return ""
-
-    def matrix_row_seed_records(self, headers, row):
-        values = {header: row[index] if index < len(row) else "" for index, header in enumerate(headers)}
-        if str(values.get("Inactive", "")).strip().lower() == "yes":
-            return []
-        span_m = self.parse_matrix_number(values.get("Width"))
-        eave_m = self.parse_matrix_number(values.get("Eave Height"))
-        bay_m = self.parse_matrix_bay_metres(values.get("Bays"))
-        roof_shape, pitch_deg = self.parse_matrix_roof(values.get("Roof Type & Pitch"))
-        wind_region = self.parse_matrix_wind_region(values.get("Wind Region"))
-        if span_m <= 0.0 or eave_m <= 0.0 or bay_m <= 0.0:
-            return []
-
-        projection_m = max(
-            self.parse_matrix_number(values.get("Canopy")),
-            self.parse_matrix_number(values.get("Lean-to")),
-        )
-        addition_type = self.matrix_addition_type(values.get("Canopy"), values.get("Lean-to")) if projection_m > 1e-6 else "None"
-        base_features = {
-            "span_m": span_m,
-            "eave_m": eave_m,
-            "pitch_deg": pitch_deg,
-            "bay_m": bay_m,
-            "importance": self.parse_matrix_importance(values.get("Building Importance Level")),
-            "frame_system": "Truss",
-            "roof_shape": roof_shape,
-            "wind_region": wind_region,
-            "matrix_wall_configuration": values.get("Wall Configuration", ""),
-        }
-        sections = {}
-        mapping = [
-            ("Main Column Member UB/RHS/SHS", ["LEFT_COLUMN", "RIGHT_COLUMN"]),
-            ("Chord Members", ["TOP", "BOTTOM"]),
-            ("Web Members", ["WEB"]),
-            ("Lean-to Column Member", ["LEFT_LEAN_COLUMN"]),
-            ("Canopy Rafter Type", ["LEFT_CANOPY_TOP", "LEFT_CANOPY_BOTTOM"]),
-            ("Lean-to Rafter Type", ["LEFT_CANOPY_TOP", "LEFT_CANOPY_BOTTOM"]),
-        ]
-        for column, groups in mapping:
-            profile = self.profile_from_matrix_text(values.get(column))
-            if profile is None:
-                continue
-            for group in groups:
-                sections[group] = profile.name
-        if not sections:
-            return []
-        section_metrics = {}
-        for group, name in sections.items():
-            profile = self.catalog.get(name)
-            if profile is not None:
-                section_metrics[group] = float(self.auto_size_profile_metric(profile, group))
-        depth = self.parse_matrix_number(values.get("Truss Depth"))
-        depths = {"main": depth} if depth > 0.0 else {}
-
-        side_variants = [("left", addition_type, projection_m)]
-        if addition_type != "None":
-            side_variants.append(("right", addition_type, projection_m))
-        records = []
-        for side, side_type, side_projection in side_variants:
-            features = dict(base_features)
-            features.update({
-                "left_type": side_type if side == "left" else "None",
-                "right_type": side_type if side == "right" else "None",
-                "left_projection_m": side_projection if side == "left" else 0.0,
-                "right_projection_m": side_projection if side == "right" else 0.0,
-            })
-            records.append({
-                "version": 1,
-                "verified": False,
-                "warm_start_eligible": True,
-                "quality": "historical_matrix_seed",
-                "trusted_for_shortcut": False,
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "source": {
-                    "type": "engineering_matrix",
-                    "job_number": values.get("Job Number", ""),
-                    "project": values.get("Project", ""),
-                },
-                "features": features,
-                "sections": sections,
-                "section_metrics": section_metrics,
-                "web_assignments": {},
-                "depths": depths,
-            })
-        return records
-
-    def import_optimiser_warm_starts(self, path):
-        rows = self.workbook_rows_for_warm_start_import(path)
-        if not rows:
-            return {"imported": 0, "skipped": 0}
-        headers = [str(value).strip() for value in rows[0]]
-        records = self.load_optimisation_learning_records()
-        existing_keys = {
-            (
-                str((record.get("source") or {}).get("type", "")),
-                str((record.get("source") or {}).get("job_number", "")),
-                str(record.get("features", {}).get("left_type", "")),
-                str(record.get("features", {}).get("right_type", "")),
-            )
-            for record in records
-        }
-        imported = 0
-        skipped = 0
-        for row in rows[1:]:
-            seed_records = self.matrix_row_seed_records(headers, row)
-            if not seed_records:
-                skipped += 1
-                continue
-            row_imported = 0
-            for record in seed_records:
-                key = (
-                    "engineering_matrix",
-                    str((record.get("source") or {}).get("job_number", "")),
-                    str(record.get("features", {}).get("left_type", "")),
-                    str(record.get("features", {}).get("right_type", "")),
-                )
-                if key in existing_keys:
-                    continue
-                existing_keys.add(key)
-                records.append(record)
-                imported += 1
-                row_imported += 1
-            if not row_imported:
-                skipped += 1
-        records = records[-2000:]
-        path = self.optimisation_learning_path()
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as file:
-                json.dump({"version": 1, "records": records}, file, indent=2)
-        except OSError:
-            return {"imported": 0, "skipped": len(rows) - 1}
-        return {"imported": imported, "skipped": skipped}
-
-    def optimisation_feature_distance(self, current, previous):
-        previous = dict(previous or {})
-        if float(previous.get("left_projection_m") or 0.0) <= 1e-6:
-            previous["left_type"] = "None"
-        if float(previous.get("right_projection_m") or 0.0) <= 1e-6:
-            previous["right_type"] = "None"
-        scales = {
-            "span_m": 10.0, "eave_m": 5.0, "pitch_deg": 15.0, "bay_m": 4.0,
-            "g_kpa": 0.5, "q_kpa": 0.5, "left_projection_m": 8.0,
-            "right_projection_m": 8.0, "importance": 1.0, "terrain": 1.0,
-            "shs_rate": 1.0, "ub_rate": 1.0, "wb_rate": 1.0,
-        }
-        terms = []
-        for key, scale in scales.items():
-            if key not in previous:
-                continue
-            terms.append(((float(current.get(key, 0.0)) - float(previous.get(key, 0.0))) / scale) ** 2)
-        for key in (
-            "frame_system", "roof_shape", "wind_region", "left_type", "right_type",
-            "left_wall_clad", "right_wall_clad", "front_wall_clad", "back_wall_clad",
-        ):
-            if key not in previous:
-                continue
-            terms.append(1.0 if current.get(key) != previous.get(key) else 0.0)
-        return math.sqrt(sum(terms) / max(len(terms), 1))
-
-    def optimisation_surrogate_prediction(self):
-        current = self.optimisation_job_features()
-        neighbours = []
-        for record in self.load_optimisation_learning():
-            distance = self.optimisation_feature_distance(current, record.get("features", {}))
-            if distance <= 1.5:
-                neighbours.append((distance, record))
-        neighbours.sort(key=lambda item: item[0])
-        neighbours = neighbours[:8]
-        if not neighbours:
-            return None
-        weights = [
-            (1.0 if record.get("verified") else 0.35) / (distance + 0.08) ** 2
-            for distance, record in neighbours
-        ]
-
-        def weighted_value(path, default=None):
-            values = []
-            for weight, (_, record) in zip(weights, neighbours):
-                value = record
-                for key in path:
-                    value = value.get(key) if isinstance(value, dict) else None
-                if value is not None:
-                    values.append((weight, float(value)))
-            if not values:
-                return default
-            return sum(weight * value for weight, value in values) / sum(weight for weight, _ in values)
-
-        groups = set()
-        for _, record in neighbours:
-            groups.update((record.get("section_metrics") or {}).keys())
-        verified_count = sum(1 for _, record in neighbours if record.get("verified"))
-        historical_count = len(neighbours) - verified_count
-        return {
-            "sample_count": len(neighbours),
-            "verified_count": verified_count,
-            "historical_count": historical_count,
-            "nearest_distance": neighbours[0][0],
-            "nearest_sections": copy.deepcopy(neighbours[0][1].get("sections", {})),
-            "nearest_web_assignments": copy.deepcopy(neighbours[0][1].get("web_assignments", {})),
-            "nearest_trusted_for_shortcut": False,
-            "nearest_quality": neighbours[0][1].get("quality", "unknown"),
-            "section_metrics": {group: weighted_value(("section_metrics", group)) for group in groups},
-            "depths": {
-                key: weighted_value(("depths", key))
-                for key in ("main", "left", "right")
-            },
-        }
-
-    def apply_optimisation_warm_start(self, active_specs):
-        prediction = self.optimisation_surrogate_prediction()
-        self.optimisation_surrogate_metrics = {}
-        self.optimisation_warm_start_distance = None
-        self.optimisation_warm_start_trusted = False
-        if prediction is None:
-            self.optimisation_learning_summary = "Learning warm start: no similar verified jobs found"
-            return False
-        changed = False
-        self.optimisation_warm_start_distance = prediction["nearest_distance"]
-        self.optimisation_warm_start_trusted = False
-        self.optimisation_surrogate_metrics = {
-            group: value for group, value in prediction["section_metrics"].items() if value is not None
-        }
-        nearest_quality = prediction.get("nearest_quality", "")
-        historical_neighbour = nearest_quality == "historical_matrix_seed"
-        seen_combos = set()
-        for _, combo, group in active_specs:
-            if id(combo) in seen_combos:
-                continue
-            seen_combos.add(id(combo))
-            target_metric = self.optimisation_surrogate_metrics.get(group)
-            if not target_metric:
-                continue
-            nearest_section = prediction["nearest_sections"].get(group)
-            exact_threshold = 0.75 if historical_neighbour else 0.10
-            exact_name = nearest_section if prediction["nearest_distance"] <= exact_threshold else None
-            exact_index = combo.findText(exact_name) if exact_name else -1
-            if exact_name and exact_index < 0:
-                exact_index = next(
-                    (
-                        index for index in range(combo.count())
-                        if getattr(self.catalog.get(combo.itemText(index)), "name", None) == exact_name
-                    ),
-                    -1,
-                )
-            if exact_index >= 0 and not self.auto_size_profile_allowed_for_group(self.catalog.get(combo.itemText(exact_index)), group):
-                exact_index = -1
-            if exact_index >= 0:
-                index = exact_index
-                if combo.currentIndex() != index:
-                    combo.setCurrentIndex(index)
-                    changed = True
-                continue
-            preferred_family = self.profile_family_name(nearest_section) if historical_neighbour else ""
-            candidates = []
-            for index in self.auto_size_candidate_indices(combo, group, min_metric_step=0.0):
-                profile = self.catalog.get(combo.itemText(index))
-                if preferred_family and self.profile_family_name(profile) != preferred_family:
-                    continue
-                metric = self.auto_size_profile_metric(profile, group)
-                candidates.append((abs(math.log(max(metric, 1e-12) / target_metric)), self.auto_size_profile_cost_key(profile), index))
-            if not candidates and preferred_family:
-                for index in self.auto_size_candidate_indices(combo, group, min_metric_step=0.0):
-                    profile = self.catalog.get(combo.itemText(index))
-                    metric = self.auto_size_profile_metric(profile, group)
-                    candidates.append((abs(math.log(max(metric, 1e-12) / target_metric)), self.auto_size_profile_cost_key(profile), index))
-            if candidates:
-                index = min(candidates)[2]
-                if combo.currentIndex() != index:
-                    combo.setCurrentIndex(index)
-                    changed = True
-        for key, widget in (
-            ("main", self.depth_input),
-            ("left", self.left_canopy_shallow_depth_input),
-            ("right", self.right_canopy_shallow_depth_input),
-        ):
-            value = prediction["depths"].get(key)
-            if value and value > 0.0:
-                text = f"{self.round_up_to_increment(value, 50.0):.0f}"
-                if widget.text() != text:
-                    widget.setText(text)
-                    changed = True
-        self.optimisation_learning_summary = (
-            f"Learning warm start: {prediction['verified_count']} verified job(s), "
-            f"{prediction['historical_count']} historical seed(s), "
-            f"nearest normalized distance {prediction['nearest_distance']:.3f}"
-        )
-        if prediction["nearest_distance"] <= 0.10 and prediction["nearest_web_assignments"]:
-            self.auto_web_profile_assignments = {
-                group: {int(member): name for member, name in assignments.items()}
-                for group, assignments in prediction["nearest_web_assignments"].items()
-            }
-            self.auto_web_assignment_basis = {
-                group: self.web_assignment_basis_signature(group)
-                for group in self.auto_web_profile_assignments
-            }
-            changed = True
-        return changed
-
-    def save_optimisation_learning(self, active_specs, final_ratio):
-        if not active_specs:
-            return False
-        records = self.load_optimisation_learning_records()
-        features = self.optimisation_job_features()
-        section_metrics = {}
-        sections = {}
-        for _, combo, group in active_specs:
-            profile = self.selected_profile(combo)
-            sections[group] = combo.currentText()
-            section_metrics[group] = float(self.auto_size_profile_metric(profile, group))
-        record = {
-            "version": 1,
-            "verified": True,
-            "quality": "verified_feasible_incumbent",
-            "confirmation_count": 1,
-            "trusted_for_shortcut": False,
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "features": features,
-            "sections": sections,
-            "section_metrics": section_metrics,
-            "web_assignments": copy.deepcopy(self.auto_web_profile_assignments),
-            "depths": {
-                "main": float(self.depth_input.text()),
-                "left": float(self.left_canopy_shallow_depth_input.text()),
-                "right": float(self.right_canopy_shallow_depth_input.text()),
-            },
-            "total_cost": float((self.costing_summary or {}).get("total_cost", 0.0)),
-            "governing_ratio": float(final_ratio),
-        }
-        duplicates = [
-            item for item in records
-            if item.get("verified") and self.optimisation_feature_distance(features, item.get("features", {})) <= 0.01
-        ]
-        records = [
-            item for item in records
-            if self.optimisation_feature_distance(features, item.get("features", {})) > 0.01
-        ]
-        if duplicates:
-            incumbent = min(duplicates, key=lambda item: float(item.get("total_cost", float("inf"))))
-            def normalized_assignments(value):
-                return {
-                    str(group): {str(member): name for member, name in assignments.items()}
-                    for group, assignments in (value or {}).items()
-                }
-            same_design = (
-                incumbent.get("sections") == record["sections"]
-                and incumbent.get("depths") == record["depths"]
-                and normalized_assignments(incumbent.get("web_assignments"))
-                == normalized_assignments(record["web_assignments"])
-            )
-            incumbent_cost = float(incumbent.get("total_cost", float("inf")))
-            if same_design and record["total_cost"] <= incumbent_cost * 1.005:
-                record["confirmation_count"] = int(incumbent.get("confirmation_count", 1)) + 1
-                record["trusted_for_shortcut"] = False
-            elif record["total_cost"] >= incumbent_cost - 1e-6:
-                record = incumbent
-        records.append(record)
-        verified_records = [item for item in records if item.get("verified")]
-        seed_records = [item for item in records if not item.get("verified")]
-        records = seed_records[-1750:] + verified_records[-250:]
-        path = self.optimisation_learning_path()
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as file:
-                json.dump({"version": 1, "records": records}, file, indent=2)
-        except OSError:
-            return False
-        return True
 
     def factory_defaults_paths(self):
         if getattr(sys, "frozen", False):
@@ -8132,6 +7717,8 @@ class MainWindow(QMainWindow):
             "version": 1,
             "geometry": {
                 "span_mm": mm_text_from_metres_widget(self.span_input),
+                # The length input; wind.building_length_m and loads.bay_size_* are derived from it.
+                "bays_mm": bay_layout.format_bays(self._bay_lengths_mm),
                 "roof_pitch_deg": self.pitch_input.text(),
                 "eave_height_mm": mm_text_from_metres_widget(self.eave_input),
                 "max_truss_depth_mm": self.max_truss_depth_input.text(),
@@ -8179,6 +7766,7 @@ class MainWindow(QMainWindow):
                 "left_g_kpa": self.left_canopy_g_load_input.text(),
                 "left_q_kpa": self.left_canopy_q_load_input.text(),
                 "left_solar_kpa": self.left_canopy_solar_load_input.text(),
+                **self.canopy_purlin_preset("left"),
                 "right_length_mm": mm_text_from_metres_widget(self.right_canopy_length_input),
                 "right_type": self.right_canopy_type_combo.currentText(),
                 "right_frame_system": self.right_canopy_frame_system_combo.currentText(),
@@ -8194,6 +7782,7 @@ class MainWindow(QMainWindow):
                 "right_g_kpa": self.right_canopy_g_load_input.text(),
                 "right_q_kpa": self.right_canopy_q_load_input.text(),
                 "right_solar_kpa": self.right_canopy_solar_load_input.text(),
+                **self.canopy_purlin_preset("right"),
             },
             "sections": {
                 "left_column": self.left_column_profile_combo.currentText(),
@@ -8342,6 +7931,7 @@ class MainWindow(QMainWindow):
                 "frame_type": self.frame_type_from_wall_states(),
                 "wall_enclosure": self.envelope_plan_selector.wall_states(),
                 "internal_pressure_mode": self.internal_pressure_combo.currentText(),
+                **({"frame_load_basis": self.frame_load_basis()} if self.frame_load_basis() != "single_frame" else {}),
                 "single_wind_case": self.wind_case_combo.currentText(),
                 "building_length_m": self.building_length_input.text(),
                 "additional_pressure_factor": self.wind_reduction_input.text(),
@@ -8593,6 +8183,11 @@ class MainWindow(QMainWindow):
         self.right_canopy_g_load_input.setText(self.downward_roof_load_text(canopies.get("right_g_kpa", canopies.get("g_kpa", self.right_canopy_g_load_input.text()))))
         self.right_canopy_q_load_input.setText(self.downward_roof_load_text(canopies.get("right_q_kpa", canopies.get("q_kpa", self.right_canopy_q_load_input.text()))))
         self.right_canopy_solar_load_input.setText(self.downward_roof_load_text(canopies.get("right_solar_kpa", canopies.get("solar_kpa", self.right_canopy_solar_load_input.text()))))
+        for side in ("left", "right"):
+            combo = getattr(self, f"{side}_canopy_purlin_combo")
+            section = canopies.get(f"{side}_purlin_section")
+            combo.setCurrentIndex(max(combo.findText(section), 0) if section else 0)
+            getattr(self, f"{side}_canopy_purlin_spacing_input").setText(str(canopies.get(f"{side}_purlin_spacing_mm", "") or ""))
 
         sections = data.get("sections", {})
         self.set_combo_text_if_present(self.left_column_profile_combo, sections.get("left_column"))
@@ -8804,8 +8399,10 @@ class MainWindow(QMainWindow):
             wall_enclosure = self.wall_states_from_legacy_frame_type(wind.get("frame_type", self.frame_type_from_wall_states()))
         self.envelope_plan_selector.set_wall_states(wall_enclosure)
         self.set_combo_text_if_present(self.internal_pressure_combo, wind.get("internal_pressure_mode"))
+        self.apply_frame_load_basis(wind.get("frame_load_basis"))
         self.set_combo_text_if_present(self.wind_case_combo, wind.get("single_wind_case"))
         self.building_length_input.setText(str(wind.get("building_length_m", self.building_length_input.text())))
+        self.apply_bays_from_preset(geometry, loads, wind)
         self.wind_reduction_input.setText(str(wind.get("additional_pressure_factor", self.wind_reduction_input.text())))
         self.update_derived_frame_type_label()
 
@@ -9144,6 +8741,11 @@ class MainWindow(QMainWindow):
         self.configurator_review_optimiser = None
         self.current_preset_path = None
         self.apply_preset_data(copy.deepcopy(dict(loaded.prepared.inputs)))
+        if loaded.prepared.building is not None:
+            # v2 request: review against every gridline's building loads.
+            from building_model import BuildingModel
+            self.building_load_mode = loaded.prepared.load_basis
+            self.building_model_override = BuildingModel.from_dict(dict(loaded.prepared.building))
         self.configure_configurator_review_ui()
         self.generate_and_solve()
         self.update_configurator_review_status(prefix="Optimisation queued on open. ")
@@ -9319,8 +8921,8 @@ class MainWindow(QMainWindow):
         self.optimise_structure_button.setText("Optimise members for estimate")
         verified = isinstance(physics_result, dict) and physics_result.get("verified") is True
         self.update_configurator_review_status(prefix=(
-            "Physics Optimise complete. " if verified
-            else "Physics Optimise found no verified candidate. Review the exact checks. "
+            "Optimise complete. " if verified
+            else "Optimise found no verified candidate. Review the exact checks. "
         ))
 
     def start_pending_configurator_review_optimisation(self):
@@ -9458,15 +9060,29 @@ class MainWindow(QMainWindow):
                 "auto_web_profile_assignments": copy.deepcopy(web_state["assignments"]),
                 "auto_web_joint_doubler_sides": copy.deepcopy(web_state["doubler_sides"]),
             })
-            final_raw = {
-                "schema": self.configurator_review.prepared.schema,
-                "request_id": self.configurator_review.prepared.request_id,
-                "mode": CalculationMode.CHECK_SPECIFIED.value,
-                "inputs": final_inputs,
-            }
+            original = self.configurator_review.prepared
+            if original.building is not None:
+                from configurator_review import reviewed_building
+                final_raw = {
+                    "schema": original.schema,
+                    "request_id": original.request_id,
+                    "mode": CalculationMode.CHECK_SPECIFIED.value,
+                    "building": reviewed_building(original.building, final_inputs),
+                    "options": {"load_basis": original.load_basis},
+                }
+            else:
+                final_raw = {
+                    "schema": original.schema,
+                    "request_id": original.request_id,
+                    "mode": CalculationMode.CHECK_SPECIFIED.value,
+                    "inputs": final_inputs,
+                }
             prepared_final = prepare_calculation_request(final_raw)
             self._solve_configurator_review_inputs(prepared_final.inputs)
             dossier = self._configurator_review_dossier(prepared_final.inputs)
+            if prepared_final.building is not None:
+                dossier["building_results"] = self.building_service_results(
+                    prepared_final.building, prepared_final.inputs)
 
             class FrozenReviewBackend:
                 def calculate(inner_self, request):
@@ -10254,7 +9870,13 @@ class MainWindow(QMainWindow):
         costing_structure.elements = [copy.copy(element) for element in structure.elements]
         self.apply_auto_web_assignments_to_structure(costing_structure)
         return costing.costing_from_structure(self, costing_structure, building_length_m, bay_size_m)
-    def purlin_design_pressures(self, wind_inputs, tributary_area_m2=None, edge_zone=None, return_info=False, wind_pressure="ultimate"):
+    def purlin_design_pressures(self, wind_inputs, tributary_area_m2=None, edge_zone=None, return_info=False, wind_pressure="ultimate",
+                                underside_cpi=None):
+        """Net roof purlin pressures (upward, downward) in kPa.
+
+        ``underside_cpi(result, cpe_case)`` replaces the building's internal
+        pressure with an open canopy's underside coefficient (with its own Kci).
+        """
         max_upward_kpa = 0.0
         max_downward_kpa = 0.0
         max_local_pressure_factor = 1.0
@@ -10269,8 +9891,13 @@ class MainWindow(QMainWindow):
             local_dimension_a_m = max(local_dimension_a_m, result_a_m)
             edge_width = result_a_m
             for cpi_case in CPI_CASE_OPTIONS:
-                cpi = active_cpi_for_case(result, cpi_case, cpe_case)
-                cpi_pressure = cpi * result.wu_kn_m2 * pressure_scale * internal_pressure_factor(result, cpi)
+                if underside_cpi is None:
+                    cpi = active_cpi_for_case(result, cpi_case, cpe_case)
+                    kci = internal_pressure_factor(result, cpi)
+                else:
+                    cpi = underside_cpi(result, cpe_case)
+                    kci = action_combination_factors(result, cpi)[1]
+                cpi_pressure = cpi * result.wu_kn_m2 * pressure_scale * kci
                 for zone in result.roof_zones:
                     zone_overlaps_edge = (
                         zone.distance_from_eave_from_m < edge_width
@@ -10381,10 +10008,10 @@ class MainWindow(QMainWindow):
 
     def current_bracing_layout_geometry(self):
         from bracing_layout import LayoutGeometry
-        geometry = LayoutGeometry.create(mm_from_metres_text(self.span_input.text()),
-                                         mm_from_metres_text(self.building_length_input.text()),
+        stations = self.bay_stations_mm()
+        geometry = LayoutGeometry.create(mm_from_metres_text(self.span_input.text()), stations[-1],
                                          mm_from_metres_text(self.eave_input.text()), float(self.pitch_input.text()),
-                                         self.current_roof_shape(), bay_mm=mm_from_metres_text(self.load_bay_size_input.text()))
+                                         self.current_roof_shape(), bay_stations_mm=stations)
         spacing = self.end_wall_spacing_override_mm()
         if spacing is not None:
             if not math.isfinite(spacing) or spacing <= 0:
@@ -10395,7 +10022,30 @@ class MainWindow(QMainWindow):
             values = geometry.to_dict()
             values["end_wall_stations_mm"] = [geometry.span_mm * i / spaces for i in range(spaces + 1)]
             geometry = LayoutGeometry.from_dict(values)
+        canopies = self.bracing_layout_canopies()
+        if canopies and geometry.roof_shape == "Gable":
+            # Open canopies are braceable 3D faces (skillion canopies are
+            # rejected by the 3D analysis with an explanation instead).
+            values = geometry.to_dict()
+            values["canopies"] = canopies
+            geometry = LayoutGeometry.from_dict(values)
         return geometry
+
+    def bracing_layout_canopies(self):
+        """Nominal open canopies for the 3D bracing layout: plan width and fall."""
+        canopies = []
+        for side in ("left", "right"):
+            type_combo = getattr(self, f"{side}_canopy_type_combo", None)
+            if type_combo is None or type_combo.currentText() != "Canopy":
+                continue
+            try:
+                width = mm_from_metres_text(getattr(self, f"{side}_canopy_length_input").text())
+                pitch = float(getattr(self, f"{side}_canopy_pitch_input").text())
+            except (TypeError, ValueError):
+                continue
+            if width > 0.0:
+                canopies.append({"side": side, "width_mm": width, "drop_mm": math.tan(math.radians(pitch)) * width})
+        return canopies
 
     def update_bracing_layout_summary(self):
         if not hasattr(self, "bracing_layout_summary_label"):
@@ -10501,27 +10151,64 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.Yes:
             return
         before = combined_sizing.capture_state(self)
-        progress = QProgressDialog("Preparing...", "Cancel", 0, 0, self)
+        progress = QProgressDialog("Preparing...", "Cancel", 0, 1000, self)
         progress.setWindowTitle("Optimise frame + bracing")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setMinimumWidth(520)
+        progress.setValue(0)
         progress.show()
+        started = time.perf_counter()
+        cancelled = []
+        current = {"message": "Preparing...", "value": 0}
 
-        def note(message):
-            progress.setLabelText(message)
-            QApplication.processEvents()
-            if progress.wasCanceled():
+        def show_label():
+            if cancelled:
+                return
+            elapsed = int(time.perf_counter() - started)
+            percent = progress.value() / 10
+            progress.setLabelText(f"{current['message']}\n\n{percent:.0f}% · {elapsed // 60}:{elapsed % 60:02d} elapsed")
+
+        # Keep the elapsed time ticking between optimiser reports (the solvers
+        # process events often enough for this timer to fire).
+        clock = QTimer(progress)
+        clock.timeout.connect(show_label)
+        clock.start(1000)
+
+        def note(message, fraction=None):
+            # Overall fraction 0-1 from frontier_sizing.Progress. Cancel stops
+            # at the next safe point (never inside a 2D auto-size).
+            if cancelled or progress.wasCanceled():
+                if not cancelled:
+                    cancelled.append(True)
+                    progress.show()
+                    progress.setValue(current["value"])   # Qt's cancel resets the bar
+                    progress.setLabelText("Cancelling: stopping at the next safe point, then restoring "
+                                          "the previous design...")
+                # Keep the window responsive until the optimiser reaches a
+                # safe point (a 2D auto-size in progress finishes first).
+                QApplication.processEvents()
                 raise AnalysisError("Optimisation cancelled; the previous design is restored.")
+            if fraction is not None:
+                current["value"] = int(round(1000*max(0.0, min(1.0, fraction))))
+                progress.setValue(current["value"])
+            current["message"] = message
+            show_label()
+            QApplication.processEvents()
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             report = frontier_sizing.optimise(self, progress=note)
         except (AnalysisError, ValueError, ArithmeticError) as error:
-            combined_sizing.restore_state(self, before)
+            clock.stop()
+            combined_sizing.restore_state(self, before, exact=True)
             self.update_bracing_layout_summary()
             QApplication.restoreOverrideCursor()
             progress.close()
             QMessageBox.warning(self, "Optimise frame + bracing", str(error))
             return
+        clock.stop()
         QApplication.restoreOverrideCursor()
         progress.close()
         self.update_bracing_layout_summary()
@@ -10880,6 +10567,81 @@ class MainWindow(QMainWindow):
             "profile_selection": selection,
         }
 
+    def canopy_purlin_check(self, side, wind_inputs, bay_size_m, canopy_loads, span_type, main_spacing_mm):
+        """Open canopy edge purlin (the 3D canopy-edge strut): Metroll bending check.
+
+        Edge purlin tributary = half the canopy purlin spacing. Loads: canopy
+        G (with solar) and Q, and net wind from the roof edge zones (with the
+        local pressure factor) plus the open underside's Table 5.1(B) Cpi.
+        "Auto" picks the lightest passing section; a chosen section is checked.
+        """
+        if bay_size_m <= 0.0:
+            return None
+        spacing_text = getattr(self, f"{side}_canopy_purlin_spacing_input").text().strip()
+        try:
+            spacing_mm = float(spacing_text) if spacing_text else float(main_spacing_mm or 0.0)
+        except ValueError:
+            return {"status": "NOT CHECKED", "message": "Canopy purlin spacing must be a number (mm)."}
+        if not math.isfinite(spacing_mm) or spacing_mm <= 0.0:
+            return {"status": "NOT CHECKED", "message": "No canopy purlin spacing, and no main roof purlin spacing to default to."}
+        width_m = spacing_mm / 2000.0
+        span_mm = bay_size_m * 1000.0
+        area_m2 = width_m * bay_size_m
+
+        def underside(result, cpe_case):
+            return open_canopy_cpi(result, cpe_case, side, wind_inputs.building_length_m, wind_inputs.eave_height_m)[0]
+        up, down = self.purlin_design_pressures(wind_inputs, tributary_area_m2=area_m2, edge_zone=True,
+                                                underside_cpi=underside)
+        up_s, down_s = self.purlin_design_pressures(wind_inputs, tributary_area_m2=area_m2, edge_zone=True,
+                                                    wind_pressure="serviceability", underside_cpi=underside)
+        permanent_kpa = abs(canopy_loads.permanent_vertical_kpa)
+        live_kpa = abs(canopy_loads.q_vertical_kpa)
+        outward_kn_m = up * width_m
+        inward_strength_kn_m = max(1.2 * permanent_kpa + 1.5 * live_kpa, 1.2 * permanent_kpa + down) * width_m
+        inward_service_kn_m = max(up_s, down_s) * width_m
+        match = self.match_metroll_purlin(span_type, span_mm, outward_kn_m, inward_strength_kn_m, inward_service_kn_m,
+                                          include_candidates=True)
+        passing = match.pop("passing_candidates", []) if isinstance(match, dict) else []
+        chosen = getattr(self, f"{side}_canopy_purlin_combo").currentText()
+        if chosen and not chosen.startswith("Auto"):
+            found = next((item for item in passing if item.get("section") == chosen), None)
+            match = dict(found) if found else {
+                "status": "NOT OK", "section": chosen,
+                "message": f"{chosen} does not satisfy the canopy edge purlin line loads." if passing or match.get("status") == "OK"
+                else match.get("message", "No section satisfies the canopy edge purlin line loads.")}
+        return {
+            "side": side, "span_type": span_type, "spacing_mm": spacing_mm,
+            "spacing_source": "Canopy input" if spacing_text else "Main roof purlin spacing",
+            "tributary_width_mm": spacing_mm / 2.0, "span_mm": span_mm, "loaded_area_m2": area_m2,
+            "permanent_kpa": permanent_kpa, "live_kpa": live_kpa,
+            "wind_upward_kpa": up, "wind_downward_kpa": down,
+            "wind_service_upward_kpa": up_s, "wind_service_downward_kpa": down_s,
+            "outward_kn_m": outward_kn_m, "inward_strength_kn_m": inward_strength_kn_m,
+            "inward_service_kn_m": inward_service_kn_m, "section_choice": chosen or "Auto", "match": match,
+            "basis": ("Canopy edge purlin: half the canopy purlin spacing; canopy G (with solar) and Q; net wind from the "
+                      "roof edge zones with the local pressure factor plus the open underside's Table 5.1(B) Cpi."),
+        }
+
+    def update_canopy_purlin_labels(self):
+        for side in ("left", "right"):
+            label = getattr(self, f"{side}_canopy_purlin_check_label", None)
+            if label is None:
+                continue
+            check = (getattr(self, "canopy_purlin_checks", None) or {}).get(side)
+            match = (check or {}).get("match", {})
+            if not check:
+                label.setText("-")
+                label.setStyleSheet("")
+            elif match.get("status") == "OK":
+                ratio = max(check["outward_kn_m"] / match["outward_capacity_kn_m"],
+                            check["inward_strength_kn_m"] / match["inward_strength_capacity_kn_m"],
+                            check["inward_service_kn_m"] / match["inward_service_capacity_kn_m"])
+                label.setText(f"{match['section']} @ {check['spacing_mm']:.0f} mm: ratio {ratio:.3f}")
+                label.setStyleSheet("color: #2e7d32; font-weight: 600;")
+            else:
+                label.setText(match.get("message") or check.get("message") or "Not checked")
+                label.setStyleSheet("color: #c62828; font-weight: 600;")
+
     def wall_girt_check_from_inputs(self, wind_inputs, bay_size_m, eave_height_mm, span_type):
         if bay_size_m <= 0.0:
             return None
@@ -11205,6 +10967,53 @@ class MainWindow(QMainWindow):
     def column_half_width_for_span_offset(self, profile):
         return (profile.depth or profile.flange_width or 0.0) / 2.0
 
+    @staticmethod
+    def secondary_member_depth_mm(check, default_mm):
+        """Depth of the purlin/girt a check selected ('C/Z 250 15' -> 250), else the default.
+
+        Returns (depth, source) so the results can say when the default was used.
+        """
+        match = (check or {}).get("match") or {}
+        if match.get("status") == "OK":
+            found = re.search(r"(\d{3})", str(match.get("section", "")))
+            if found:
+                return float(found.group(1)), match["section"]
+        return float(default_mm), f"default {default_mm:g} mm (no passing section)"
+
+    def eave_node_basis(self, eave_mm, pitch_deg, roof_shape, left_column, right_column, top_chord_depth_mm,
+                        purlin_check, girt_check):
+        """Top chord node height at the column centrelines from the eave pitching point.
+
+        The eave height is the roof cladding pitching point on the wall
+        cladding line (outside of the girts). Building width stays to the
+        outside of the column flanges, so the cladding line is the girt depth g
+        outside the flange and the column centreline is g + D/2 inside it. The
+        top chord centreline is the purlin depth p plus half the chord depth t
+        below the cladding, square to the slope:
+
+            node = H + (g + D/2) tan(pitch) - (p + t/2) / cos(pitch)
+
+        A gable uses the mean of the two sides' g + D/2 (both eaves at H, ridge
+        on the truss centreline); a skillion uses its low (left) side.
+        """
+        girt, girt_source = self.secondary_member_depth_mm(girt_check, GIRT_DEPTH_DEFAULT_MM)
+        purlin, purlin_source = self.secondary_member_depth_mm(purlin_check, PURLIN_DEPTH_DEFAULT_MM)
+        # The eave purlins are in the local (edge) pressure zone: take the
+        # deeper of the general and edge-zone selections.
+        local = {"match": (purlin_check or {}).get("local_match")}
+        local_depth, local_source = self.secondary_member_depth_mm(local, 0.0)
+        if local_depth > purlin:
+            purlin, purlin_source = local_depth, f"{local_source} (edge zone)"
+        offsets = {side: girt + self.column_half_width_for_span_offset(profile)
+                   for side, profile in (("left", left_column), ("right", right_column))}
+        inset = offsets["left"] if roof_shape == "Skillion" else 0.5 * (offsets["left"] + offsets["right"])
+        theta = math.radians(pitch_deg)
+        drop = (purlin + 0.5 * top_chord_depth_mm) / math.cos(theta)
+        node = eave_mm + inset * math.tan(theta) - drop
+        return {"eave_mm": eave_mm, "node_mm": node, "girt_mm": girt, "girt_source": girt_source,
+                "purlin_mm": purlin, "purlin_source": purlin_source, "top_chord_depth_mm": top_chord_depth_mm,
+                "column_offsets_mm": offsets, "inset_mm": inset, "drop_mm": drop}
+
     def update_storage_section_visibility(self):
         group = getattr(self, "storage_section_group", None)
         if group is None:
@@ -11341,6 +11150,11 @@ class MainWindow(QMainWindow):
         if getattr(self, "envelope_plan_selector", None) is not None and hasattr(self.envelope_plan_selector, "set_lean_to_visibility"):
             self.envelope_plan_selector.set_lean_to_visibility(left_has_lean_to, right_has_lean_to)
         self.update_canopy_section_visibility(left_has_canopy, right_has_canopy, left_has_lean_to, right_has_lean_to)
+        for rows, visible in ((getattr(self, "left_canopy_purlin_rows", []), left_has_canopy and not left_has_lean_to),
+                              (getattr(self, "right_canopy_purlin_rows", []), right_has_canopy and not right_has_lean_to)):
+            for widget in rows:
+                if widget is not None:
+                    widget.setVisible(visible)
         for rows in [
             getattr(self, "left_canopy_wind_model_rows", []),
             getattr(self, "left_canopy_underside_rows", []),
@@ -11613,6 +11427,120 @@ class MainWindow(QMainWindow):
         except Exception:
             self._panel_count_override = previous_override
             raise
+
+    def on_frame_load_basis_changed(self, *_):
+        """Desktop toggle: one frame-anywhere envelope, or every gridline's building loads."""
+        combo = getattr(self, "frame_load_basis_combo", None)
+        basis = combo.currentData() if combo is not None else "single_frame"
+        self.building_load_mode = None if basis in (None, "single_frame") else basis
+        self._building_loads_cache = None
+
+    def building_load_summary_lines(self):
+        """Results-text section for building-load mode (empty for a single frame)."""
+        loads = getattr(self, "building_frame_loads", None)
+        if not getattr(self, "building_load_mode", None) or not loads:
+            return []
+        from frame_loading import gridline_label, governing_report
+        frames = loads["frames"]
+        gridlines = getattr(self, "building_load_gridlines", None) or [f.gridline for f in frames]
+        checked, total = getattr(self, "building_check_counts", (0, 0))
+        basis = {"building": "building loads", "legacy_2d": "building loads with 2D coefficients"}.get(loads["mode"], loads["mode"])
+        lines = [
+            "BUILDING LOADS",
+            f"Basis            : {basis} (Kc {frames[0].kc_rule if loads['mode'] == 'building' else 'legacy'})",
+            f"Gridlines checked: {gridline_label(gridlines)} of {len(frames)}",
+            "Distinct loads   : " + "; ".join(gridline_label(group) for group in loads["distinct_frames"]
+                                         if set(group) & set(gridlines)),
+            f"Combinations     : {checked} of {total}" + (" (screened)" if checked != total else ""),
+            "Diagram and selected-combination loads show the single-frame case.",
+        ]
+        lines.extend(governing_report(self.design_envelope_actions))
+        lines.append("")
+        return lines
+
+    def frame_load_basis(self):
+        combo = getattr(self, "frame_load_basis_combo", None)
+        return (combo.currentData() if combo is not None else None) or "single_frame"
+
+    def apply_frame_load_basis(self, basis):
+        """Set the toggle from a preset. A service/review building drives the mode itself."""
+        if getattr(self, "building_model_override", None) is not None:
+            return
+        combo = self.frame_load_basis_combo
+        index = combo.findData(basis or "single_frame")
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        self.on_frame_load_basis_changed()
+
+    def current_building_frame_loads(self):
+        """Per-gridline building loads for the current inputs (phase 4).
+
+        Uses ``building_model_override`` when set (a BOLT building), else a
+        uniform building from the current preset. Cached on the inputs that
+        affect loads, so optimiser solves reuse it.
+        """
+        from building_loads import building_loads
+        from building_model import building_model_from_preset
+        from frame_loading import distinct_frames
+        mode = self.building_load_mode
+        model = getattr(self, "building_model_override", None)
+        preset = None
+        if model is None:
+            preset = self.collect_preset_data()
+            relevant = {key: preset.get(key) for key in ("geometry", "canopies", "loads", "wind")}
+            relevant["geometry"] = {k: v for k, v in (relevant["geometry"] or {}).items()
+                                    if k not in {"truss_depth_mm", "max_truss_depth_mm"}}
+            key = (mode, json.dumps(relevant, sort_keys=True, default=str))
+        else:
+            key = (mode, json.dumps(model.to_dict(), sort_keys=True, default=str))
+        cached = getattr(self, "_building_loads_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        if model is None:
+            model = building_model_from_preset(preset)
+        frames = building_loads(model, basis=mode)
+        result = {"mode": mode, "model": model, "frames": frames, "distinct_frames": distinct_frames(frames)}
+        self._building_loads_cache = (key, result)
+        return result
+
+    def building_service_results(self, building, frame_inputs, group_id=None):
+        """v2 service evidence for one sizing group: its gridlines, sections, load sets and governing cases."""
+        from frame_loading import governing_actions
+        from portalcalc_service import building_with_frame_inputs
+        loads = self.building_frame_loads or self.current_building_frame_loads()
+        model = loads["model"]
+        frames = {frame.gridline: frame for frame in loads["frames"]}
+        groups = model.resolved_sizing_groups()
+        group = next((g for g in groups if g.id == group_id), groups[0])
+        sections = dict((frame_inputs or {}).get("sections") or {})
+        geometry = (frame_inputs or {}).get("geometry") or {}
+        checked, total = getattr(self, "building_check_counts", (None, None))
+        sized_building = building_with_frame_inputs(building, frame_inputs)
+        governing = governing_actions(self.design_envelope_actions,
+                                      getattr(self, "building_combination_gridlines", {}) or {})
+        for item in governing:
+            item["sizing_group"] = group.id
+        return {
+            "load_basis": loads["mode"],
+            "kc_rule": next(iter(frames.values())).kc_rule if loads["mode"] == "building" else "legacy",
+            "all_gridlines": [{"id": gridline.id} for gridline in model.gridlines],
+            "gridlines": [
+                {"id": gridline.id, "y_mm": gridline.y_mm, "frame_type": gridline.frame_type,
+                 "sizing_group": group.id, "tributary_mm": frames[gridline.id].tributary_mm,
+                 "attachments": sorted(model.attachments_at(gridline.id)),
+                 "sections": sections}
+                for gridline in model.gridlines if gridline.id in group.gridlines
+            ],
+            "sizing_groups": [{
+                "id": group.id, "gridlines": list(group.gridlines),
+                "frame_type": model.gridlines[model.gridline_index(group.gridlines[0])].frame_type,
+                "sections": sections, "truss_depth_mm": geometry.get("truss_depth_mm"),
+            }],
+            "distinct_load_sets": [list(ids) for ids in loads["distinct_frames"]],
+            "combinations": {"checked": checked, "total": total,
+                             "full_set_checked": checked is not None and checked == total},
+            "governing": governing,
+            "sized_building": sized_building,
+        }
 
     def generate_and_solve(self):
         if getattr(self, "_defer_generate_and_solve", False):
@@ -11909,13 +11837,40 @@ class MainWindow(QMainWindow):
         self.web_angle_label.setText(f"{web_angle:.1f}°")
         self.panel_count_label.setText(str(num_panels))
 
-        structure = Structure2D()
-        E = 200000  # MPa = N/mm²
-
         half_span = span / 2
         pitch_tan = math.tan(math.radians(pitch))
         rise = pitch_tan * (span if roof_shape == "Skillion" else half_span)
-        ridge_y = eave + rise
+
+        def roof_line_y(local_x, eave_y):
+            if roof_shape == "Skillion" or local_x <= half_span:
+                return eave_y + local_x * pitch_tan
+            return eave_y + rise - (local_x - half_span) * pitch_tan
+
+        # Secondary members first: they depend only on the building envelope
+        # (and the chord's slope length, which a vertical shift doesn't change),
+        # then the frame node height from them. No circular dependence.
+        from types import SimpleNamespace
+        provisional_top = [SimpleNamespace(x=left_column_offset + local_x, y=roof_line_y(local_x, eave))
+                           for local_x in top_panel_stations]
+        early_purlin_check = self.purlin_check_from_inputs(
+            self.build_purlin_layout(provisional_top, wind_inputs.wind_region, wind_inputs.importance_level),
+            bay_size_m, roof_loads, wind_inputs, self.purlin_span_type_combo.currentText())
+        early_girt_check = self.wall_girt_check_from_inputs(
+            wind_inputs, bay_size_m, eave, self.wall_girt_span_type_combo.currentText())
+        node_basis = self.eave_node_basis(eave, pitch, roof_shape, left_column_profile, right_column_profile,
+                                          top_chord_depth, early_purlin_check, early_girt_check)
+        frame_eave = node_basis["node_mm"]
+        self.eave_node_basis_record = node_basis
+        if frame_eave <= 0.0 or (not is_rafter and frame_eave - truss_centreline_depth <= 0.0):
+            self.results_box.setText(
+                f"Input error: the top chord node ({frame_eave:.0f} mm, from the {eave:.0f} mm eave pitching point) "
+                "leaves no column below the truss.")
+            return
+
+        structure = Structure2D()
+        E = 200000  # MPa = N/mm²
+
+        ridge_y = frame_eave + rise
 
         top_nodes = []
         bottom_nodes = []
@@ -11925,13 +11880,7 @@ class MainWindow(QMainWindow):
         panel_stations[-1] = span
         for i, local_x in enumerate(top_panel_stations):
             x = left_column_offset + local_x
-            if roof_shape == "Skillion":
-                y = eave + local_x * pitch_tan
-            elif local_x <= half_span:
-                y = eave + local_x * pitch_tan
-            else:
-                y = ridge_y - (local_x - half_span) * pitch_tan
-            node = Node(node_id, x, y)
+            node = Node(node_id, x, roof_line_y(local_x, frame_eave))
             structure.add_node(node)
             top_nodes.append(node)
             node_id += 1
@@ -11944,12 +11893,7 @@ class MainWindow(QMainWindow):
             for index, top_node in enumerate(top_nodes):
                 local_x = panel_stations[index]
                 x = left_column_offset + local_x
-                if roof_shape == "Skillion":
-                    roof_y = eave + local_x * pitch_tan
-                elif local_x <= half_span:
-                    roof_y = eave + local_x * pitch_tan
-                else:
-                    roof_y = ridge_y - (local_x - half_span) * pitch_tan
+                roof_y = roof_line_y(local_x, frame_eave)
                 node = Node(node_id, x, roof_y - truss_centreline_depth)
                 structure.add_node(node)
                 bottom_nodes.append(node)
@@ -11957,6 +11901,19 @@ class MainWindow(QMainWindow):
 
             left_column_bottom_chord_node = bottom_nodes[0]
             right_column_bottom_chord_node = bottom_nodes[-1]
+
+        # Envelope outside the frame lines, carried to the eave nodes
+        # (apply_eave_strip_loads): the wall from the node up to the pitching
+        # point, and the roof from the column centreline out to the cladding.
+        cos_pitch = math.cos(math.radians(pitch))
+        girt_mm = node_basis["girt_mm"]
+        right_cladding_y = eave if roof_shape != "Skillion" else eave + (outside_span + 2.0 * girt_mm) * pitch_tan
+        eave_strips = [
+            {"side": side, "x": node.x, "y": node.y, "wall_mm": max(cladding_y - node.y, 0.0),
+             "roof_mm": node_basis["column_offsets_mm"][side.lower()] / cos_pitch}
+            for side, node, cladding_y in (("LEFT", top_nodes[0], eave), ("RIGHT", top_nodes[-1], right_cladding_y))
+        ]
+        node_basis["strips"] = eave_strips
 
         main_truss_panel_top_nodes = list(top_nodes)
         main_truss_panel_bottom_nodes = list(bottom_nodes)
@@ -12430,6 +12387,12 @@ class MainWindow(QMainWindow):
         right_support = self.right_support_combo.currentText()
         eave_x_restraint = self.eave_x_restraint_combo.currentText()
         eave_bracing_info = None
+        propped_end = self.propped_end_context()
+        if propped_end is not None:
+            # A propped end frame lies in the end wall: its own end-wall bracing
+            # restrains its eaves (springs added below), not the L/2 path spring
+            # an interior frame gets.
+            eave_x_restraint = "None"
         active_eave_restraint = eave_x_restraint
         active_eave_x_spring_kn_mm = eave_x_spring_kn_mm
         if eave_x_restraint in {"One end", "Both ends"}:
@@ -12489,6 +12452,15 @@ class MainWindow(QMainWindow):
                 structure.add_support(top_nodes[-1].ux)
                 eave_restraint_types.append("X restraint")
             eave_restraint_nodes.append(top_nodes[-1])
+        if propped_end is not None:
+            eave_bracing_info = self.propped_end_bracing_springs(propped_end, end_wall_brace_size)
+            for side, spring in eave_bracing_info["springs"].items():
+                node = top_nodes[0] if side == "left" else top_nodes[-1]
+                structure.add_spring(node.ux, spring["spring_kn_mm"] * 1000.0)
+                eave_restraint_nodes.append(node)
+                eave_restraint_types.append("X spring")
+            active_eave_restraint = eave_bracing_info["restraint"]
+            active_eave_x_spring_kn_mm = max((s["spring_kn_mm"] for s in eave_bracing_info["springs"].values()), default=0.0)
         for internal_base in internal_column_bases:
             self.apply_base_support(structure, internal_base, "Pinned")
         for lean_base in [left_lean_base, right_lean_base]:
@@ -12499,22 +12471,24 @@ class MainWindow(QMainWindow):
             wind_inputs.wind_region,
             wind_inputs.importance_level,
         )
-        self.purlin_check = self.purlin_check_from_inputs(
-            self.purlin_layout,
-            bay_size_m,
-            roof_loads,
-            wind_inputs,
-            self.purlin_span_type_combo.currentText(),
-        )
+        # The layout's spacing equals the provisional one (same chord, shifted
+        # vertically), so the purlin check made before the frame stands.
+        self.purlin_check = early_purlin_check
+        # Open canopy edge purlins (the canopy-edge struts in the 3D bracing model).
+        self.canopy_purlin_checks = {}
+        for side_key, has_canopy, has_lean_to, side_loads in (
+            ("left", left_has_canopy, left_has_lean_to, left_canopy_loads),
+            ("right", right_has_canopy, right_has_lean_to, right_canopy_loads),
+        ):
+            if has_canopy and not has_lean_to:
+                self.canopy_purlin_checks[side_key] = self.canopy_purlin_check(
+                    side_key, wind_inputs, bay_size_m, side_loads, self.purlin_span_type_combo.currentText(),
+                    (self.purlin_check or {}).get("spacing_mm"))
+        self.update_canopy_purlin_labels()
         self.calculate_longitudinal_bracing_design(
             wind_inputs, outside_span, eave, pitch, roof_shape, bay_size_m
         )
-        self.wall_girt_check = self.wall_girt_check_from_inputs(
-            wind_inputs,
-            bay_size_m,
-            eave,
-            self.wall_girt_span_type_combo.currentText(),
-        )
+        self.wall_girt_check = early_girt_check
         self.calculate_end_wall_design(wind_inputs, outside_span, eave, pitch, roof_shape)
         self.member_check_restraints = self.member_check_restraint_lengths(
             wind_inputs,
@@ -13157,6 +13131,10 @@ class MainWindow(QMainWindow):
                 cpi, _ = lean_to_cpi_for_case(wind_result, cpi_case, cpe_case, side_key)
                 return cpi
             chamber_width_m = left_canopy_length / 1000.0 if side_key == "left" else right_canopy_length / 1000.0
+            if chamber_wall_opening_area_m2(chamber_width_m, side_key) > 1e-12:
+                # Single open side: the shared rule (also used by the 3D bracing model).
+                cpi, _, _ = open_canopy_cpi(wind_result, cpe_case, side_key, building_length_m, max(eave / 1000.0, 0.0))
+                return cpi
             cpi, _ = chamber_cpi_from_openings(
                 wind_result,
                 cpi_case,
@@ -13743,10 +13721,66 @@ class MainWindow(QMainWindow):
 
             return cases
 
+        def apply_frame_wind_loads(target_structure, combination):
+            """One gridline's wind (building_loads descriptors) on this 2D frame.
+
+            Uses the same primitives as the 2D wind application, so a
+            legacy_2d interior frame loads the model exactly as today.
+            """
+            from types import SimpleNamespace
+            from frame_loading import roof_strips_on_nodes
+            case = combination.frame_loads.wind_case(combination.cpe_case)
+            pressure = SimpleNamespace(wu_kn_m2=case.wu_kn_m2, ws_kn_m2=case.ws_kn_m2)
+            scale = wind_pressure_scale(pressure, combination.wind_pressure)
+            roof_nodes = continuous_roof_top_nodes if case.roof_basis == "cpe" else top_nodes
+            canopy_bounds = {}
+            if case.roof_basis == "cpe" and len(roof_nodes) > len(top_nodes):
+                distances = cumulative_roof_distances(roof_nodes)
+                if len(left_canopy_top_nodes) > 1 and not left_canopy_is_free_roof:
+                    canopy_bounds["left"] = (0.0, distances[len(left_canopy_top_nodes) - 1])
+                if len(right_canopy_top_nodes) > 1 and not right_canopy_is_free_roof:
+                    canopy_bounds["right"] = (distances[len(roof_nodes) - len(right_canopy_top_nodes)], distances[-1])
+            arrows = apply_roof_wind_strips_to_nodes(
+                target_structure, roof_nodes, roof_strips_on_nodes(case, roof_nodes, canopy_bounds), pressure,
+                combination.wind_pressure)
+            columns = {"left": (left_base, top_nodes[0], "LEFT_COLUMN"),
+                       "right": (right_base, top_nodes[-1], "RIGHT_COLUMN"),
+                       "left_lean": (*lean_outer_wall_nodes("left"), "LEFT_LEAN_COLUMN"),
+                       "right_lean": (*lean_outer_wall_nodes("right"), "RIGHT_LEAN_COLUMN")}
+            canopy_members = {"left": (left_canopy_top_nodes, "LEFT_CANOPY_TOP"),
+                              "right": (right_canopy_top_nodes, "RIGHT_CANOPY_TOP")}
+            for side, line in case.canopy_cpe_kn_m.items():
+                nodes, group = canopy_members[side]
+                arrows.extend(add_normal_uniform_line_load_to_members(target_structure, nodes, line * scale, group))
+            for column, signed in case.wall_cpe_kn_m.items():
+                base, top, group = columns[column]
+                arrows.extend(add_signed_horizontal_line_load(target_structure, base, top, signed * scale, group))
+            roof_cpi = case.roof_cpi_kn_m.get(combination.cpi_case)
+            if roof_cpi:
+                line_kn_m = roof_cpi * scale
+                for n1, n2 in zip(top_nodes[:-1], top_nodes[1:]):
+                    panel_len_m = math.hypot((n2.x - n1.x) / 1000, (n2.y - n1.y) / 1000)
+                    total_n = line_kn_m * panel_len_m * 1000.0
+                    nx, ny = add_roof_panel_pressure(target_structure, n1, n2, total_n)
+                    arrows.append(((n1.x + n2.x) / 2, (n1.y + n2.y) / 2 + 800, total_n * nx, total_n * ny))
+            for side, line in case.canopy_cpi_kn_m.get(combination.cpi_case, {}).items():
+                nodes, group = canopy_members[side]
+                if len(nodes) >= 2:
+                    arrows.extend(add_normal_uniform_line_load_to_members(target_structure, nodes, line * scale, group))
+            for column, signed in case.wall_cpi_kn_m.get(combination.cpi_case, {}).items():
+                base, top, group = columns[column]
+                arrows.extend(add_signed_horizontal_line_load(target_structure, base, top, signed * scale, group))
+            return arrows
+
         def apply_combination_loads(combination, include_summary=False, target_structure=None, storage_case=None, include_self_weight=True):
             load_structure = target_structure or structure
             load_structure.clear_loads()
-            basic_load_case = BasicLoadCase(roof_loads, wall_loads)
+            frame_loads = getattr(combination, "frame_loads", None)
+            if frame_loads is not None:
+                from frame_loading import frame_roof_loads
+                basic_load_case = BasicLoadCase(frame_roof_loads(frame_loads), wall_loads)
+            else:
+                basic_load_case = BasicLoadCase(roof_loads, wall_loads)
             load_application = basic_load_case.apply_factored(
                 load_structure,
                 top_nodes,
@@ -13763,6 +13797,9 @@ class MainWindow(QMainWindow):
             ]:
                 if len(canopy_nodes) < 2:
                     continue
+                if frame_loads is not None:
+                    from frame_loading import frame_attachment_loads
+                    side_canopy_loads = frame_attachment_loads(frame_loads, "left" if side_label.startswith("Left") else "right")
                 for _, factored_kpa, _ in side_canopy_loads.factored_components(combination.g_factor, combination.q_factor):
                     arrows.extend(
                         apply_roof_vertical_loads(
@@ -13775,6 +13812,9 @@ class MainWindow(QMainWindow):
                             },
                         )
                     )
+            def element_loads():
+                return dict(getattr(load_structure, "element_uniform_loads", {}) or {})
+            loads_before_storage = element_loads()
             self_weight_application = None
             if include_self_weight:
                 self_weight_application = apply_structure_self_weight(
@@ -13803,6 +13843,7 @@ class MainWindow(QMainWindow):
                     right_base_y_mm=right_base.y,
                 )
             )
+            loads_after_storage = element_loads()
 
             summary_lines = []
             if include_summary:
@@ -13844,7 +13885,12 @@ class MainWindow(QMainWindow):
                 if self_weight_application is not None:
                     summary_lines.extend(self_weight_application.summary_lines)
 
-            if combination.includes_wind:
+            if combination.includes_wind and frame_loads is not None:
+                arrows.extend(apply_frame_wind_loads(load_structure, combination))
+                if include_summary:
+                    from frame_loading import summary_lines as frame_summary_lines
+                    summary_lines.extend(frame_summary_lines(combination))
+            elif combination.includes_wind:
                 wind_result = get_wind_result(combination.cpe_case)
                 continuous_roof_wind_result = get_continuous_roof_wind_result(combination.cpe_case)
                 if main_roof_is_free_roof:
@@ -13926,6 +13972,12 @@ class MainWindow(QMainWindow):
                 summary_lines.append("")
                 summary_lines.append("Wind: not included in this combination")
 
+            # Roof, wall and wind loads continue above the node to the cladding
+            # pitching point; crane and storage loads do not (snapshot difference).
+            arrows.extend(apply_eave_strip_loads(
+                load_structure, eave_strips,
+                [(element_loads(), 1.0), (loads_after_storage, -1.0), (loads_before_storage, 1.0)]))
+
             return arrows, summary_lines
 
         try:
@@ -13962,12 +14014,32 @@ class MainWindow(QMainWindow):
             if storage_inputs.left_wall and storage_inputs.right_wall:
                 storage_check_cases.append(("Storage both", True, True))
 
+        check_combinations = self.load_combinations
+        self.building_frame_loads = None
+        all_building_combinations = None
+        if getattr(self, "building_load_mode", None):
+            try:
+                self.building_frame_loads = self.current_building_frame_loads()
+                from frame_loading import frame_load_combinations
+                # One sizing group at a time: only its gridlines' loads are checked.
+                check_combinations = all_building_combinations = frame_load_combinations(
+                    self.building_frame_loads["frames"], gridlines=getattr(self, "building_load_gridlines", None))
+            except Exception as exc:
+                self.results_box.setText(f"Building load error: {exc}")
+                return
+            # Phase 5 active-set screening: optimiser solves check only the
+            # combinations that govern (plus all gravity); the full set is the
+            # acceptance gate (auto_size_current_preset).
+            active_set = getattr(self, "_building_active_set", None)
+            if active_set is not None:
+                check_combinations = [c for c in check_combinations if c.name in active_set]
+
         try:
             for cpe_case in CPE_CASE_OPTIONS:
                 get_wind_result(cpe_case)
             design_check_lines, design_envelope_actions = self.member_check_envelope_lines(
                 structure,
-                self.load_combinations,
+                check_combinations,
                 apply_combination_loads,
                 top_nodes,
                 span,
@@ -13982,6 +14054,16 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.results_box.setText(f"Member check envelope error: {exc}")
             return
+
+        if all_building_combinations is not None:
+            from frame_loading import governing_combination_names
+            names = [c.name for c in all_building_combinations]
+            self.building_check_counts = (len(check_combinations), len(all_building_combinations))
+            self.building_combination_names = names
+            self.building_combination_gridlines = {c.name: list(c.gridlines) for c in all_building_combinations}
+            self.building_gravity_combination_names = {c.name for c in all_building_combinations if not c.includes_wind}
+            if len(check_combinations) == len(all_building_combinations):
+                self.building_full_governing_names = governing_combination_names(design_envelope_actions, names)
 
         self.foundation_summary = self.foundation_design_from_envelopes(design_envelope_actions.get("foundation_reactions", []))
 
@@ -15052,7 +15134,7 @@ class MainWindow(QMainWindow):
             if combination.is_serviceability:
                 local_sls_count += 1
                 ws_only_serviceability = getattr(combination, "serviceability_component", None) == "Ws"
-                gq_only_serviceability = combination.name == "SLS: G + Q"
+                gq_only_serviceability = (getattr(combination, "base_name", "") or combination.name) == "SLS: G + Q"
                 if crane_deflection_nodes and (ws_only_serviceability or gq_only_serviceability):
                     for node in crane_deflection_nodes:
                         signed_ux = d[node.ux]
@@ -16058,7 +16140,88 @@ class MainWindow(QMainWindow):
             if connection["ratio"] > ratio:
                 ratio = connection["ratio"]
                 check_label = connection["label"]
+        if group == "INTERNAL_COLUMN":
+            mullion = self.propped_mullion_check(profile, envelope)
+            if mullion is not None and mullion["ratio"] > ratio:
+                ratio = mullion["ratio"]
+                check_label = mullion["label"]
         return ratio, check_label, result
+
+    def propped_end_context(self):
+        """The current sizing group's lightweight end frame, if it is one (building-load mode)."""
+        if not getattr(self, "building_load_mode", None):
+            return None
+        model = getattr(self, "building_model_override", None)
+        if model is None:
+            return None
+        gridlines = getattr(self, "building_load_gridlines", None) or model.gridline_ids
+        gridline = model.gridlines[model.gridline_index(gridlines[0])]
+        frame_type = model.frame_type(gridline.frame_type)
+        if frame_type.kind != "propped_end":
+            return None
+        end_face = "front" if gridline.id == model.gridline_ids[0] else "back"
+        return {"model": model, "frame_type": frame_type, "end_face": end_face,
+                "end_wall_clad": not model.wall(end_face).fully_open}
+
+    def propped_end_bracing_springs(self, context, brace):
+        """End-wall bracing restraint for a propped end frame's eaves.
+
+        One tension diagonal in the end-wall panel between each column and its
+        nearest prop: k = E·A·cos²θ / L. It acts on the left eave, or on both
+        eaves when the end walls are braced on both sides. Brace forces stay
+        with the bracing design (D2a).
+        """
+        model, frame_type = context["model"], context["frame_type"]
+        span, eave = model.main.span_mm, model.main.eave_mm
+        area = float(brace.get("area_mm2", 0.0) or 0.0)
+        widths = {"left": frame_type.prop_x_mm[0], "right": span - frame_type.prop_x_mm[-1]}
+        sides = ("left", "right") if self.end_wall_braced_sides_combo.currentText() == "Both sides" else ("left",)
+        springs = {}
+        for side in sides:
+            width = widths[side]
+            diagonal = math.hypot(width, eave)
+            cos_theta = width / diagonal
+            springs[side] = {"panel_width_mm": width, "diagonal_mm": diagonal, "cos_theta": cos_theta,
+                             "spring_kn_mm": 200000.0 * area * cos_theta ** 2 / diagonal / 1000.0}
+        return {"modelled": True, "basis": "propped end frame: end-wall bracing panel next to each column",
+                "brace_label": brace.get("label"), "brace_area_mm2": area,
+                "restraint": "Both eaves" if len(sides) == 2 else "Left eave", "springs": springs}
+
+    def propped_mullion_check(self, profile, envelope):
+        """Load-bearing mullion of a propped end frame: frame axial force plus end-wall wind bending.
+
+        Each prop spans from the ground to the rafter, pinned at both ends, with
+        the end-wall mullion basis: mid-height flybrace (effective length H/2),
+        am 1.75 and H/150 deflection. End-wall pressure acts on its tributary
+        width (half the distance to each neighbouring prop or column). The 2D
+        envelope's largest compression and largest tension are each combined
+        with the full wind bending. This is conservative, because those
+        maxima come from different cases.
+        """
+        context = self.propped_end_context()
+        if context is None:
+            return None
+        from end_wall import mullion_profile_design, roof_height_mm
+        model, frame_type = context["model"], context["frame_type"]
+        design = getattr(self, "end_wall_mullion_design", None) or {}
+        strength_kpa = float(design.get("strength_pressure_kpa", 0.0) or 0.0) if context["end_wall_clad"] else 0.0
+        service_kpa = float(design.get("service_kpa", 0.0) or 0.0) if context["end_wall_clad"] else 0.0
+        compression = float(((envelope or {}).get("compression_kn") or {}).get("value", 0.0) or 0.0)
+        tension = float(((envelope or {}).get("tension_kn") or {}).get("value", 0.0) or 0.0)
+        span = model.main.span_mm
+        stations = [0.0, *frame_type.prop_x_mm, span]
+        governing = None
+        for index, x_mm in enumerate(frame_type.prop_x_mm, start=1):
+            height = roof_height_mm(x_mm, span, model.main.eave_mm, model.main.pitch_deg, model.main.roof_shape)
+            width = (stations[index + 1] - stations[index - 1]) / 2.0
+            for axial in (-compression, tension):
+                item = mullion_profile_design(profile, height, width, strength_kpa, service_kpa, axial_force_kn=axial)
+                if governing is None or item["governing_ratio"] > governing["ratio"]:
+                    mode = "deflection" if item["deflection_ratio"] >= item["strength_ratio"] else "axial + bending"
+                    governing = {"ratio": item["governing_ratio"], "x_mm": x_mm, "height_mm": height,
+                                 "tributary_width_mm": width, "axial_kn": axial, "item": item,
+                                 "label": f"Propped mullion ({mode}: frame axial + end-wall wind)"}
+        return governing
 
     def auto_size_is_truss_chord_group(self, group):
         return group in {
@@ -16312,28 +16475,6 @@ class MainWindow(QMainWindow):
                 ratios.append((result["governing"]["ratio"], f"Web split chord-joint {result['governing']['label']}"))
         return max(ratios, default=(0.0, ""), key=lambda item: item[0])
 
-    def auto_size_coordinated_choices(self, active_specs, ratio_cache):
-        """Screen every active section against the current exact demand envelopes."""
-        decisions = {}
-        for spec in active_specs:
-            combo = spec[1]
-            decision = decisions.setdefault(id(combo), {"combo": combo, "specs": []})
-            decision["specs"].append(spec)
-
-        choices = []
-        unresolved = []
-        for decision in decisions.values():
-            candidate = self.auto_size_frozen_candidate(
-                decision["combo"],
-                decision["specs"],
-                ratio_cache,
-            )
-            if candidate is None:
-                unresolved.extend((label, group, None) for label, _, group in decision["specs"])
-                continue
-            choices.append((decision["combo"], candidate[3]))
-        return choices, unresolved
-
     def auto_size_exact_neighbour_candidate(
         self,
         active_specs,
@@ -16420,371 +16561,11 @@ class MainWindow(QMainWindow):
             ),
         )
 
-    def auto_size_frozen_group_profile_ratio(self, group_profiles, ratio_cache, cache_prefix="local-depth"):
-        """Estimate proposed section changes against the current exact demand envelopes."""
-        envelopes = self.design_envelope_actions or {}
-        worst_ratio = 0.0
-        worst_check = "-"
-        for group, profile in group_profiles:
-            envelope = envelopes.get(group)
-            if profile is None or not self.member_envelope_has_demands(envelope):
-                continue
-            chord_profiles = self.web_connection_group_profiles(group) if group in {
-                "WEB", "LEFT_CANOPY_WEB", "RIGHT_CANOPY_WEB",
-            } else None
-            if chord_profiles is not None and not self.web_profile_fits_chords(profile, group, chord_profiles=chord_profiles):
-                return float("inf"), "Connection geometry"
-            chord_names = tuple(item.name if item is not None else "-" for item in (chord_profiles or ()))
-            cache_key = (cache_prefix, group, profile.name, id(envelope), chord_names)
-            if cache_key not in ratio_cache:
-                ratio_cache[cache_key] = self.member_and_connection_ratio(
-                    profile,
-                    envelope,
-                    group,
-                    chord_profiles=chord_profiles,
-                )[:2]
-            ratio, check_label = ratio_cache[cache_key]
-            if ratio > worst_ratio:
-                worst_ratio = ratio
-                worst_check = check_label
-            if group in {
-                "TOP", "BOTTOM", "LEFT_CANOPY_TOP", "LEFT_CANOPY_BOTTOM",
-                "RIGHT_CANOPY_TOP", "RIGHT_CANOPY_BOTTOM",
-            } and self.doubled_chord_length_fraction(group) > MAX_DOUBLED_CHORD_LENGTH_FRACTION:
-                single_envelope = (envelopes.get("single_chord_envelopes") or {}).get(group)
-                if self.member_envelope_has_demands(single_envelope):
-                    single_key = (cache_prefix, "single", group, profile.name, id(single_envelope))
-                    if single_key not in ratio_cache:
-                        ratio_cache[single_key] = (
-                            self.member_check_result(profile, single_envelope, group).governing_ratio,
-                            "Single chord envelope",
-                        )
-                    single_ratio, single_check = ratio_cache[single_key]
-                    if single_ratio > worst_ratio:
-                        worst_ratio = single_ratio
-                        worst_check = single_check
-                joint_ratio = self.auto_size_chord_joint_ratio(profile, group)
-                if joint_ratio > worst_ratio:
-                    worst_ratio = joint_ratio
-                    worst_check = "Chord-web joint"
-        return worst_ratio, worst_check
-
-    def auto_size_try_depth_reduction(self, active_specs, best_state, exact_solves):
-        if self.frame_system_combo.currentText() != "Truss":
-            return best_state, exact_solves, None
-        try:
-            current_depth = float(self.depth_input.text())
-        except ValueError:
-            return best_state, exact_solves, None
-        min_depth = self.truss_depth_from_span(MAIN_TRUSS_DEPTH_MIN_RATIO)
-        trial_depth = current_depth - 50.0
-        if trial_depth < min_depth - 1e-9:
-            return best_state, exact_solves, None
-        self.depth_input.setText(f"{trial_depth:.0f}")
-        self.generate_and_solve()
-        QApplication.processEvents()
-        exact_solves += 1
-        ratio, group, check = self.auto_size_overall_ratio(active_specs)
-        cost = (self.costing_summary or {}).get("total_cost", float("inf"))
-        if self.auto_size_design_acceptable(active_specs, ratio) and cost < best_state["cost"] - 1e-6:
-            saving = best_state["cost"] - cost
-            best_state = self.auto_size_capture_state(active_specs, ratio, cost)
-            return best_state, exact_solves, (
-                f"depth {current_depth:.0f} -> {trial_depth:.0f} | verified ratio {ratio:.3f}, "
-                f"saving ${saving:,.0f}"
-            )
-        self.auto_size_restore_state(best_state)
-        self.generate_and_solve()
-        QApplication.processEvents()
-        exact_solves += 1
-        return best_state, exact_solves, None
-
     def auto_size_depth_increment_from_ratio(self, current_depth, ratio, max_step=250.0):
         if ratio <= 1.0:
             return 50.0
         target_depth = current_depth * min(max(math.sqrt(ratio) * 1.03, 1.05), 1.50)
         return min(max(self.round_up_to_increment(target_depth - current_depth, 50.0), 50.0), max_step)
-
-    def auto_size_try_depth_for_column_saving(self, active_specs, best_state, exact_solves, ratio_cache=None, max_depth_steps=3, max_candidates=4):
-        if self.frame_system_combo.currentText() != "Truss" or best_state is None:
-            return best_state, exact_solves, None
-        if not self.symmetric_end_columns_should_match():
-            return best_state, exact_solves, None
-        specs_by_group = {group: (label, combo, group) for label, combo, group in active_specs}
-        left_spec = specs_by_group.get("LEFT_COLUMN")
-        right_spec = specs_by_group.get("RIGHT_COLUMN")
-        if left_spec is None or right_spec is None:
-            return best_state, exact_solves, None
-        _, left_combo, _ = left_spec
-        _, right_combo, _ = right_spec
-        try:
-            base_depth = float(best_state["depth"])
-        except (TypeError, ValueError):
-            return best_state, exact_solves, None
-        max_depth = self.max_main_truss_depth_mm()
-        if base_depth >= max_depth - 1e-9:
-            return best_state, exact_solves, None
-
-        self.auto_size_restore_state(best_state)
-        left_profile = self.selected_profile(left_combo)
-        right_profile = self.selected_profile(right_combo)
-        if left_profile is None or right_profile is None:
-            return best_state, exact_solves, None
-        ratio_cache = ratio_cache if ratio_cache is not None else {}
-        family = self.profile_family_name(left_profile)
-        current_cost = max(
-            self.auto_size_profile_cost_key(left_profile),
-            self.auto_size_profile_cost_key(right_profile),
-        )
-        candidates = []
-        for index in self.auto_size_candidate_indices(left_combo, "LEFT_COLUMN", min_metric_step=0.0):
-            profile = self.catalog.get(left_combo.itemText(index))
-            if profile is None:
-                continue
-            if family and self.profile_family_name(profile) != family:
-                continue
-            candidate_cost = self.auto_size_profile_cost_key(profile)
-            if candidate_cost >= current_cost - 1e-9:
-                continue
-            right_index = right_combo.findText(left_combo.itemText(index))
-            if right_index < 0:
-                right_index = next(
-                    (
-                        candidate_index for candidate_index in range(right_combo.count())
-                        if getattr(self.catalog.get(right_combo.itemText(candidate_index)), "name", None) == profile.name
-                    ),
-                    -1,
-                )
-            if right_index < 0:
-                continue
-            frozen_ratio, _ = self.auto_size_frozen_group_profile_ratio(
-                (("LEFT_COLUMN", profile), ("RIGHT_COLUMN", profile)),
-                ratio_cache,
-                cache_prefix="local-column-depth",
-            )
-            if frozen_ratio > 1.20:
-                continue
-            candidates.append((candidate_cost, frozen_ratio, profile.name, index, right_index))
-        if not candidates:
-            return best_state, exact_solves, None
-        candidates = sorted(candidates, key=lambda item: (item[1], -item[0], item[2]))[:max_candidates]
-
-        original_state = self.auto_size_clone_state(best_state)
-        best_trial = None
-        best_trial_state = None
-        for step in range(1, max_depth_steps + 1):
-            trial_depth = base_depth + 50.0 * step
-            if trial_depth > max_depth + 1e-9:
-                break
-            depth_relief = min(max(trial_depth / max(base_depth, 1.0), 1.0), 1.20)
-            for _, frozen_ratio, profile_name, left_index, right_index in candidates:
-                if frozen_ratio > depth_relief * 1.05:
-                    continue
-                self.auto_size_restore_state(original_state)
-                self.depth_input.setText(f"{trial_depth:.0f}")
-                left_combo.setCurrentIndex(left_index)
-                right_combo.setCurrentIndex(right_index)
-                self.generate_and_solve()
-                QApplication.processEvents()
-                exact_solves += 1
-                ratio, group, check = self.auto_size_overall_ratio(active_specs)
-                cost = (self.costing_summary or {}).get("total_cost", float("inf"))
-                if not self.auto_size_design_acceptable(active_specs, ratio) or cost >= original_state["cost"] - 1e-6:
-                    continue
-                saving = original_state["cost"] - cost
-                option = (cost, saving, trial_depth, profile_name, ratio, group, check)
-                if best_trial is None or option[0] < best_trial[0]:
-                    best_trial = option
-                    best_trial_state = self.auto_size_capture_state(active_specs, ratio, cost)
-
-        best_state = best_trial_state or original_state
-        self.auto_size_restore_state(best_state)
-        self.generate_and_solve()
-        QApplication.processEvents()
-        exact_solves += 1
-        if best_trial is None:
-            return best_state, exact_solves, None
-        _, saving, trial_depth, profile_name, ratio, group, check = best_trial
-        return best_state, exact_solves, (
-            f"depth {base_depth:.0f} -> {trial_depth:.0f}, end columns -> {profile_name} | "
-            f"verified {group} {check} {ratio:.3f}, saving ${saving:,.0f}"
-        )
-
-    def auto_size_try_depth_for_chord_saving(self, active_specs, best_state, exact_solves, ratio_cache=None, max_depth_steps=4, max_candidates=10):
-        if self.frame_system_combo.currentText() != "Truss" or best_state is None:
-            return best_state, exact_solves, None
-        specs_by_group = {group: (label, combo, group) for label, combo, group in active_specs}
-        top_spec = specs_by_group.get("TOP")
-        bottom_spec = specs_by_group.get("BOTTOM")
-        if top_spec is None or bottom_spec is None:
-            return best_state, exact_solves, None
-        _, chord_combo, _ = top_spec
-        if bottom_spec[1] is not chord_combo:
-            return best_state, exact_solves, None
-        try:
-            base_depth = float(best_state["depth"])
-        except (TypeError, ValueError):
-            return best_state, exact_solves, None
-        max_depth = self.max_main_truss_depth_mm()
-        if base_depth >= max_depth - 1e-9:
-            return best_state, exact_solves, None
-
-        self.auto_size_restore_state(best_state)
-        current_profile = self.selected_profile(chord_combo)
-        if current_profile is None:
-            return best_state, exact_solves, None
-        ratio_cache = ratio_cache if ratio_cache is not None else {}
-        current_cost = self.auto_size_search_cost_key(current_profile, "TOP")
-        candidates = []
-        for index in self.auto_size_candidate_indices(chord_combo, "TOP", min_metric_step=0.0):
-            profile = self.catalog.get(chord_combo.itemText(index))
-            if profile is None or profile.name == current_profile.name:
-                continue
-            candidate_cost = self.auto_size_search_cost_key(profile, "TOP")
-            if candidate_cost >= current_cost - 1e-9:
-                continue
-            family = self.profile_family_name(profile)
-            family_rank = 0 if family in {"SHS", "RHS", "CHS"} else 1
-            frozen_ratio, _ = self.auto_size_frozen_group_profile_ratio(
-                (("TOP", profile), ("BOTTOM", profile)),
-                ratio_cache,
-                cache_prefix="local-chord-depth",
-            )
-            if frozen_ratio > 1.35:
-                continue
-            candidates.append((family_rank, frozen_ratio, candidate_cost, profile.name, index))
-        if not candidates:
-            return best_state, exact_solves, None
-        candidates = sorted(candidates, key=lambda item: (item[0], item[1], -item[2], item[3]))[:max_candidates]
-
-        original_state = self.auto_size_clone_state(best_state)
-        best_trial = None
-        best_trial_state = None
-        for step in range(1, max_depth_steps + 1):
-            trial_depth = base_depth + 50.0 * step
-            if trial_depth > max_depth + 1e-9:
-                break
-            depth_relief = min(max(trial_depth / max(base_depth, 1.0), 1.0), 1.25)
-            for _, frozen_ratio, _, profile_name, chord_index in candidates:
-                if frozen_ratio > depth_relief * 1.08:
-                    continue
-                self.auto_size_restore_state(original_state)
-                self.depth_input.setText(f"{trial_depth:.0f}")
-                chord_combo.setCurrentIndex(chord_index)
-                self.auto_web_profile_assignments.pop("WEB", None)
-                self.auto_web_assignment_basis.pop("WEB", None)
-                self.auto_web_joint_doubler_sides.pop("WEB", None)
-                self.generate_and_solve()
-                QApplication.processEvents()
-                exact_solves += 1
-                ratio, group, check = self.auto_size_overall_ratio(active_specs)
-                cost = (self.costing_summary or {}).get("total_cost", float("inf"))
-                if not self.auto_size_design_acceptable(active_specs, ratio) or cost >= original_state["cost"] - 1e-6:
-                    continue
-                saving = original_state["cost"] - cost
-                option = (cost, saving, trial_depth, profile_name, ratio, group, check)
-                if best_trial is None or option[0] < best_trial[0]:
-                    best_trial = option
-                    best_trial_state = self.auto_size_capture_state(active_specs, ratio, cost)
-
-        best_state = best_trial_state or original_state
-        self.auto_size_restore_state(best_state)
-        self.generate_and_solve()
-        QApplication.processEvents()
-        exact_solves += 1
-        if best_trial is None:
-            return best_state, exact_solves, None
-        _, saving, trial_depth, profile_name, ratio, group, check = best_trial
-        return best_state, exact_solves, (
-            f"depth {base_depth:.0f} -> {trial_depth:.0f}, chords -> {profile_name} | "
-            f"verified {group} {check} {ratio:.3f}, saving ${saving:,.0f}"
-        )
-
-    def auto_size_local_search(
-        self,
-        active_specs,
-        ratio_cache,
-        best_state,
-        exact_solves,
-        max_passes=5,
-        column_depth_steps=3,
-        column_candidates=4,
-        chord_depth_steps=4,
-        chord_candidates=10,
-    ):
-        if best_state is None:
-            return best_state, exact_solves, []
-        self.auto_size_restore_state(best_state)
-        self.generate_and_solve()
-        QApplication.processEvents()
-        exact_solves += 1
-        reports = []
-        rejected = set()
-        min_local_saving = max(100.0, best_state["cost"] * 0.0015 if math.isfinite(best_state["cost"]) else 0.0)
-        for _ in range(max_passes):
-            improved = False
-            for _neighbour_trial in range(8):
-                neighbour = self.auto_size_exact_neighbour_candidate(
-                    active_specs,
-                    ratio_cache,
-                    max_frozen_ratio=1.10,
-                    rejected=rejected,
-                    min_estimated_saving=min_local_saving,
-                )
-                if neighbour is None:
-                    break
-                frozen_ratio, _, candidate_name, combo, candidate_index, previous_name, estimated_saving, move_key = neighbour
-                combo.setCurrentIndex(candidate_index)
-                self.generate_and_solve()
-                QApplication.processEvents()
-                exact_solves += 1
-                trial_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-                trial_cost = (self.costing_summary or {}).get("total_cost", float("inf"))
-                if self.auto_size_design_acceptable(active_specs, trial_ratio) and trial_cost < best_state["cost"] - 1e-6:
-                    saving = best_state["cost"] - trial_cost
-                    reports.append(
-                        f"{previous_name} -> {candidate_name} | frozen {frozen_ratio:.3f}, "
-                        f"verified {trial_ratio:.3f}, saving ${saving:,.0f}"
-                    )
-                    best_state = self.auto_size_capture_state(active_specs, trial_ratio, trial_cost)
-                    improved = True
-                    break
-                else:
-                    rejected.add(move_key)
-                    self.auto_size_restore_state(best_state)
-            best_state, exact_solves, depth_report = self.auto_size_try_depth_reduction(active_specs, best_state, exact_solves)
-            if depth_report:
-                reports.append(depth_report)
-                improved = True
-            best_state, exact_solves, column_trade_report = self.auto_size_try_depth_for_column_saving(
-                active_specs,
-                best_state,
-                exact_solves,
-                ratio_cache,
-                max_depth_steps=column_depth_steps,
-                max_candidates=column_candidates,
-            )
-            if column_trade_report:
-                reports.append(column_trade_report)
-                improved = True
-            best_state, exact_solves, chord_trade_report = self.auto_size_try_depth_for_chord_saving(
-                active_specs,
-                best_state,
-                exact_solves,
-                ratio_cache,
-                max_depth_steps=chord_depth_steps,
-                max_candidates=chord_candidates,
-            )
-            if chord_trade_report:
-                reports.append(chord_trade_report)
-                improved = True
-            if not improved:
-                break
-        self.auto_size_restore_state(best_state)
-        self.generate_and_solve()
-        QApplication.processEvents()
-        exact_solves += 1
-        return best_state, exact_solves, reports
 
     def auto_size_state_signature(self, active_specs):
         seen = set()
@@ -16812,19 +16593,6 @@ class MainWindow(QMainWindow):
         self.auto_web_profile_assignments = copy.deepcopy(state["web_assignments"])
         self.auto_web_assignment_basis = copy.deepcopy(state.get("web_assignment_basis", {}))
         self.auto_web_joint_doubler_sides = copy.deepcopy(state.get("web_joint_doubler_sides", {}))
-
-    def auto_size_clone_state(self, state):
-        return {
-            "cost": state["cost"],
-            "ratio": state["ratio"],
-            "depth": state["depth"],
-            "left_depth": state.get("left_depth"),
-            "right_depth": state.get("right_depth"),
-            "combos": list(state["combos"]),
-            "web_assignments": copy.deepcopy(state.get("web_assignments", {})),
-            "web_assignment_basis": copy.deepcopy(state.get("web_assignment_basis", {})),
-            "web_joint_doubler_sides": copy.deepcopy(state.get("web_joint_doubler_sides", {})),
-        }
 
     def auto_size_capture_state(self, active_specs, ratio=None, cost=None):
         unique_combos = []
@@ -16955,117 +16723,6 @@ class MainWindow(QMainWindow):
                 ratios.append((demand / limit if limit > 1e-12 else float("inf"), f"{label} {component} deflection", f"Span/{divisor:.0f}"))
         return ratios
 
-    def auto_size_main_truss_ratio(self, active_specs):
-        ratios = []
-        envelopes = self.design_envelope_actions or {}
-        main_groups = {"TOP", "BOTTOM", "WEB"}
-        for _, combo, group in active_specs:
-            if group not in main_groups:
-                continue
-            envelope = envelopes.get(group)
-            if self.member_envelope_has_demands(envelope):
-                ratio, check, _ = self.member_and_connection_ratio(self.selected_profile(combo), envelope, group)
-                ratios.append((ratio, group, check))
-            fraction = self.doubled_chord_length_fraction(group)
-            if fraction > 0.0:
-                ratios.append((fraction / MAX_DOUBLED_CHORD_LENGTH_FRACTION, group, "Doubled chord length limit"))
-        ratios.extend(self.truss_midspan_deflection_ratios())
-        return max(ratios, default=(0.0, "-", "-"), key=lambda item: item[0])
-
-    def auto_size_adjust_truss_depth(self, active_specs):
-        if getattr(self, "frame_system_combo", None) is not None and self.frame_system_combo.currentText() == "Rafter":
-            return None
-        try:
-            current_depth = float(self.depth_input.text())
-            min_depth = self.truss_depth_from_span(MAIN_TRUSS_DEPTH_MIN_RATIO)
-            max_depth = self.max_main_truss_depth_mm()
-        except ValueError:
-            return None
-
-        current_depth = min(max(self.round_up_to_increment(current_depth, 50.0), min_depth), max_depth)
-        self.depth_input.setText(f"{current_depth:.0f}")
-        self.generate_and_solve()
-        QApplication.processEvents()
-
-        start_depth = current_depth
-        best_depth = current_depth
-        ratio, _, _ = self.auto_size_main_truss_ratio(active_specs)
-        overall_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-        serviceability = self.auto_size_serviceability_ratio()
-        frame_sway_failure = (
-            ratio <= 1.0
-            and not self.design_utilization_ok(overall_ratio)
-            and serviceability[0] >= overall_ratio - 1e-9
-            and "column" in str(serviceability[1]).lower()
-        )
-        if frame_sway_failure:
-            # Truss depth is a whole-frame stiffness variable. A truss can pass
-            # its own checks while its chord separation is still too small to
-            # control eave sway economically.
-            best_serviceability = serviceability[0]
-            non_improving_steps = 0
-            trial_depth = current_depth + 50.0
-            while trial_depth <= max_depth:
-                self.depth_input.setText(f"{trial_depth:.0f}")
-                self.generate_and_solve()
-                QApplication.processEvents()
-                trial_ratio, _, _ = self.auto_size_main_truss_ratio(active_specs)
-                trial_overall, _, _ = self.auto_size_overall_ratio(active_specs)
-                trial_serviceability = self.auto_size_serviceability_ratio()[0]
-                if trial_ratio <= 1.0 and trial_serviceability < best_serviceability - 1e-4:
-                    best_depth = trial_depth
-                    best_serviceability = trial_serviceability
-                    non_improving_steps = 0
-                else:
-                    non_improving_steps += 1
-                if trial_ratio <= 1.0 and self.design_utilization_ok(trial_overall):
-                    best_depth = trial_depth
-                    break
-                if non_improving_steps >= 2:
-                    break
-                trial_depth += 50.0
-        elif ratio <= 1.0:
-            trial_depth = current_depth - 50.0
-            while trial_depth >= min_depth:
-                self.depth_input.setText(f"{trial_depth:.0f}")
-                self.generate_and_solve()
-                QApplication.processEvents()
-                trial_ratio, _, _ = self.auto_size_main_truss_ratio(active_specs)
-                overall_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-                if trial_ratio > 1.0 or not self.design_utilization_ok(overall_ratio):
-                    break
-                best_depth = trial_depth
-                trial_depth -= 50.0
-        else:
-            trial_depth = min(current_depth + self.auto_size_depth_increment_from_ratio(current_depth, ratio), max_depth)
-            while trial_depth <= max_depth:
-                self.depth_input.setText(f"{trial_depth:.0f}")
-                self.generate_and_solve()
-                QApplication.processEvents()
-                trial_ratio, _, _ = self.auto_size_main_truss_ratio(active_specs)
-                best_depth = trial_depth
-                if trial_ratio <= 1.0:
-                    break
-                trial_depth = min(
-                    trial_depth + self.auto_size_depth_increment_from_ratio(trial_depth, trial_ratio),
-                    max_depth + 50.0,
-                )
-
-        self.depth_input.setText(f"{best_depth:.0f}")
-        self.generate_and_solve()
-        QApplication.processEvents()
-        final_ratio, final_group, final_check = self.auto_size_main_truss_ratio(active_specs)
-        return {
-            "label": "Main truss depth",
-            "start": start_depth,
-            "end": best_depth,
-            "min": min_depth,
-            "max": max_depth,
-            "ratio": final_ratio,
-            "governing_group": final_group,
-            "governing_check": final_check,
-        }
-
     def addition_depth_bounds(self, side):
         """Return the valid 50 mm depth range for an active canopy/lean-to truss."""
         frame_combo = getattr(self, f"{side}_canopy_frame_system_combo")
@@ -17090,142 +16747,6 @@ class MainWindow(QMainWindow):
         )
         max_depth = max(max_depth, min_depth, self.round_up_to_increment(current_depth, 50.0))
         return min_depth, max_depth
-
-    def auto_size_adjust_addition_depth(self, side, active_specs, *, optimise_cost=False, coarse_increment=50.0):
-        prefix = side.upper()
-        depth_input = getattr(self, f"{side}_canopy_shallow_depth_input")
-        bounds = self.addition_depth_bounds(side)
-        if bounds is None:
-            return None
-        min_depth, max_depth = bounds
-        current_depth = float(depth_input.text())
-        relevant_specs = [
-            spec for spec in active_specs
-            if spec[2].startswith(f"{prefix}_CANOPY_") or spec[2] == f"{prefix}_LEAN_COLUMN"
-        ]
-        if not relevant_specs:
-            return None
-
-        def addition_ratio():
-            values = []
-            envelopes = self.design_envelope_actions or {}
-            for _, combo, group in relevant_specs:
-                envelope = envelopes.get(group)
-                if self.member_envelope_has_demands(envelope):
-                    ratio, check, _ = self.member_and_connection_ratio(self.selected_profile(combo), envelope, group)
-                    values.append((ratio, group, check))
-                fraction = self.doubled_chord_length_fraction(group)
-                if fraction > 0.0:
-                    values.append((fraction / MAX_DOUBLED_CHORD_LENGTH_FRACTION, group, "Doubled chord length limit"))
-            for key, item in envelopes.get("sls_canopy_tip_deflections", {}).items():
-                if side not in str(key).lower() or item.get("length_mm", 0.0) <= 0.0:
-                    continue
-                limit = item["length_mm"] / self.canopy_tip_deflection_divisor()
-                values.append((max(item.get("value", 0.0), 0.0) / limit, prefix, "Tip deflection"))
-            values.extend(
-                (ratio, prefix, label)
-                for ratio, label, _ in self.side_midspan_deflection_ratios(side_filter=side)
-            )
-            return max(values, default=(0.0, prefix, "-"), key=lambda item: item[0])
-
-        current_depth = min(max(self.round_up_to_increment(current_depth, 50.0), min_depth), max_depth)
-        start_depth = current_depth
-
-        if optimise_cost:
-            best_depth = None
-            best_cost = float("inf")
-            best_ratio = float("inf")
-            best_group = prefix
-            best_check = "-"
-            evaluated = []
-            coarse_increment = max(self.round_up_to_increment(float(coarse_increment), 50.0), 50.0)
-            trial_depths = []
-            trial_depth = min_depth
-            while trial_depth <= max_depth + 1e-9:
-                trial_depths.append(trial_depth)
-                trial_depth += coarse_increment
-            if not any(abs(depth - start_depth) <= 1e-9 for depth in trial_depths):
-                trial_depths.append(start_depth)
-
-            evaluated_depths = set()
-
-            def evaluate_depth(trial_depth):
-                nonlocal best_depth, best_cost, best_ratio, best_group, best_check
-                depth_input.setText(f"{trial_depth:.0f}")
-                self.generate_and_solve()
-                QApplication.processEvents()
-                trial_ratio, trial_group, trial_check = addition_ratio()
-                overall_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-                cost = float((self.costing_summary or {}).get("total_cost", float("inf")))
-                passes = self.auto_size_design_acceptable(active_specs, overall_ratio)
-                evaluated.append({
-                    "depth_mm": trial_depth,
-                    "cost": cost if math.isfinite(cost) else None,
-                    "passes": passes,
-                    "ratio": trial_ratio,
-                })
-                if passes and cost < best_cost - 1e-6:
-                    best_depth = trial_depth
-                    best_cost = cost
-                    best_ratio = trial_ratio
-                    best_group = trial_group
-                    best_check = trial_check
-                evaluated_depths.add(round(trial_depth, 6))
-
-            for trial_depth in sorted(trial_depths):
-                evaluate_depth(trial_depth)
-
-            # A 100 mm AI-branch sweep is followed by exact 50 mm neighbours
-            # around its cheapest passing point. This preserves the catalogue
-            # increment while avoiding a full 50 mm scan of a very wide range.
-            if coarse_increment > 50.0 and best_depth is not None:
-                for trial_depth in (best_depth - 50.0, best_depth + 50.0):
-                    key = round(trial_depth, 6)
-                    if min_depth <= trial_depth <= max_depth and key not in evaluated_depths:
-                        evaluate_depth(trial_depth)
-            if best_depth is None:
-                best_depth = start_depth
-            depth_input.setText(f"{best_depth:.0f}")
-            self.generate_and_solve()
-            QApplication.processEvents()
-            final_ratio, final_group, final_check = addition_ratio()
-            return {
-                "label": f"{side.title()} canopy/lean-to depth",
-                "start": start_depth,
-                "end": best_depth,
-                "min": min_depth,
-                "max": max_depth,
-                "ratio": final_ratio,
-                "governing_group": final_group,
-                "governing_check": final_check,
-                "selection_basis": "lowest verified total cost",
-                "selected_cost": best_cost if math.isfinite(best_cost) else None,
-                "evaluated_depths": evaluated,
-            }
-
-        best_depth = current_depth
-        depth_input.setText(f"{current_depth:.0f}")
-        self.generate_and_solve()
-        ratio, _, _ = addition_ratio()
-        step = -50.0 if ratio <= 1.0 else 50.0
-        trial_depth = current_depth + step
-        while min_depth <= trial_depth <= max_depth:
-            depth_input.setText(f"{trial_depth:.0f}")
-            self.generate_and_solve()
-            trial_ratio, _, _ = addition_ratio()
-            overall_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-            if step < 0.0 and (trial_ratio > 1.0 or not self.design_utilization_ok(overall_ratio)):
-                break
-            best_depth = trial_depth
-            if step > 0.0 and trial_ratio <= 1.0:
-                break
-            trial_depth += step
-        depth_input.setText(f"{best_depth:.0f}")
-        self.generate_and_solve()
-        final_ratio, final_group, final_check = addition_ratio()
-        return {"label": f"{side.title()} canopy/lean-to depth", "start": start_depth, "end": best_depth,
-                "min": min_depth, "max": max_depth, "ratio": final_ratio,
-                "governing_group": final_group, "governing_check": final_check}
 
     def auto_size_repair_deflections(self):
         """Increase truss depths after final member selection until SLS deflections pass."""
@@ -17433,9 +16954,6 @@ class MainWindow(QMainWindow):
             adopted = None
             best_failure = (governing[0], original_index, current_profile.name, governing)
             required_metric = current_metric * max(governing[0] * 1.08, 1.10)
-            learned_metric = self.optimisation_surrogate_metrics.get(group)
-            if learned_metric:
-                required_metric = max(required_metric, min(learned_metric, required_metric * 1.50))
             tried_indices = set()
             previous_ratio = governing[0]
             previous_metric = current_metric
@@ -17510,158 +17028,6 @@ class MainWindow(QMainWindow):
             reports.append(
                 f"{label:<31}: {current_profile.name} -> {adopted[0]} | deflection "
                 f"{adopted[1][0]:.3f} ({adopted[1][1]}, {adopted[1][2]}) | strength {adopted[2]:.3f} | OK"
-            )
-        return reports, exact_solves
-
-    def symmetric_end_columns_should_match(self):
-        features = self.optimisation_job_features()
-        wall_states = self.envelope_plan_selector.wall_states()
-        left_clad = bool(wall_states.get("left"))
-        right_clad = bool(wall_states.get("right"))
-        if left_clad != right_clad:
-            return False
-        return (
-            self.left_support_combo.currentText() == self.right_support_combo.currentText()
-            and features.get("left_type") == features.get("right_type")
-            and abs(float(features.get("left_projection_m", 0.0)) - float(features.get("right_projection_m", 0.0))) <= 1e-6
-        )
-
-    def auto_size_sync_symmetric_end_columns(self, active_specs):
-        if not self.symmetric_end_columns_should_match():
-            return [], 0
-        specs_by_group = {group: (label, combo, group) for label, combo, group in active_specs}
-        left_spec = specs_by_group.get("LEFT_COLUMN")
-        right_spec = specs_by_group.get("RIGHT_COLUMN")
-        if left_spec is None or right_spec is None:
-            return [], 0
-        _, left_combo, _ = left_spec
-        _, right_combo, _ = right_spec
-        left_profile = self.selected_profile(left_combo)
-        right_profile = self.selected_profile(right_combo)
-        if left_profile is None or right_profile is None or left_profile.name == right_profile.name:
-            return [], 0
-
-        left_metric = self.auto_size_profile_metric(left_profile, "LEFT_COLUMN")
-        right_metric = self.auto_size_profile_metric(right_profile, "RIGHT_COLUMN")
-        target_profile = left_profile if left_metric >= right_metric else right_profile
-        target_metric = max(left_metric, right_metric)
-        target_family = self.profile_family_name(target_profile)
-        candidates = []
-        for index in self.auto_size_candidate_indices(left_combo, "LEFT_COLUMN", min_metric_step=0.0):
-            profile = self.catalog.get(left_combo.itemText(index))
-            if profile is None:
-                continue
-            if target_family and self.profile_family_name(profile) != target_family:
-                continue
-            if self.auto_size_profile_metric(profile, "LEFT_COLUMN") + 1e-9 < target_metric:
-                continue
-            right_index = right_combo.findText(left_combo.itemText(index))
-            if right_index < 0:
-                right_index = next(
-                    (
-                        candidate_index for candidate_index in range(right_combo.count())
-                        if getattr(self.catalog.get(right_combo.itemText(candidate_index)), "name", None) == profile.name
-                    ),
-                    -1,
-                )
-            if right_index < 0:
-                continue
-            candidates.append((self.auto_size_profile_cost_key(profile), self.auto_size_profile_metric(profile, "LEFT_COLUMN"), profile.name, index, right_index))
-        if not candidates:
-            return [], 0
-        _, _, profile_name, left_index, right_index = min(candidates, key=lambda item: (item[0], item[1], item[2]))
-        if left_combo.currentIndex() == left_index and right_combo.currentIndex() == right_index:
-            return [], 0
-        before = (left_profile.name, right_profile.name)
-        left_combo.setCurrentIndex(left_index)
-        right_combo.setCurrentIndex(right_index)
-        self.generate_and_solve()
-        QApplication.processEvents()
-        return [
-            f"End columns matched for symmetric frame: left {before[0]} / right {before[1]} -> {profile_name}"
-        ], 1
-
-    def auto_size_repair_symmetric_end_column_deflections(self, active_specs):
-        if not self.symmetric_end_columns_should_match():
-            return [], 0
-        specs_by_group = {group: (label, combo, group) for label, combo, group in active_specs}
-        left_spec = specs_by_group.get("LEFT_COLUMN")
-        right_spec = specs_by_group.get("RIGHT_COLUMN")
-        if left_spec is None or right_spec is None:
-            return [], 0
-        _, left_combo, _ = left_spec
-        _, right_combo, _ = right_spec
-        governing = max(
-            [self.column_group_deflection_ratio("LEFT_COLUMN"), self.column_group_deflection_ratio("RIGHT_COLUMN")],
-            key=lambda item: item[0],
-        )
-        if governing[0] <= 1.0:
-            return [], 0
-
-        left_profile = self.selected_profile(left_combo)
-        right_profile = self.selected_profile(right_combo)
-        current_metric = max(
-            self.auto_size_profile_metric(left_profile, "LEFT_COLUMN"),
-            self.auto_size_profile_metric(right_profile, "RIGHT_COLUMN"),
-        )
-        target_family = self.profile_family_name(left_profile if self.auto_size_profile_metric(left_profile, "LEFT_COLUMN") >= self.auto_size_profile_metric(right_profile, "RIGHT_COLUMN") else right_profile)
-        candidates = []
-        for index in self.auto_size_candidate_indices(left_combo, "LEFT_COLUMN", min_metric_step=0.0):
-            profile = self.catalog.get(left_combo.itemText(index))
-            if profile is None:
-                continue
-            if target_family and self.profile_family_name(profile) != target_family:
-                continue
-            metric = self.auto_size_profile_metric(profile, "LEFT_COLUMN")
-            if metric <= current_metric * 1.001:
-                continue
-            right_index = right_combo.findText(left_combo.itemText(index))
-            if right_index < 0:
-                right_index = next(
-                    (
-                        candidate_index for candidate_index in range(right_combo.count())
-                        if getattr(self.catalog.get(right_combo.itemText(candidate_index)), "name", None) == profile.name
-                    ),
-                    -1,
-                )
-            if right_index < 0:
-                continue
-            candidates.append((self.auto_size_profile_cost_key(profile), metric, profile.name, index, right_index))
-        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
-        reports = []
-        exact_solves = 0
-        start = (left_profile.name, right_profile.name, governing)
-        adopted = None
-        best = (governing[0], left_combo.currentIndex(), right_combo.currentIndex(), left_profile.name, governing)
-        for _, _, profile_name, left_index, right_index in candidates[:6]:
-            left_combo.setCurrentIndex(left_index)
-            right_combo.setCurrentIndex(right_index)
-            self.generate_and_solve()
-            QApplication.processEvents()
-            exact_solves += 1
-            current_governing = max(
-                [self.column_group_deflection_ratio("LEFT_COLUMN"), self.column_group_deflection_ratio("RIGHT_COLUMN")],
-                key=lambda item: item[0],
-            )
-            if current_governing[0] < best[0]:
-                best = (current_governing[0], left_index, right_index, profile_name, current_governing)
-            if current_governing[0] <= 1.0:
-                adopted = (profile_name, current_governing)
-                break
-        if adopted is None:
-            left_combo.setCurrentIndex(best[1])
-            right_combo.setCurrentIndex(best[2])
-            self.generate_and_solve()
-            QApplication.processEvents()
-            exact_solves += 1
-            reports.append(
-                f"End column pair: {start[0]} / {start[1]} -> {best[3]} | closest deflection "
-                f"{best[4][0]:.3f} ({best[4][1]}, {best[4][2]}) | NOT OK"
-            )
-        else:
-            reports.append(
-                f"End column pair: {start[0]} / {start[1]} -> {adopted[0]} | deflection "
-                f"{adopted[1][0]:.3f} ({adopted[1][1]}, {adopted[1][2]}) | OK"
             )
         return reports, exact_solves
 
@@ -18300,68 +17666,6 @@ class MainWindow(QMainWindow):
             "RIGHT_CANOPY_BOTTOM": self.right_canopy_bottom_profile_combo,
         }.get(group)
 
-    def web_split_related_ratio(self, group):
-        ratios = []
-        envelope = (self.design_envelope_actions or {}).get(group)
-        combo = self.web_group_combo(group)
-        if self.member_envelope_has_demands(envelope) and combo is not None:
-            base_profile = self.selected_profile(combo)
-            split_ratio = self.web_assignment_overall_ratio(base_profile, group)
-            if split_ratio is not None:
-                ratios.append(split_ratio)
-            else:
-                ratio, check_label, _ = self.member_and_connection_ratio(base_profile, envelope, group)
-                ratios.append((ratio, group, check_label))
-        for chord_group in self.web_related_chord_groups(group):
-            chord_envelope = (self.design_envelope_actions or {}).get(chord_group)
-            chord_combo = self.chord_group_combo(chord_group)
-            if not self.member_envelope_has_demands(chord_envelope) or chord_combo is None:
-                continue
-            chord_profile = self.selected_profile(chord_combo)
-            ratio, check_label, _ = self.member_and_connection_ratio(chord_profile, chord_envelope, chord_group)
-            doubled_length_ratio = self.doubled_chord_length_fraction(chord_group) / MAX_DOUBLED_CHORD_LENGTH_FRACTION
-            if doubled_length_ratio > ratio:
-                ratio = doubled_length_ratio
-                check_label = "Doubled chord length limit"
-            ratios.append((ratio, chord_group, check_label))
-        return max(ratios, default=(0.0, group, "-"), key=lambda item: item[0])
-
-    def repair_auto_web_split_with_single_sizes(self, groups):
-        repaired = False
-        previous_preserve = getattr(self, "_preserve_web_assignments_on_solve", False)
-        previous_suppress = getattr(self, "_suppress_auto_web_split_on_solve", False)
-        self._preserve_web_assignments_on_solve = False
-        self._suppress_auto_web_split_on_solve = True
-        try:
-            for group in groups:
-                combo = self.web_group_combo(group)
-                if combo is None:
-                    continue
-                self.auto_web_profile_assignments.pop(group, None)
-                self.auto_web_assignment_basis.pop(group, None)
-                self.auto_web_joint_doubler_sides.pop(group, None)
-                current_profile = self.selected_profile(combo)
-                current_metric = self.auto_size_profile_metric(current_profile, group) if current_profile is not None else 0.0
-                candidate_indices = self.auto_size_candidate_indices(combo, group, min_metric_step=0.0)
-                for index in candidate_indices:
-                    profile = self.catalog.get(combo.itemText(index))
-                    if profile is None:
-                        continue
-                    if not self.web_profile_fits_chords(profile, group):
-                        continue
-                    if current_profile is not None and self.auto_size_profile_metric(profile, group) < current_metric * 0.999:
-                        continue
-                    combo.setCurrentIndex(index)
-                    self.generate_and_solve()
-                    ratio, _, _ = self.web_split_related_ratio(group)
-                    if ratio <= 1.0:
-                        repaired = True
-                        break
-        finally:
-            self._preserve_web_assignments_on_solve = previous_preserve
-            self._suppress_auto_web_split_on_solve = previous_suppress
-        return repaired
-
     def web_assignment_bucket_summary(self, profile, group, demands, ratio_lookup=None):
         if not demands:
             return "0 members"
@@ -18709,89 +18013,6 @@ class MainWindow(QMainWindow):
         }
         return reports
 
-    def auto_size_refine_web_chord_cost(self, active_specs, best_state, exact_solves, max_trials=6):
-        """Trial lighter chords with a fresh two-size web optimisation.
-
-        Frozen-envelope section screening cannot value a wider web that makes a
-        cheaper chord joint possible. Keep this search deliberately small, but
-        use exact reanalysis and the full project cost for every adopted result.
-        """
-        if best_state is None or self.frame_system_combo.currentText() != "Truss":
-            return best_state, exact_solves, []
-
-        active_groups = {group for _, _, group in active_specs}
-        lengths = self.auto_size_group_lengths_m()
-        trials = []
-        seen = set()
-        for web_group in ("WEB", "LEFT_CANOPY_WEB", "RIGHT_CANOPY_WEB"):
-            if web_group not in active_groups:
-                continue
-            chord_groups = self.web_related_chord_groups(web_group)
-            chord_combos = [self.chord_group_combo(group) for group in chord_groups]
-            if not chord_groups or any(combo is None for combo in chord_combos):
-                continue
-            unique_combos = {id(combo): combo for combo in chord_combos}
-            if len(unique_combos) != 1:
-                continue
-            chord_combo = next(iter(unique_combos.values()))
-            current = self.selected_profile(chord_combo)
-            if current is None:
-                continue
-            current_cost = self.auto_size_profile_cost_key(current)
-            chord_length = max(sum(lengths.get(group, 0.0) for group in chord_groups), 1.0)
-            for index in self.auto_size_candidate_indices(chord_combo, chord_groups[0], min_metric_step=0.0):
-                profile = self.catalog.get(chord_combo.itemText(index))
-                if profile is None or profile.name == current.name:
-                    continue
-                candidate_cost = self.auto_size_profile_cost_key(profile)
-                if candidate_cost >= current_cost - 1e-9:
-                    continue
-                key = (id(chord_combo), profile.name, web_group)
-                if key in seen:
-                    continue
-                seen.add(key)
-                estimated_saving = (current_cost - candidate_cost) * chord_length
-                # Start with the nearest cheaper chord steps. Extremely small
-                # sections are cheap on paper but rarely useful exact trials.
-                trials.append((estimated_saving, profile.name, web_group, chord_combo, index, current.name))
-
-        reports = []
-        for estimated_saving, candidate_name, web_group, chord_combo, chord_index, original_name in sorted(trials)[:max_trials]:
-            self.auto_size_restore_state(best_state)
-            chord_combo.setCurrentIndex(chord_index)
-            self.auto_web_profile_assignments.pop(web_group, None)
-            self.auto_web_assignment_basis.pop(web_group, None)
-            self.auto_web_joint_doubler_sides.pop(web_group, None)
-            self.generate_and_solve()
-            exact_solves += 1
-
-            self.auto_size_two_web_assignments(active_specs)
-            self._preserve_web_assignments_on_solve = True
-            try:
-                self.generate_and_solve()
-            finally:
-                self._preserve_web_assignments_on_solve = False
-            exact_solves += 1
-
-            trial_ratio, _, trial_check = self.auto_size_overall_ratio(active_specs)
-            trial_cost = (self.costing_summary or {}).get("total_cost", float("inf"))
-            if self.auto_size_design_acceptable(active_specs, trial_ratio) and trial_cost < best_state["cost"] - 1e-6:
-                saving = best_state["cost"] - trial_cost
-                best_state = self.auto_size_capture_state(active_specs, trial_ratio, trial_cost)
-                reports.append(
-                    f"{web_group} economic web/chord trial adopted: chord {original_name} -> {candidate_name}, "
-                    f"fresh web split | verified {trial_ratio:.3f} {trial_check} | total saving ${saving:,.0f}"
-                )
-
-        self.auto_size_restore_state(best_state)
-        self._preserve_web_assignments_on_solve = True
-        try:
-            self.generate_and_solve()
-        finally:
-            self._preserve_web_assignments_on_solve = False
-        exact_solves += 1
-        return best_state, exact_solves, reports
-
     def auto_size_webs_current_preset(self):
         self.auto_size_report_text = ""
         self.auto_web_profile_assignments = {}
@@ -18911,6 +18132,11 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
 
     def optimisation_progress_update(self, step=None, label=None, exact_solves=None, busy=False):
+        # A caller running the auto-size inside a larger job (the frame +
+        # bracing optimiser) can follow its steps 1-12 on its own progress bar.
+        listener = getattr(self, "optimisation_progress_listener", None)
+        if listener is not None:
+            listener(step, label, exact_solves)
         progress = getattr(self, "optimisation_progress_dialog", None)
         if progress is None:
             return
@@ -18941,13 +18167,152 @@ class MainWindow(QMainWindow):
         from future_canopy_design import run
         return run(self, show_completion=show_completion)
 
+    def auto_size_depth_sweep(self, seed, exact_solves, coarse_step=100.0, descent_moves=4):
+        """Coupled truss depth and section search around a verified design.
+
+        The stiffness screen ranks by serviceability, so it favours deep
+        trusses. A strength-governed frame can be cheaper shallower with
+        lighter columns (factory defaults: 1000 mm with 250UB31.4 columns
+        against 1300 mm with 360UB44.7), and a sway-governed one deeper with
+        lighter columns and chords. A single depth step can't reach either,
+        because the sections have to change with the depth.
+
+        Each trial depth gets the cheapest sections its own solved envelopes
+        allow (auto_size_frozen_candidate, all groups at once), then member and
+        serviceability repairs to an exact pass. Depths are tried every
+        ``coarse_step`` over the permitted range, then the 50 mm neighbours of
+        the cheapest, and the cheapest of all gets a short cheaper-neighbour
+        descent. Only exactly verified states are compared, by full cost.
+        Returns (best state or None, exact_solves, report lines).
+        """
+        if self.frame_system_combo.currentText() != "Truss" or seed is None:
+            return None, exact_solves, []
+        try:
+            minimum = self.round_up_to_increment(self.truss_depth_from_span(MAIN_TRUSS_DEPTH_MIN_RATIO), 50.0)
+            maximum = math.floor(self.max_main_truss_depth_mm() / 50.0) * 50.0
+        except (TypeError, ValueError):
+            return None, exact_solves, []
+        if maximum < minimum:
+            return None, exact_solves, []
+        results = {}
+        solves = [exact_solves]
+
+        def solve():
+            self.generate_and_solve()
+            QApplication.processEvents()
+            solves[0] += 1
+
+        def evaluate(depth):
+            depth = float(depth)
+            if depth in results:
+                return results[depth]
+            self.auto_size_restore_state(seed)
+            self.depth_input.setText(f"{depth:.0f}")
+            # One web size while sizing; the two-size split is made at the end.
+            self.auto_web_profile_assignments = {}
+            self.auto_web_assignment_basis = {}
+            self.auto_web_joint_doubler_sides = {}
+            solve()
+            specs = self.active_auto_size_group_specs()
+            if not self.design_envelope_actions or not specs:
+                results[depth] = None
+                return None
+            decisions = {}
+            for spec in specs:
+                decisions.setdefault(id(spec[1]), {"combo": spec[1], "specs": []})["specs"].append(spec)
+            cache = {}
+            for decision in decisions.values():   # columns, then chords, then webs (to fit the chords)
+                candidate = self.auto_size_frozen_candidate(decision["combo"], decision["specs"], cache)
+                if candidate is not None:
+                    decision["combo"].setCurrentIndex(candidate[3])
+            solve()
+            for _ in range(4):
+                specs = self.active_auto_size_group_specs()
+                ratio, _, _ = self.auto_size_overall_ratio(specs)
+                if self.auto_size_design_acceptable(specs, ratio):
+                    break
+                if self.auto_size_serviceability_ratio()[0] >= ratio - 1e-9:
+                    _, _, sls_solves = self.auto_size_repair_serviceability(specs, {}, max_passes=2)
+                    solves[0] += sls_solves
+                    continue
+                if not self.auto_size_repair_failed_members(specs, {}):
+                    break
+                solve()
+            specs = self.active_auto_size_group_specs()
+            ratio, _, _ = self.auto_size_overall_ratio(specs)
+            if not self.auto_size_design_acceptable(specs, ratio):
+                results[depth] = None
+                return None
+            cost = float((self.costing_summary or {}).get("total_cost", float("inf")))
+            results[depth] = self.auto_size_capture_state(specs, ratio, cost)
+            return results[depth]
+
+        depths = []
+        depth = minimum
+        while depth <= maximum + 1e-9:
+            depths.append(depth)
+            depth += coarse_step
+        if depths[-1] < maximum - 1e-9:
+            depths.append(maximum)
+        for number, depth in enumerate(depths, start=1):
+            self.optimisation_progress_update(
+                10, f"Depth sweep: {depth:.0f} mm ({number} of {len(depths)})...", solves[0])
+            evaluate(depth)
+        passing = {d: s for d, s in results.items() if s is not None}
+        if passing:
+            best_depth = min(passing, key=lambda d: passing[d]["cost"])
+            for depth in (best_depth - 50.0, best_depth + 50.0):
+                if minimum - 1e-9 <= depth <= maximum + 1e-9:
+                    evaluate(depth)
+        passing = {d: s for d, s in results.items() if s is not None}
+        lines = [f"  {d:.0f} mm: " + (f"${s['cost']:,.0f} (exact {float(s['ratio']):.3f})" if s else "no verified design")
+                 for d, s in sorted(results.items())]
+        if not passing:
+            return None, solves[0], lines
+        best = min(passing.values(), key=lambda s: s["cost"])
+        # Short cheaper-neighbour descent on the cheapest depth only.
+        self.auto_size_restore_state(best)
+        solve()
+        specs = self.active_auto_size_group_specs()
+        rejected = set()
+        for _ in range(descent_moves):
+            neighbour = self.auto_size_exact_neighbour_candidate(
+                specs, {}, max_frozen_ratio=1.08, rejected=rejected,
+                min_estimated_saving=max(100.0, best["cost"] * 0.0015))
+            if neighbour is None:
+                break
+            _, _, candidate_name, combo, candidate_index, previous_name, _, move_key = neighbour
+            combo.setCurrentIndex(candidate_index)
+            solve()
+            ratio, _, _ = self.auto_size_overall_ratio(specs)
+            cost = float((self.costing_summary or {}).get("total_cost", float("inf")))
+            if self.auto_size_design_acceptable(specs, ratio) and cost < best["cost"] - 1e-6:
+                lines.append(f"  descent {previous_name} -> {candidate_name}, exact {ratio:.3f}, "
+                             f"saving ${best['cost'] - cost:,.0f}")
+                best = self.auto_size_capture_state(specs, ratio, cost)
+            else:
+                rejected.add(move_key)
+                self.auto_size_restore_state(best)
+                solve()
+        return best, solves[0], lines
+
     def run_physics_structure_optimisation(self, show_completion=True):
-        """Run the experimental stiffness-first search and exact verification flow."""
-        button = getattr(self, "physics_optimise_button", None)
+        """Optimise: the stiffness-first search with exact verification.
+
+        A fast reduced elastic screen finds a low-cost stiffness distribution,
+        which is projected to catalogue sections; the leading designs are
+        verified exactly, repaired and locally refined. This is the only frame
+        optimiser (the Optimise button, Optimise frame + bracing, the
+        calculation service, Configurator Review and the hay-shed search).
+        Progress is reported as steps 1-12 (optimisation_progress_update).
+        """
+        button = getattr(self, "optimise_structure_button", None)
+        button_text = button.text() if button is not None else ""
         if button is not None:
             button.setEnabled(False)
-            button.setText("Physics screening...")
+            button.setText("Optimising...")
         QApplication.processEvents()
+        self.optimisation_progress_update(1, "Preparing the starting design...")
         started = time.perf_counter()
         exact_solves = 0
         starting_state = None
@@ -18985,6 +18350,7 @@ class MainWindow(QMainWindow):
             start_cost = float((self.costing_summary or {}).get("total_cost", float("inf")))
             starting_state = self.auto_size_capture_state(active_specs, start_ratio, start_cost)
 
+            self.optimisation_progress_update(2, "Stiffness screen...", exact_solves)
             screen_started = time.perf_counter()
             screen, bindings, diagnostics = build_screen_from_portalcalc(self)
             screening = screen.run(candidate_count=20)
@@ -18993,7 +18359,11 @@ class MainWindow(QMainWindow):
             repair_lines = []
             passing_seeds = []
             failed_seeds = []
+            candidate_total = max(len(screening.candidates), 1)
             for number, candidate in enumerate(screening.candidates, start=1):
+                self.optimisation_progress_update(
+                    3 + 4 * (number - 1) // candidate_total,
+                    f"Checking catalogue candidate {number} of {candidate_total}...", exact_solves)
                 self.auto_size_restore_state(starting_state)
                 for variable_name, profile_name in candidate.selected_sections.items():
                     binding = bindings[variable_name]
@@ -19026,6 +18396,7 @@ class MainWindow(QMainWindow):
             if self.auto_size_design_acceptable(active_specs, start_ratio):
                 passing_seeds.append(starting_state)
             if not passing_seeds and failed_seeds:
+                self.optimisation_progress_update(7, "Repairing the nearest candidates...", exact_solves)
                 def promote_doubled_chord(group):
                     combo = self.chord_group_combo(group)
                     current_profile = self.selected_profile(combo) if combo is not None else None
@@ -19193,7 +18564,7 @@ class MainWindow(QMainWindow):
                                 )
             if not passing_seeds:
                 failure_report = [
-                    "PHYSICS OPTIMISE — NO VERIFIED CANDIDATE",
+                    "OPTIMISE — NO VERIFIED CANDIDATE",
                     "",
                     f"Reduced model: {diagnostics['variables']} stiffness variable(s), "
                     f"{diagnostics['constraints']} captured SLS constraint(s), "
@@ -19225,6 +18596,8 @@ class MainWindow(QMainWindow):
             refined_states = []
             refinement_lines = []
             for number, seed in enumerate(leading, start=1):
+                self.optimisation_progress_update(
+                    8 + number, f"Refining leading design {number} of {len(leading)}...", exact_solves)
                 self.auto_size_restore_state(seed)
                 self.generate_and_solve()
                 exact_solves += 1
@@ -19341,10 +18714,18 @@ class MainWindow(QMainWindow):
                 )
 
             best_state = min([*leading, *refined_states], key=lambda state: state["cost"])
+            swept_state, exact_solves, sweep_lines = self.auto_size_depth_sweep(best_state, exact_solves)
+            if swept_state is not None and swept_state["cost"] < best_state["cost"] - 1e-6:
+                sweep_lines.append(f"  Adopted {swept_state['depth']} mm: ${best_state['cost']:,.0f} -> "
+                                   f"${swept_state['cost']:,.0f}")
+                best_state = swept_state
+            elif sweep_lines:
+                sweep_lines.append(f"  Kept {best_state['depth']} mm (${best_state['cost']:,.0f})")
             self.auto_size_restore_state(best_state)
             self.generate_and_solve()
             exact_solves += 1
             final_specs = self.active_auto_size_group_specs()
+            self.optimisation_progress_update(11, "Two-size web assignment...", exact_solves)
             web_lines = self.auto_size_two_web_assignments(final_specs)
             if web_lines:
                 pre_web_state = self.auto_size_capture_state(final_specs)
@@ -19364,6 +18745,7 @@ class MainWindow(QMainWindow):
                     exact_solves += 1
                     web_lines = []
 
+            self.optimisation_progress_update(12, "Final verification...", exact_solves)
             self.auto_size_restore_state(best_state)
             self._preserve_web_assignments_on_solve = True
             try:
@@ -19377,7 +18759,7 @@ class MainWindow(QMainWindow):
             final_verified = self.auto_size_design_acceptable(final_specs, final_ratio)
             elapsed = time.perf_counter() - started
             report = [
-                "PHYSICS OPTIMISE — EXPERIMENTAL",
+                "OPTIMISE",
                 "",
                 f"Reduced model: {diagnostics['variables']} stiffness variable(s), "
                 f"{diagnostics['constraints']} captured SLS constraint(s), "
@@ -19394,6 +18776,8 @@ class MainWindow(QMainWindow):
                 report.extend(["", "Exact basin repair", *repair_lines])
             if refinement_lines:
                 report.extend(["", "Detailed local refinement", *refinement_lines])
+            if sweep_lines:
+                report.extend(["", "Depth sweep (sections sized at each depth)", *sweep_lines])
             if web_lines:
                 report.extend(["", "Detailed web refinement", *[f"  {line}" for line in web_lines]])
             report.extend([
@@ -19434,9 +18818,9 @@ class MainWindow(QMainWindow):
                 self.preserve_auto_size_report = False
             adopted = final_verified
             if final_verified and show_completion:
-                QMessageBox.information(self, "Physics Optimise", self.auto_size_report_text)
+                QMessageBox.information(self, "Optimise", self.auto_size_report_text)
             elif show_completion:
-                QMessageBox.warning(self, "Physics Optimise", self.auto_size_report_text)
+                QMessageBox.warning(self, "Optimise", self.auto_size_report_text)
             return {
                 "verified": final_verified,
                 "ratio": final_ratio,
@@ -19453,848 +18837,93 @@ class MainWindow(QMainWindow):
                 self.auto_size_restore_state(starting_state)
                 self.generate_and_solve()
             if show_completion:
-                QMessageBox.critical(self, "Physics Optimise failed", str(error))
+                QMessageBox.critical(self, "Optimise failed", str(error))
             return {"verified": False, "error": str(error), "exact_solves": exact_solves}
         finally:
             if button is not None:
-                button.setText("Physics Optimise")
+                button.setText(button_text)
                 button.setEnabled(True)
 
-    @staticmethod
-    def guided_optimisation_search_settings(strategy):
-        """Translate Luna's bounded macro focus into deterministic search budgets."""
-        if not isinstance(strategy, dict):
-            # Preserve the rigorous production optimiser budget for the baseline.
-            return {
-                "max_passes": 5,
-                "column_depth_steps": 3,
-                "column_candidates": 4,
-                "chord_depth_steps": 4,
-                "chord_candidates": 10,
-            }
-        focus = str((strategy or {}).get("search_focus") or "balanced")
-        # AI branches investigate the mechanism Luna selected instead of
-        # repeating and widening the whole production search. A full exact
-        # solve still verifies every candidate accepted by the branch.
-        settings = {
-            "max_passes": 2,
-            "column_depth_steps": 2,
-            "column_candidates": 3,
-            "chord_depth_steps": 2,
-            "chord_candidates": 4,
-        }
-        if focus == "column_stiffness_trade":
-            settings.update(
-                max_passes=3,
-                column_depth_steps=6,
-                column_candidates=6,
-                chord_depth_steps=1,
-                chord_candidates=2,
-            )
-        elif focus == "chord_depth_trade":
-            settings.update(
-                max_passes=3,
-                column_depth_steps=1,
-                column_candidates=2,
-                chord_depth_steps=7,
-                chord_candidates=9,
-            )
-        elif focus == "topology_trade":
-            settings.update(
-                max_passes=2,
-                column_depth_steps=2,
-                column_candidates=3,
-                chord_depth_steps=3,
-                chord_candidates=5,
-            )
-        elif focus == "wide_cost_basin":
-            settings.update(
-                max_passes=4,
-                column_depth_steps=6,
-                column_candidates=7,
-                chord_depth_steps=7,
-                chord_candidates=10,
-            )
-        return settings
+    def auto_size_current_preset(self, *, show_completion=True):
+        """Size the frame with Optimise (run_physics_structure_optimisation).
 
-    def apply_guided_optimisation_seed(self, strategy):
-        """Apply one holistic design-basin hypothesis to the verified incumbent."""
-        if not isinstance(strategy, dict):
-            return []
-        changes = []
-        if self.frame_system_combo.currentText() == "Truss":
-            try:
-                current_depth = float(self.depth_input.text())
-                depth_delta = int(strategy.get("truss_depth_delta_mm") or 0)
-                minimum = self.truss_depth_from_span(MAIN_TRUSS_DEPTH_MIN_RATIO)
-                maximum = self.max_main_truss_depth_mm()
-                target_depth = min(max(current_depth + depth_delta, minimum), maximum)
-                target_depth = self.round_up_to_increment(target_depth, 50.0)
-                if abs(target_depth - current_depth) > 1e-9:
-                    self.depth_input.setText(f"{target_depth:.0f}")
-                    changes.append({
-                        "parameter": "main_truss_depth_mm",
-                        "before": current_depth,
-                        "after": target_depth,
-                        "requested_delta_mm": depth_delta,
-                    })
-            except (TypeError, ValueError):
-                pass
+        With building loads it sizes on the governing combinations and accepts
+        only on a check of all of them (_auto_size_with_building_screening).
+        """
+        if not getattr(self, "building_load_mode", None) or getattr(self, "building_screening_disabled", False):
+            return self.run_physics_structure_optimisation(show_completion=show_completion)
+        return self._auto_size_with_building_screening(show_completion=show_completion)
 
-        for side in ("left", "right"):
-            try:
-                addition_delta = int(strategy.get(f"{side}_addition_depth_delta_mm") or 0)
-            except (TypeError, ValueError):
-                addition_delta = 0
-            if not addition_delta:
-                continue
-            bounds = self.addition_depth_bounds(side)
-            if bounds is None:
-                continue
-            minimum, maximum = bounds
-            depth_input = getattr(self, f"{side}_canopy_shallow_depth_input")
-            try:
-                current_depth = float(depth_input.text())
-            except ValueError:
-                continue
-            target_depth = min(max(current_depth + addition_delta, minimum), maximum)
-            target_depth = self.round_up_to_increment(target_depth, 50.0)
-            if abs(target_depth - current_depth) > 1e-9:
-                depth_input.setText(f"{target_depth:.0f}")
-                changes.append({
-                    "parameter": f"{side}_canopy_lean_to_depth_mm",
-                    "before": current_depth,
-                    "after": target_depth,
-                    "requested_delta_mm": addition_delta,
-                })
+    def _auto_size_with_building_screening(self, *, show_completion=True, max_rounds=3):
+        """Phase 5: optimise against the governing building combinations, then check all of them.
 
-        active = {group: (label, combo, group) for label, combo, group in self.active_auto_size_group_specs()}
-        group_steps = (
-            (("LEFT_COLUMN",), "left_column_steps"),
-            (("RIGHT_COLUMN",), "right_column_steps"),
-            (("LEFT_LEAN_COLUMN",), "left_lean_column_steps"),
-            (("RIGHT_LEAN_COLUMN",), "right_lean_column_steps"),
-            (("TOP",), "top_member_steps"),
-            (("BOTTOM",), "bottom_chord_steps"),
-            (("WEB",), "web_steps"),
-        )
-        for groups, key in group_steps:
-            step = min(max(int(strategy.get(key) or 0), -12), 8)
-            if not step:
-                continue
-            for group in groups:
-                spec = active.get(group)
-                change = self.auto_size_profile_step(spec[1], group, step) if spec else None
-                if change:
-                    changes.append(change)
-
-        panel_steps = min(max(int(strategy.get("panel_layout_steps") or 0), -2), 2)
-        if panel_steps and self.frame_system_combo.currentText() == "Truss":
-            try:
-                before = int(self.panel_count_label.text())
-            except (TypeError, ValueError):
-                before = None
-            if before is not None:
-                increment = 4 if self.current_roof_shape() == "Gable" else 1
-                after = max(4, before + panel_steps * increment)
-                if after != before:
-                    self._panel_count_override = after
-                    changes.append({
-                        "parameter": "main_truss_panel_count",
-                        "before": before,
-                        "after": after,
-                        "requested_layout_steps": panel_steps,
-                    })
-        return changes
-
-    def auto_size_current_preset(self, *, guided_strategy=None, show_completion=True, save_learning=True):
-        self.auto_size_report_text = ""
-        protected_state = None
-        protected_specs = self.active_auto_size_group_specs()
-        if self.design_envelope_actions and protected_specs:
-            protected_ratio, _, _ = self.auto_size_overall_ratio(protected_specs)
-            if self.auto_size_design_acceptable(protected_specs, protected_ratio):
-                protected_state = self.auto_size_capture_state(protected_specs, protected_ratio)
-        self.auto_web_profile_assignments = {}
-        self.auto_web_assignment_basis = {}
-        self.auto_web_joint_doubler_sides = {}
-        self.optimisation_progress_update(1, "Preparing verified starting design...")
-        if self.frame_system_combo.currentText() == "Truss":
-            try:
-                start_depth = float(self.depth_input.text())
-                start_depth = min(
-                    max(start_depth, self.truss_depth_from_span(MAIN_TRUSS_DEPTH_MIN_RATIO)),
-                    self.max_main_truss_depth_mm(),
-                )
-                start_depth = self.round_up_to_increment(start_depth, 50.0)
-                self.depth_input.setText(f"{start_depth:.0f}")
-            except ValueError:
-                pass
-        guided_seed_changes = self.apply_guided_optimisation_seed(guided_strategy)
-        self.optimisation_progress_update(2, "Generating starting model...")
+        Each round sizes against the active set (combinations governing the
+        last full check, plus every gravity combination), then solves the full
+        set. A design is accepted only on the full check. If it fails and new
+        combinations govern, they join the active set and the next round
+        continues from the current design.
+        """
+        from frame_loading import governing_report
+        self._building_active_set = None
+        self.building_full_governing_names = set()
         self.generate_and_solve()
         if not self.design_envelope_actions:
-            message = "Generate and solve the frame before auto-sizing."
-            if show_completion:
-                QMessageBox.warning(self, "Auto-size unavailable", message)
-            return {"verified": False, "error": message}
-
-        active_specs = self.active_auto_size_group_specs()
-        if not active_specs:
-            message = "No active member groups were found to auto-size."
-            if show_completion:
-                QMessageBox.information(self, "Auto-size current preset", message)
-            return {"verified": False, "error": message}
-
-        starting_depth = self.depth_input.text()
-        starting_sections = {group: combo.currentText() for _, combo, group in active_specs}
-        selected_sections = {}
-        unresolved = []
-        depth_results = []
-        learned_incumbent = None
-        shortcut_rejection_report = ""
-        incumbent_report = ""
-        cheapest_incumbent_report = ""
-        starting_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-        starting_cost = (self.costing_summary or {}).get("total_cost", float("inf"))
-        starting_state = self.auto_size_capture_state(active_specs, starting_ratio, starting_cost)
-        seeded_state = (
-            self.auto_size_clone_state(starting_state)
-            if self.auto_size_design_acceptable(active_specs, starting_ratio)
-            else None
-        )
-        best_state = self.auto_size_clone_state(protected_state) if protected_state is not None else None
-        if seeded_state is not None and seeded_state["cost"] < (best_state or {}).get("cost", float("inf")):
-            best_state = seeded_state
-
-        self.optimisation_progress_update(3, "Checking learned warm start...")
-        use_learning_warm_start = not isinstance(guided_strategy, dict)
-        if use_learning_warm_start and self.apply_optimisation_warm_start(active_specs):
-            self._preserve_web_assignments_on_solve = True
+            return self.run_physics_structure_optimisation(show_completion=show_completion)
+        total = len(getattr(self, "building_combination_names", []) or [])
+        active = set(self.building_full_governing_names) | set(self.building_gravity_combination_names)
+        lines, result, verified = [], {}, False
+        ratio, group, check = 0.0, "-", "-"
+        for round_index in range(1, max_rounds + 1):
+            self._building_active_set = frozenset(active)
             try:
-                self.generate_and_solve()
+                result = self.run_physics_structure_optimisation(show_completion=False) or {}
             finally:
-                self._preserve_web_assignments_on_solve = False
-            QApplication.processEvents()
-            active_specs = self.active_auto_size_group_specs()
-            warm_start_usable = True
-            if not active_specs:
-                self.auto_size_restore_state(starting_state)
-                self.generate_and_solve()
-                QApplication.processEvents()
-                active_specs = self.active_auto_size_group_specs()
-                warm_start_usable = False
-                incumbent_report = "Incumbent seed: warm start ignored because it produced no active design checks"
-            else:
-                learned_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-            if warm_start_usable and self.auto_size_design_acceptable(active_specs, learned_ratio):
-                learned_incumbent = self.auto_size_capture_state(active_specs, learned_ratio)
-                if learned_incumbent["cost"] < (best_state or {}).get("cost", float("inf")):
-                    best_state = learned_incumbent
-                    incumbent_report = (
-                        f"Incumbent seed: verified warm start kept (${learned_incumbent['cost']:,.0f}) "
-                        f"over starting setup (${starting_cost:,.0f})"
-                    )
-                elif best_state is not None:
-                    incumbent_report = (
-                        f"Incumbent seed: starting setup kept (${best_state['cost']:,.0f}) "
-                        f"over warm start (${learned_incumbent['cost']:,.0f})"
-                    )
-            elif warm_start_usable and best_state is not None:
-                incumbent_report = f"Incumbent seed: starting setup kept (${best_state['cost']:,.0f}); warm start did not pass"
-        elif best_state is not None and use_learning_warm_start:
-            incumbent_report = f"Incumbent seed: starting setup kept (${best_state['cost']:,.0f}); no warm start applied"
-        elif isinstance(guided_strategy, dict):
-            incumbent_report = (
-                f"AI design-basin hypothesis: {guided_strategy.get('search_focus', 'balanced')} | "
-                f"{len(guided_seed_changes)} coupled starting move(s); verified incumbent protected"
-            )
-
-        self.optimisation_progress_update(4, "Adjusting truss and addition depths...")
-        depth_result = self.auto_size_adjust_truss_depth(active_specs)
-        if depth_result:
-            depth_results.append(depth_result)
-        for side in ("left", "right"):
-            depth_result = self.auto_size_adjust_addition_depth(side, active_specs)
-            if depth_result:
-                depth_results.append(depth_result)
-
-        ratio_cache = {}
-        seen_states = set()
-        exact_solves = 0
-        initial_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-        initial_cost = (self.costing_summary or {}).get("total_cost", float("inf"))
-        if self.auto_size_design_acceptable(active_specs, initial_ratio) and initial_cost < (best_state or {}).get("cost", float("inf")):
-            best_state = self.auto_size_capture_state(active_specs, initial_ratio, initial_cost)
-        # Frozen-envelope screening normally converges in two or three passes.
-        # Bound exact reanalysis so a difficult model cannot turn this into a
-        # catalogue-sized brute-force search.
-        self.optimisation_progress_update(5, "Frozen-envelope section search...", exact_solves=exact_solves)
-        for pass_index in range(3):
-            self.optimisation_progress_update(5, f"Frozen-envelope section search, pass {pass_index + 1} of 3...", exact_solves=exact_solves)
-            current_signature = self.auto_size_state_signature(active_specs)
-            if current_signature in seen_states:
+                self._building_active_set = None
+            if result.get("error"):
                 break
-            seen_states.add(current_signature)
-
-            choices, screening_unresolved = self.auto_size_coordinated_choices(active_specs, ratio_cache)
-            unresolved = screening_unresolved
-            changed = False
-            for combo, index in choices:
-                if combo.currentIndex() != index:
-                    combo.setCurrentIndex(index)
-                    changed = True
-            if not changed:
+            self._preserve_web_assignments_on_solve = True
+            try:
+                self.generate_and_solve()
+            finally:
+                self._preserve_web_assignments_on_solve = False
+            specs = self.active_auto_size_group_specs()
+            ratio, group, check = self.auto_size_overall_ratio(specs)
+            verified = self.auto_size_design_acceptable(specs, ratio)
+            newly = set(self.building_full_governing_names) - active
+            lines.append(
+                f"Round {round_index}: sized on {len(active)} of {total} combinations; full check "
+                f"{group} {check} {ratio:.3f} {'OK' if verified else 'NOT OK'}; {len(newly)} newly governing")
+            if verified or not newly:
                 break
-
-            self.generate_and_solve()
-            exact_solves += 1
-            self.optimisation_progress_update(5, f"Frozen-envelope section search, pass {pass_index + 1} of 3...", exact_solves=exact_solves)
-            QApplication.processEvents()
-            ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-            cost = (self.costing_summary or {}).get("total_cost", float("inf"))
-            if self.auto_size_design_acceptable(active_specs, ratio) and cost < (best_state or {}).get("cost", float("inf")):
-                best_state = self.auto_size_capture_state(active_specs, ratio, cost)
-
-        if best_state is None:
-            ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-            if active_specs and ratio <= 1.0:
-                best_state = self.auto_size_capture_state(active_specs, ratio)
-
-        if best_state is not None:
-            self.auto_size_restore_state(best_state)
-        self.optimisation_progress_update(6, "Verifying incumbent design...", exact_solves=exact_solves)
-        self.generate_and_solve()
-        exact_solves += 1
-        exact_neighbour_report = "Exact neighbour refinement: no cheaper near-pass candidate"
-        self.optimisation_progress_update(6, "Exact neighbour refinement...", exact_solves=exact_solves)
-        neighbour = self.auto_size_exact_neighbour_candidate(active_specs, ratio_cache)
-        if best_state is not None and neighbour is not None:
-            frozen_ratio, _, candidate_name, combo, candidate_index, previous_name, estimated_saving, move_key = neighbour
-            combo.setCurrentIndex(candidate_index)
-            self.generate_and_solve()
-            exact_solves += 1
-            self.optimisation_progress_update(6, "Exact neighbour refinement...", exact_solves=exact_solves)
-            trial_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-            trial_cost = (self.costing_summary or {}).get("total_cost", float("inf"))
-            if self.auto_size_design_acceptable(active_specs, trial_ratio) and trial_cost < best_state["cost"] - 1e-6:
-                exact_neighbour_report = (
-                    f"Exact neighbour refinement: adopted {previous_name} -> {candidate_name} | "
-                    f"frozen ratio {frozen_ratio:.3f}, verified ratio {trial_ratio:.3f}, "
-                    f"total saving ${best_state['cost'] - trial_cost:,.0f}"
-                )
-                best_state = self.auto_size_capture_state(active_specs, trial_ratio, trial_cost)
-            else:
-                exact_neighbour_report = (
-                    f"Exact neighbour refinement: rejected {previous_name} -> {candidate_name} | "
-                    f"frozen ratio {frozen_ratio:.3f}, verified ratio {trial_ratio:.3f}, "
-                    f"estimated section saving ${estimated_saving:,.0f}"
-                )
-                self.auto_size_restore_state(best_state)
-                self.generate_and_solve()
-                exact_solves += 1
-                self.optimisation_progress_update(6, "Exact neighbour refinement...", exact_solves=exact_solves)
-
-        self.optimisation_progress_update(7, "Local cost search...", exact_solves=exact_solves, busy=True)
-        guided_search_settings = self.guided_optimisation_search_settings(guided_strategy)
-        best_state, exact_solves, local_search_lines = self.auto_size_local_search(
-            active_specs,
-            ratio_cache,
-            best_state,
-            exact_solves,
-            **guided_search_settings,
-        )
-
-        self.optimisation_progress_update(8, "Checking two-size web assignments...", exact_solves=exact_solves)
-        for _, combo, group in active_specs:
-            selected_sections[group] = combo.currentText()
-
-        web_split_report_lines = self.auto_size_two_web_assignments(active_specs)
-        if web_split_report_lines:
-            self._preserve_web_assignments_on_solve = True
-            try:
-                self.generate_and_solve()
-                exact_solves += 1
-                self.optimisation_progress_update(8, "Checking two-size web assignments...", exact_solves=exact_solves)
-            finally:
-                self._preserve_web_assignments_on_solve = False
-            split_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-            split_cost = (self.costing_summary or {}).get("total_cost", float("inf"))
-            if self.auto_size_design_acceptable(active_specs, split_ratio) and split_cost < (best_state or {}).get("cost", float("inf")):
-                best_state = self.auto_size_capture_state(active_specs, split_ratio, split_cost)
-            elif best_state is not None:
-                self.auto_size_restore_state(best_state)
-                self._preserve_web_assignments_on_solve = True
-                try:
-                    self.generate_and_solve()
-                    exact_solves += 1
-                    self.optimisation_progress_update(8, "Restoring incumbent after web split trial...", exact_solves=exact_solves)
-                finally:
-                    self._preserve_web_assignments_on_solve = False
-                web_split_report_lines = []
-
-        economic_web_chord_lines = []
-        if best_state is not None:
-            self.optimisation_progress_update(8, "Economic web/chord refinement...", exact_solves=exact_solves, busy=True)
-            best_state, exact_solves, economic_web_chord_lines = self.auto_size_refine_web_chord_cost(
-                active_specs,
-                best_state,
-                exact_solves,
-            )
-        self._preserve_web_assignments_on_solve = True
-        symmetry_lines = []
-        coupled_lines = []
-        serviceability_repair_lines = []
-        current_ratio_before_repairs, _, _ = self.auto_size_overall_ratio(active_specs)
-        self.optimisation_progress_update(9, "Adaptive repair phase...", exact_solves=exact_solves, busy=True)
-        try:
-            closure_lines = []
-            column_repair_lines = []
-            if not self.design_utilization_ok(current_ratio_before_repairs):
-                serviceability_governing = self.auto_size_serviceability_ratio()
-                if not self.design_utilization_ok(serviceability_governing[0]):
-                    serviceability_repair_lines, repair_results, serviceability_solves = self.auto_size_repair_serviceability(
-                        active_specs,
-                        ratio_cache,
-                    )
-                    depth_results.extend(repair_results)
-                    exact_solves += serviceability_solves
-                    self.optimisation_progress_update(9, "Serviceability repair...", exact_solves=exact_solves, busy=True)
-                for _ in range(2):
-                    member_changes = self.auto_size_repair_failed_members(active_specs, ratio_cache)
-                    if not member_changes:
-                        break
-                    closure_lines.extend(member_changes)
-                    self.generate_and_solve()
-                    QApplication.processEvents()
-                    exact_solves += 1
-                    self.optimisation_progress_update(9, "Late member closure repairs...", exact_solves=exact_solves, busy=True)
-                    more_column_lines, more_column_solves = self.auto_size_repair_column_deflections(active_specs)
-                    column_repair_lines.extend(more_column_lines)
-                    exact_solves += more_column_solves
-                    more_depth_results = self.auto_size_repair_deflections()
-                    depth_results.extend(more_depth_results)
-                    exact_solves += sum(
-                        max(int(round((result["end"] - result["start"]) / 50.0)), 0)
-                        for result in more_depth_results
-                    )
-                if not self.design_utilization_ok(self.auto_size_overall_ratio(active_specs)[0]):
-                    coupled_lines = self.auto_size_repair_coupled_web_chords(active_specs, ratio_cache)
-                    if coupled_lines:
-                        self.generate_and_solve()
-                        QApplication.processEvents()
-                        exact_solves += 1
-                        self.optimisation_progress_update(9, "Coupled web/chord repair...", exact_solves=exact_solves, busy=True)
-                        repaired_groups = getattr(self, "_last_coupled_repair_groups", set())
-                        unresolved = [item for item in unresolved if item[1] not in repaired_groups]
-                        member_changes = self.auto_size_repair_failed_members(active_specs, ratio_cache)
-                        if member_changes:
-                            closure_lines.extend(member_changes)
-                            self.generate_and_solve()
-                            QApplication.processEvents()
-                            exact_solves += 1
-                            self.optimisation_progress_update(9, "Post-coupled member repairs...", exact_solves=exact_solves, busy=True)
-                        post_repair_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-                        if self.auto_size_design_acceptable(active_specs, post_repair_ratio):
-                            post_repair_cost = (self.costing_summary or {}).get("total_cost", float("inf"))
-                            best_state = self.auto_size_capture_state(active_specs, post_repair_ratio, post_repair_cost)
-                            post_split_lines = self.auto_size_two_web_assignments(active_specs)
-                            if self.auto_web_profile_assignments:
-                                self.generate_and_solve()
-                                QApplication.processEvents()
-                                exact_solves += 1
-                                self.optimisation_progress_update(9, "Post-repair web split check...", exact_solves=exact_solves, busy=True)
-                                post_split_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-                                post_split_cost = (self.costing_summary or {}).get("total_cost", float("inf"))
-                                if self.auto_size_design_acceptable(active_specs, post_split_ratio):
-                                    web_split_report_lines = post_split_lines
-                                    best_state = self.auto_size_capture_state(active_specs, post_split_ratio, post_split_cost)
-                                else:
-                                    self.auto_size_restore_state(best_state)
-                                    self.generate_and_solve()
-                                    QApplication.processEvents()
-                                    exact_solves += 1
-                                    self.optimisation_progress_update(9, "Restoring post-repair incumbent...", exact_solves=exact_solves, busy=True)
-                            best_state, exact_solves, post_local_search_lines = self.auto_size_local_search(
-                                active_specs,
-                                ratio_cache,
-                                best_state,
-                                exact_solves,
-                                max_passes=3,
-                            )
-                            local_search_lines.extend(
-                                f"Post-repair {line}" for line in post_local_search_lines
-                            )
-                symmetry_lines, symmetry_solves = self.auto_size_sync_symmetric_end_columns(active_specs)
-                exact_solves += symmetry_solves
-                self.optimisation_progress_update(9, "Symmetry repair...", exact_solves=exact_solves, busy=True)
-                if symmetry_lines:
-                    more_column_lines, more_column_solves = self.auto_size_repair_column_deflections(active_specs)
-                    column_repair_lines.extend(more_column_lines)
-                    exact_solves += more_column_solves
-                pair_column_lines, pair_column_solves = self.auto_size_repair_symmetric_end_column_deflections(active_specs)
-                column_repair_lines.extend(pair_column_lines)
-                exact_solves += pair_column_solves
-                self.optimisation_progress_update(9, "Paired column repair...", exact_solves=exact_solves, busy=True)
-                if pair_column_lines:
-                    member_changes = self.auto_size_repair_failed_members(active_specs, ratio_cache)
-                    if member_changes:
-                        closure_lines.extend(member_changes)
-                        self.generate_and_solve()
-                        QApplication.processEvents()
-                        exact_solves += 1
-                        self.optimisation_progress_update(9, "Final repair closure...", exact_solves=exact_solves, busy=True)
-        finally:
-            self._preserve_web_assignments_on_solve = False
-        repaired_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-        if serviceability_repair_lines and self.auto_size_design_acceptable(active_specs, repaired_ratio):
-            repaired_cost = (self.costing_summary or {}).get("total_cost", float("inf"))
-            best_state = self.auto_size_capture_state(active_specs, repaired_ratio, repaired_cost)
-
-        self.optimisation_progress_update(10, "Restoring cheapest verified incumbent...", exact_solves=exact_solves)
-        if best_state is not None:
-            current_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-            current_cost = (self.costing_summary or {}).get("total_cost", float("inf"))
-            if self.auto_size_design_acceptable(active_specs, current_ratio) and current_cost < best_state["cost"] - 1e-6:
-                best_state = self.auto_size_capture_state(active_specs, current_ratio, current_cost)
-            elif (not self.design_utilization_ok(current_ratio)) or current_cost > best_state["cost"] + 1e-6:
-                previous_cost = current_cost
-                previous_state = self.auto_size_capture_state(active_specs, current_ratio, current_cost)
-                self.auto_size_restore_state(best_state)
-                self._preserve_web_assignments_on_solve = True
-                try:
-                    self.generate_and_solve()
-                finally:
-                    self._preserve_web_assignments_on_solve = False
-                QApplication.processEvents()
-                exact_solves += 1
-                self.optimisation_progress_update(10, "Restoring cheapest verified incumbent...", exact_solves=exact_solves)
-                restored_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-                if not self.auto_size_design_acceptable(active_specs, restored_ratio):
-                    self.auto_size_restore_state(previous_state)
-                    self._preserve_web_assignments_on_solve = True
-                    try:
-                        self.generate_and_solve()
-                    finally:
-                        self._preserve_web_assignments_on_solve = False
-                    QApplication.processEvents()
-                    exact_solves += 1
-                    best_state = previous_state if self.auto_size_design_acceptable(active_specs, current_ratio) else None
-                    cheapest_incumbent_report = (
-                        f"Cheapest incumbent restore rejected: restored state no longer passes "
-                        f"(ratio {restored_ratio:.3f})"
-                    )
-                elif math.isfinite(previous_cost):
-                    cheapest_incumbent_report = (
-                        f"Cheapest incumbent restored: kept ${best_state['cost']:,.0f} "
-                        f"over final trial state (${previous_cost:,.0f})"
-                    )
-                else:
-                    cheapest_incumbent_report = (
-                        f"Cheapest incumbent restored: kept verified ${best_state['cost']:,.0f} design"
-                    )
-        final_member_repair_lines = []
-        final_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-        if not self.auto_size_design_acceptable(active_specs, final_ratio):
-            self._preserve_web_assignments_on_solve = True
-            try:
-                for _ in range(2):
-                    member_changes = self.auto_size_repair_failed_members(active_specs, ratio_cache)
-                    if not member_changes:
-                        break
-                    final_member_repair_lines.extend(member_changes)
-                    self.generate_and_solve()
-                    QApplication.processEvents()
-                    exact_solves += 1
-                    self.optimisation_progress_update(10, "Final member closure...", exact_solves=exact_solves, busy=True)
-                    final_ratio, _, _ = self.auto_size_overall_ratio(active_specs)
-                    if self.auto_size_design_acceptable(active_specs, final_ratio):
-                        break
-            finally:
-                self._preserve_web_assignments_on_solve = False
-        panel_topology_report_line = ""
-        if self.frame_system_combo.currentText() == "Truss" and self.structure is not None:
-            self.optimisation_progress_update(11, "Checking adjacent panel topologies...", exact_solves=exact_solves, busy=True)
-            panel_topology_report_line, topology_solves = self.refine_main_truss_panel_topology(force=True)
-            exact_solves += topology_solves
-            if self.auto_size_report_text.startswith("Auto-sized webs"):
-                web_split_report_lines = self.auto_size_report_text.splitlines()[1:]
-        selected_sections = {group: combo.currentText() for _, combo, group in active_specs}
-        for depth_result in depth_results:
-            if depth_result.get("label") == "Main truss depth":
-                ratio, group, check = self.auto_size_main_truss_ratio(active_specs)
-                depth_result["ratio"] = ratio
-                depth_result["governing_group"] = group
-                depth_result["governing_check"] = check
-            elif depth_result.get("label") == "Main truss deflection repair":
-                governing = max(self.truss_midspan_deflection_ratios(), default=(0.0, "-", "-"), key=lambda item: item[0])
-                depth_result["ratio"] = governing[0]
-                depth_result["governing_group"] = governing[1]
-                depth_result["governing_check"] = governing[2]
-        report_lines = []
-        report_lines.append(
-            f"Coordinated search: {exact_solves} exact section solve(s), "
-            f"{len(ratio_cache)} cached frozen-envelope checks"
-        )
-        report_lines.append(self.optimisation_learning_summary)
-        if incumbent_report:
-            report_lines.append(incumbent_report)
-        if shortcut_rejection_report:
-            report_lines.append(shortcut_rejection_report)
-        report_lines.append(exact_neighbour_report)
-        if panel_topology_report_line:
-            report_lines.append(panel_topology_report_line)
-        if cheapest_incumbent_report:
-            report_lines.append(cheapest_incumbent_report)
-        if local_search_lines:
-            report_lines.append(f"Local search: {len(local_search_lines)} improvement(s)")
-            report_lines.extend(f"  {line}" for line in local_search_lines)
-        if serviceability_repair_lines:
-            report_lines.append("")
-            report_lines.append("Serviceability repair")
-            report_lines.extend(serviceability_repair_lines)
-        if closure_lines:
-            report_lines.append(f"Bounded closure: {len(closure_lines)} late member adjustment(s)")
-        if final_member_repair_lines:
-            report_lines.append(f"Final member closure: {len(final_member_repair_lines)} governing adjustment(s)")
-            report_lines.extend(f"  {line}" for line in final_member_repair_lines)
-        if coupled_lines:
-            report_lines.append("")
-            report_lines.append("Coupled web/chord repair")
-            report_lines.extend(coupled_lines)
-        if economic_web_chord_lines:
-            report_lines.append("")
-            report_lines.append("Economic web/chord refinement")
-            report_lines.extend(economic_web_chord_lines)
-        if column_repair_lines:
-            report_lines.append("")
-            report_lines.append("Column deflection repair")
-            report_lines.extend(column_repair_lines)
-        if symmetry_lines:
-            report_lines.append("")
-            report_lines.append("Symmetry repair")
-            left_final = self.left_column_profile_combo.currentText()
-            right_final = self.right_column_profile_combo.currentText()
-            if left_final == right_final:
-                report_lines.extend(symmetry_lines)
-            else:
-                report_lines.extend(f"{line} | trial not adopted" for line in symmetry_lines)
-                report_lines.append(f"Final end columns differ: left {left_final} / right {right_final}")
-        final_depth = self.depth_input.text()
-        depth_change_text = f"{starting_depth} -> {final_depth}" if starting_depth != final_depth else f"{final_depth} (unchanged)"
-        for depth_result in depth_results:
-            start_text = f"{depth_result['start']:.0f}"
-            end_text = f"{depth_result['end']:.0f}"
-            change_text = f"{start_text} -> {end_text}" if start_text != end_text else f"{end_text} (unchanged)"
-            report_lines.append(
-                f"{depth_result['label']:<31}: {change_text} | bounds "
-                f"{depth_result['min']:.0f}-{depth_result['max']:.0f} mm | "
-                f"governs {depth_result['governing_group']} {depth_result['governing_check']} "
-                f"{depth_result['ratio']:.3f}"
-            )
-        for label, combo, group in active_specs:
-            envelope = (self.design_envelope_actions or {}).get(group)
-            if not self.member_envelope_has_demands(envelope):
-                continue
-            if group in (self.auto_web_profile_assignments or {}):
-                before = starting_sections.get(group, "-")
-                after = selected_sections.get(group, combo.currentText())
-                change_text = f"{before} -> {after}" if before != after else f"{after} (base unchanged)"
-                report_lines.append(f"{label:<31}: {change_text} | two-size split below")
-                continue
-            profile = self.selected_profile(combo)
-            ratio, check_label, _ = self.member_and_connection_ratio(profile, envelope, group)
-            status = "OK" if self.design_utilization_ok(ratio) else "NOT OK"
-            before = starting_sections.get(group, "-")
-            after = selected_sections.get(group, combo.currentText())
-            change_text = f"{before} -> {after}" if before != after else f"{after} (unchanged)"
-            report_lines.append(
-                f"{label:<31}: {change_text} | governs {check_label} "
-                f"{ratio:.3f} | {status}"
-            )
-        if web_split_report_lines:
-            report_lines.append("")
-            report_lines.append("Two-size web assignment")
-            report_lines.extend(web_split_report_lines)
-
-        if unresolved:
-            unresolved_labels = ", ".join(label for label, _, _ in unresolved)
-            report_lines.append("")
-            report_lines.append(f"No passing catalog option found for: {unresolved_labels}")
-
-        final_ratio, final_group, final_check = self.auto_size_overall_ratio(active_specs)
-        if not self.design_utilization_ok(final_ratio) and best_state is not None:
-            self.auto_size_restore_state(best_state)
-            self._preserve_web_assignments_on_solve = True
-            try:
-                self.generate_and_solve()
-            finally:
-                self._preserve_web_assignments_on_solve = False
-            exact_solves += 1
-            self.optimisation_progress_update(11, "Checking verified incumbent fallback...", exact_solves=exact_solves)
-            fallback_ratio, fallback_group, fallback_check = self.auto_size_overall_ratio(active_specs)
-            if self.auto_size_design_acceptable(active_specs, fallback_ratio):
-                final_ratio, final_group, final_check = fallback_ratio, fallback_group, fallback_check
-                report_lines.append("Verified incumbent fallback: restored cheapest passing design")
-        if not self.design_utilization_ok(final_ratio) and learned_incumbent is not None:
-            self.auto_size_restore_state(learned_incumbent)
-            self._preserve_web_assignments_on_solve = True
-            try:
-                self.generate_and_solve()
-            finally:
-                self._preserve_web_assignments_on_solve = False
-            exact_solves += 1
-            self.optimisation_progress_update(11, "Checking learned fallback...", exact_solves=exact_solves)
-            fallback_ratio, fallback_group, fallback_check = self.auto_size_overall_ratio(active_specs)
-            if self.auto_size_design_acceptable(active_specs, fallback_ratio):
-                final_ratio, final_group, final_check = fallback_ratio, fallback_group, fallback_check
-                report_lines.append("Learned incumbent fallback: restored prior verified design")
-                fallback_state = self.auto_size_capture_state(active_specs, fallback_ratio)
-                fallback_state, exact_solves, fallback_search_lines = self.auto_size_local_search(
-                    active_specs,
-                    ratio_cache,
-                    fallback_state,
-                    exact_solves,
-                    max_passes=3,
-                )
-                if fallback_search_lines:
-                    fallback_ratio, fallback_group, fallback_check = self.auto_size_overall_ratio(active_specs)
-                    if self.auto_size_design_acceptable(active_specs, fallback_ratio):
-                        final_ratio, final_group, final_check = fallback_ratio, fallback_group, fallback_check
-                        report_lines.append("Learned fallback refinement")
-                        report_lines.extend(f"  {line}" for line in fallback_search_lines)
-        if (
-            not self.auto_size_design_acceptable(active_specs, final_ratio)
-            and final_group in (self.auto_web_profile_assignments or {})
-        ):
-            self.optimisation_progress_update(11, "Repairing final web split...", exact_solves=exact_solves, busy=True)
-            if self.repair_auto_web_split_with_single_sizes({final_group}):
-                QApplication.processEvents()
-                exact_solves += 1
-                final_ratio, final_group, final_check = self.auto_size_overall_ratio(active_specs)
-                report_lines.append("Final web split repair: restored a passing web arrangement")
-        if self.auto_size_design_acceptable(active_specs, final_ratio):
-            final_depth_trim_lines = []
-            for side in ("left", "right"):
-                depth_result = self.auto_size_adjust_addition_depth(
-                    side,
-                    active_specs,
-                    optimise_cost=True,
-                    coarse_increment=100.0 if isinstance(guided_strategy, dict) else 50.0,
-                )
-                if depth_result and (
-                    depth_result.get("selection_basis")
-                    or abs(depth_result.get("end", 0.0) - depth_result.get("start", 0.0)) > 1e-9
-                ):
-                    final_depth_trim_lines.append(
-                        f"Final {depth_result['label']}: {depth_result['start']:.0f} -> {depth_result['end']:.0f} mm "
-                        f"| governs {depth_result['governing_group']} {depth_result['governing_check']} "
-                        f"{depth_result['ratio']:.3f} | {depth_result.get('selection_basis', 'verified depth')}"
-                    )
-            if final_depth_trim_lines:
-                final_ratio, final_group, final_check = self.auto_size_overall_ratio(active_specs)
-                report_lines.extend(final_depth_trim_lines)
-        final_verified = self.auto_size_design_acceptable(active_specs, final_ratio)
-        self.optimisation_progress_update(11, "Saving optimiser learning and final verification...", exact_solves=exact_solves)
-        learning_saved = (
-            self.save_optimisation_learning(active_specs, final_ratio)
-            if final_verified and save_learning else False
-        )
-        report_lines.append("")
-        report_lines.append(
-            f"Final adopted state: main depth {self.depth_input.text()} mm"
-            f", left addition depth {self.left_canopy_shallow_depth_input.text()} mm"
-            f", right addition depth {self.right_canopy_shallow_depth_input.text()} mm"
-            f", chords {self.top_profile_combo.currentText()}"
-        )
-        report_lines.append(
-            f"FINAL VERIFICATION: {'OK' if final_verified else 'NOT OK'} | "
-            f"{final_group} {final_check} {final_ratio:.3f}"
-        )
-        if final_verified and save_learning:
-            report_lines.append(
-                "Learning update: verified design saved for future jobs"
-                if learning_saved else "Learning update: verified design could not be persisted"
-            )
-        elif final_verified:
-            report_lines.append("Learning update: deferred until the Guided Optimise winner is adopted")
-
-        self.auto_size_report_text = "\n".join(report_lines)
-        self.preserve_auto_size_report = True
-        self._preserve_web_assignments_on_solve = True
-        try:
-            self.optimisation_progress_update(12, "Updating section checks and report...", exact_solves=exact_solves)
-            self.update_section_checks_text(
-                self.selected_profile(self.left_column_profile_combo),
-                self.selected_profile(self.right_column_profile_combo),
-                self.selected_profile(self.internal_column_profile_combo),
-                self.selected_profile(self.top_profile_combo),
-                self.selected_profile(self.bottom_profile_combo),
-                self.selected_profile(self.web_profile_combo),
-                self.selected_profile(self.left_canopy_top_profile_combo),
-                self.selected_profile(self.left_canopy_bottom_profile_combo),
-                self.selected_profile(self.left_canopy_web_profile_combo),
-                self.selected_profile(self.left_lean_column_profile_combo),
-                self.selected_profile(self.right_canopy_top_profile_combo),
-                self.selected_profile(self.right_canopy_bottom_profile_combo),
-                self.selected_profile(self.right_canopy_web_profile_combo),
-                self.selected_profile(self.right_lean_column_profile_combo),
-            )
-        finally:
-            self._preserve_web_assignments_on_solve = False
-            self.preserve_auto_size_report = False
-        message = self.auto_size_report_text or "Auto-size completed."
+            active |= newly
+        report = [self.auto_size_report_text or "", "", "BUILDING LOAD ACCEPTANCE GATE", *lines,
+                  f"FULL-SET VERIFICATION: {'OK' if verified else 'NOT OK'} | {group} {check} {ratio:.3f}",
+                  "", *governing_report(self.design_envelope_actions)]
+        self.auto_size_report_text = "\n".join(report).strip()
         if show_completion:
-            if final_verified:
-                QMessageBox.information(self, "Auto-size current preset", message)
-            else:
-                QMessageBox.warning(
-                    self,
-                    "Optimisation did not find a passing design",
-                    message,
-                )
-        final_cost = (self.costing_summary or {}).get("total_cost")
-        return {
-            "verified": final_verified,
-            "ratio": final_ratio,
-            "governing_group": final_group,
-            "governing_check": final_check,
-            "cost": final_cost,
-            "exact_solves": exact_solves,
-            "report": self.auto_size_report_text,
-            "guided_seed_changes": guided_seed_changes,
-            "search_focus": str((guided_strategy or {}).get("search_focus") or "baseline"),
-        }
+            (QMessageBox.information if verified else QMessageBox.warning)(
+                self, "Optimise" if verified else "Optimisation did not find a passing design",
+                self.auto_size_report_text)
+        result = dict(result)
+        result.update(verified=verified, ratio=ratio, governing_group=group, governing_check=check,
+                      cost=(self.costing_summary or {}).get("total_cost"), report=self.auto_size_report_text,
+                      building_screening_rounds=len(lines))
+        return result
 
-    def run_structure_optimisation(self, *, show_completion=True, save_learning=True):
-        button = getattr(self, "optimise_structure_button", None)
-        if button is not None:
-            button.setEnabled(False)
-            button.setText("Optimising...")
-        QApplication.processEvents()
+    def run_structure_optimisation(self, *, show_completion=True):
+        """The Optimise button: auto-size with a progress dialog and one undo step for the result."""
         previous_history_state = self._history_suspended
-        previous_topology_suppression = self._suppress_panel_topology_search
         self._history_suspended = True
-        self._suppress_panel_topology_search = True
-        self._panel_count_override = None
-        self._panel_topology_cache_signature = None
-        self._panel_topology_cache_count = None
         self.optimisation_progress_begin()
+        # Combination loads are applied once per geometry/spring/case signature.
         self.optimisation_load_vector_cache = {}
         try:
-            self.auto_size_current_preset(
-                show_completion=show_completion,
-                save_learning=save_learning,
-            )
+            return self.auto_size_current_preset(show_completion=show_completion)
         finally:
             self.optimisation_load_vector_cache = None
             self.optimisation_progress_finish()
-            self._suppress_panel_topology_search = previous_topology_suppression
             self._history_suspended = previous_history_state
             self.record_model_snapshot()
-            if button is not None:
-                button.setText("Optimise Structure")
-                button.setEnabled(True)
 
     def update_section_checks_text(
         self,
@@ -21579,6 +20208,19 @@ class MainWindow(QMainWindow):
             )
             results.append(f"Column offsets: left {left_column_offset:.1f} mm, right {right_column_offset:.1f} mm")
         results.append(f"Roof shape: {roof_shape}")
+        basis = getattr(self, "eave_node_basis_record", None)
+        if basis:
+            results.append(
+                f"Eave height: {basis['eave_mm']:.1f} mm at the cladding pitching point (outside of girts)")
+            results.append(
+                f"Top chord node: {basis['node_mm']:.1f} mm at the column centrelines = eave "
+                f"+ {basis['inset_mm']:.1f} x tan(pitch) - {basis['drop_mm']:.1f} "
+                f"(girt {basis['girt_mm']:.0f} mm: {basis['girt_source']}; purlin {basis['purlin_mm']:.0f} mm: "
+                f"{basis['purlin_source']}; top chord {basis['top_chord_depth_mm']:.0f} mm)")
+            strips = basis.get("strips") or []
+            if strips:
+                results.append("Eave strips to the eave nodes: " + "; ".join(
+                    f"{s['side'].lower()} wall {s['wall_mm']:.0f} mm, roof {s['roof_mm']:.0f} mm" for s in strips))
         if truss_external_depth is not None and truss_centreline_depth is not None:
             results.append(
                 f"Truss depth: {truss_external_depth:.1f} mm outside-to-outside "
@@ -21630,7 +20272,15 @@ class MainWindow(QMainWindow):
         if restraint_status is not None:
             label = {"applied": "", "recheck": "RECHECK 3D: ", "stale": "STALE: ", "missing": "NOT ADOPTED: "}[restraint_status["state"]]
             results.append(f"3D bracing restraint: {label}{restraint_status['message']}\n")
-        if eave_bracing_info is not None:
+        if eave_bracing_info is not None and "springs" in eave_bracing_info:
+            results.append(
+                "Propped end frame restraint (end-wall bracing panels, k = E·A·cos²θ/L): "
+                f"{eave_bracing_info['brace_label']} (A={eave_bracing_info['brace_area_mm2']:.0f} mm2); "
+                + "; ".join(f"{side} eave: panel {s['panel_width_mm']:.0f} mm, L={s['diagonal_mm']:.0f} mm, "
+                            f"{s['spring_kn_mm']:.3f} kN/mm" for side, s in eave_bracing_info["springs"].items())
+                + "\n"
+            )
+        elif eave_bracing_info is not None:
             results.append(
                 "End-wall portal restraint model: "
                 f"{eave_bracing_info['end_count']} end(s), "
@@ -21670,6 +20320,7 @@ class MainWindow(QMainWindow):
 
         results.extend(load_summary_lines)
         results.append("")
+        results.extend(self.building_load_summary_lines())
 
         results.append("SELECTED PROFILES")
         for label, p in [

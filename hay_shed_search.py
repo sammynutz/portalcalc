@@ -70,7 +70,8 @@ def hay_inputs(base, geometry, region, facing, importance, terrain, pitch, solar
                               frame_system="Truss", roof_shape="Gable",
                               internal_column_count="None", eave_x_restraint="None",
                               max_truss_depth_mm=geometry["width_m"] * 1000 / 20,
-                              truss_depth_mm=round(geometry["width_m"] * 40 / 50) * 50)
+                              truss_depth_mm=round(geometry["width_m"] * 40 / 50) * 50,
+                              bays_mm=f"{geometry['bay_count']}*{geometry['bay_m'] * 1000:g}")
     inputs["loads"].update(bay_size_mm=geometry["bay_m"] * 1000,
                            bay_size_m=geometry["bay_m"], solar_kpa=solar_kpa,
                            fire_service_kpa=0, hvac_kpa=0, other_kpa=0,

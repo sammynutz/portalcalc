@@ -1,8 +1,8 @@
 """User-adopted brace family preferences and mandatory unclad-wall rods."""
 from bracing_analysis import AnalysisError
+from bracing_layout import BRACE_GROUPS, brace_group
 
 PROJECT_USES = ('unspecified', 'agricultural', 'commercial_industrial')
-BRACE_GROUPS = ('roof_brace', 'wall_brace', 'end_brace')
 
 
 def policy(context):
@@ -26,9 +26,7 @@ def group_faces(context, group):
     if group not in BRACE_GROUPS:
         return []
     layout = context['layout']
-    return sorted({layout.panels[key].face for key in layout.pinned
-                   if ('roof_brace' if layout.panels[key].face.startswith('roof') else
-                       'end_brace' if layout.panels[key].face in {'front_end', 'back_end'} else 'wall_brace') == group})
+    return sorted({layout.panels[key].face for key in layout.pinned if brace_group(layout.panels[key].face) == group})
 
 
 def rod_faces(context, group):
@@ -54,7 +52,7 @@ def candidate_rank(context, group, candidate):
 
 
 def selection_score(context, selections, result):
-    return (sum(candidate_rank(context, group, selections[group]) for group in BRACE_GROUPS),
+    return (sum(candidate_rank(context, group, selections[group]) for group in BRACE_GROUPS if group in selections),
             result['design']['estimated_cost'])
 
 
@@ -74,7 +72,7 @@ def evidence(context, selections):
     result['groups'] = {group: {'faces': group_faces(context, group), 'rod_required_faces': rod_faces(context, group),
                                'selected_family': family(selections[group]),
                                'preference_rank': candidate_rank(context, group, selections[group])}
-                        for group in BRACE_GROUPS}
+                        for group in BRACE_GROUPS if group in selections}
     result['basis'] = ('Agricultural: wire preferred; commercial/industrial: rod preferred; unspecified: cost only. '
                        'Preferences rank eligible, passing, priced candidates before estimated cost. '
                        'Rod is mandatory for a wall-brace group containing an installed brace on an unclad face. '

@@ -23,16 +23,16 @@ class StrengthModeTests(unittest.TestCase):
         from main import ShapeCatalog
         cls.catalog=ShapeCatalog('Shape_Catalog.xlsx')
 
-    def test_il1_global_h100_is_separate_from_local_l150_and_other_importance_levels(self):
+    def test_il1_global_h80_is_separate_from_local_l150_and_other_importance_levels(self):
         c,s,_=design_fixtures.DesignMechanicsTests.small_context(SimpleNamespace(catalog=self.catalog))
         rates={'shs':3.,'ub':4.,'wb':5.};criteria=DesignCriteria()
         il1={**c,'source_preset':{'wind':{'importance_level':'1'}}}
         result=solve_selection(il1,s,criteria,rates)
         old=solve_selection(il1,s,replace(criteria,global_sls_divisor=150.),rates)
-        self.assertEqual(result['design']['global_sls']['divisor'],100.)
+        self.assertEqual(result['design']['global_sls']['divisor'],80.)
         self.assertEqual(result['design_request']['criteria']['sls_divisor'],150.)
-        self.assertAlmostEqual(result['design']['global_sls']['limit_mm'],old['design']['global_sls']['limit_mm']*1.5)
-        self.assertAlmostEqual(result['design']['global_sls']['ratio'],old['design']['global_sls']['ratio']*2/3)
+        self.assertAlmostEqual(result['design']['global_sls']['limit_mm'],old['design']['global_sls']['limit_mm']*150/80)
+        self.assertAlmostEqual(result['design']['global_sls']['ratio'],old['design']['global_sls']['ratio']*80/150)
         for key,checked in result['section_checks'].items():
             self.assertEqual(checked['case_checks'],old['section_checks'][key]['case_checks'])
         for level in ('2','3','4'):
@@ -124,7 +124,7 @@ class StrengthModeTests(unittest.TestCase):
 
 
 class StrengthModeWorkspaceTests(unittest.TestCase):
-    def test_main_and_bracing_il1_h100_follow_overrides_preserve_local_limits_and_cache(self):
+    def test_main_and_bracing_il1_h80_follow_overrides_preserve_local_limits_and_cache(self):
         os.environ['QT_QPA_PLATFORM']='offscreen';os.environ['PORTALCALC_LICENSE_ENFORCED']='0'
         from PySide6.QtWidgets import QApplication
         from main import MainWindow,SERVICEABILITY_LIMIT_DEFAULTS
@@ -132,7 +132,7 @@ class StrengthModeWorkspaceTests(unittest.TestCase):
         from bracing_analysis_regression import fixed_layout
         from bracing_workspace_ui import BracingAnalysisDialog
         app=QApplication.instance() or QApplication([])
-        self.assertEqual(SERVICEABILITY_LIMIT_DEFAULTS['column_il1'],100.)
+        self.assertEqual(SERVICEABILITY_LIMIT_DEFAULTS['column_il1'],80.)
         with tempfile.TemporaryDirectory() as settings:
             os.environ['APPDATA']=settings
             w=MainWindow();w.confirm_on_close=False
@@ -140,13 +140,13 @@ class StrengthModeWorkspaceTests(unittest.TestCase):
                 w.importance_combo.setCurrentText('1')
                 w.bracing_location_layout=fixed_layout(w.current_bracing_layout_geometry()).to_dict()
                 w.generate_and_solve();context=prepare_context(w)
-                self.assertEqual(w.eave_deflection_divisor(),100.)
+                self.assertEqual(w.eave_deflection_divisor(),80.)
                 d=BracingAnalysisDialog(context,w.catalog,{'mixed_struts':False,'criteria':{'sls_divisor':150.}})
                 try:
-                    self.assertTrue(d.global_sls_auto.isChecked());self.assertEqual(d.global_sls_input.value(),100.)
+                    self.assertTrue(d.global_sls_auto.isChecked());self.assertEqual(d.global_sls_input.value(),80.)
                     self.assertEqual(d.criteria_inputs['sls_divisor'].value(),150.)
-                    d.run_analysis();self.assertEqual(d.result['design']['global_sls']['divisor'],100.)
-                    self.assertIn('H/100',d.result_summary_label.text())
+                    d.run_analysis();self.assertEqual(d.result['design']['global_sls']['divisor'],80.)
+                    self.assertIn('H/80',d.result_summary_label.text())
                     self.assertIn('Local member/purlin deflection divisor: L/150',d.report_text)
                     saved=d.snapshot();cache=d.calculation_cache()
                     restored=BracingAnalysisDialog(context,w.catalog,saved,cached_calculation=cache)
@@ -161,7 +161,7 @@ class StrengthModeWorkspaceTests(unittest.TestCase):
                     self.assertEqual(d.result['design']['global_sls']['divisor'],200.)
                     self.assertEqual(d.criteria_inputs['sls_divisor'].value(),150.)
                     d.global_sls_auto.setChecked(True)
-                    self.assertIsNone(d.result);self.assertEqual(d.global_sls_input.value(),100.)
+                    self.assertIsNone(d.result);self.assertEqual(d.global_sls_input.value(),80.)
                     locked=BracingAnalysisDialog(context,w.catalog,saved,read_only=True)
                     try:self.assertFalse(locked.global_sls_auto.isEnabled());self.assertFalse(locked.global_sls_input.isEnabled())
                     finally:locked.reject()

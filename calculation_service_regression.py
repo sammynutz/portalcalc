@@ -26,10 +26,18 @@ BASELINE_INPUT_DIGEST = "d27bc5545310f2dfaa95b316d3e595b28291d737fd535297412eda9
 # roof panels, with horizontal Table 5.3(A) bands. The previous autoSize values
 # were already stale: with those changes reverted in memory the run gave WEB
 # compression 0.9943 with 75*4 SHS chords, not the stored RIGHT_COLUMN result.
+# Re-baselined 2026-11-13: eave height is now the cladding pitching point and
+# the top chord node sits below it (girt, half column, purlin, half chord), with
+# the wall/roof strips outside the frame lines carried to the eave nodes.
+# checkSpecified 1.7578 -> 1.7757; autoSize keeps its sections, governing
+# BOTTOM Combined 0.9745 -> LEFT_COLUMN Combined 0.9781.
+# autoSize re-baselined 2026-11-13 again: the legacy local-search optimiser was
+# removed; autoSize is Optimise (stiffness screen + exact refinement + depth
+# sweep): 1100 mm, 310UB32 columns, $35,445 (legacy 1000 mm 250UB31.4, $35,404).
 BASELINE = {
     "checkSpecified": {
         "verified": False,
-        "ratio": 1.757758142975726,
+        "ratio": 1.7757243784557766,
         "group": "BOTTOM",
         "check": "Doubled chord zone",
         "sections": {
@@ -42,12 +50,12 @@ BASELINE = {
     },
     "autoSize": {
         "verified": True,
-        "ratio": 0.9744532845912571,
-        "group": "BOTTOM",
-        "check": "Combined",
+        "ratio": 0.9747871848817715,
+        "group": "WEB",
+        "check": "Compression",
         "sections": {
-            "left_column": "250 UB 31.4 (31.5 kg/m)",
-            "right_column": "250 UB 31.4 (31.5 kg/m)",
+            "left_column": "310 UB 32.0 (32.0 kg/m)",
+            "right_column": "310 UB 32.0 (32.0 kg/m)",
             "top_chord": "75*3 SHS (6.6 kg/m)",
             "bottom_chord": "75*3 SHS (6.6 kg/m)",
             "webs_posts": "50*2 SHS (2.9 kg/m)",

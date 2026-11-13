@@ -23,13 +23,18 @@ def bay_panels(layout,bay):
     return roof,walls
 
 
+def portal_panels_in_bay(bay):
+    return {f'portal_{side}/bay/{bay}' for side in ('left','right')}
+
+
 def spacing_assessment(layout, maximum=DEFAULT_MAX_BAY_SPACING, selected=None):
-    selected=set(layout.pinned if selected is None else selected)
+    # A portal frame brace in a wall bay counts as that bay's side-wall bracing.
+    selected=set(getattr(layout,'selection',layout.pinned) if selected is None else selected)
     count=len(layout.geometry.bay_stations_mm)-1
     anchors=[]
     for bay in range(count):
         roof,walls=bay_panels(layout,bay)
-        if roof<=selected and walls & selected:
+        if roof<=selected and (walls|portal_panels_in_bay(bay)) & selected:
             anchors.append(bay)
     runs=[]
     for left,right in zip([-1]+anchors,anchors+[count]):
@@ -40,7 +45,7 @@ def spacing_assessment(layout, maximum=DEFAULT_MAX_BAY_SPACING, selected=None):
         'anchor_bays':[b+1 for b in anchors],
         'maximum_unbraced_run':max((r['unbraced_bays'] for r in runs),default=0),
         'violations':violations,
-        'basis':f'Project load-path rule: at least one complete roof-braced bay aligned with side-wall bracing in every {maximum} consecutive building bays. A continuous eave strip alone does not count. Blocked panels remain excluded.'}
+        'basis':f'Project load-path rule: at least one complete roof-braced bay aligned with side-wall bracing (X bracing or a portal frame brace) in every {maximum} consecutive building bays. A continuous eave strip alone does not count. Blocked panels remain excluded.'}
 
 
 def repair_spacing(context, selected):
@@ -61,7 +66,8 @@ def repair_spacing(context, selected):
         roof,walls=bay_panels(layout,bay)
         if not roof<=available_panels:
             continue
-        available=walls & available_panels
+        # A selected portal frame brace also anchors its bay (repair never adds one).
+        available=(walls & available_panels) | (portal_panels_in_bay(bay) & selected)
         if not available:
             continue
         aligned=available & selected

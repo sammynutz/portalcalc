@@ -76,7 +76,8 @@ def reduce_strut_brace_cost(context, best, candidates, criteria, rates, budget, 
                                group_cost, member_assessment, solve_selection)
     from purlin_beam_design import with_beam_demands
     result, chosen = best
-    brace_groups = [g for g in ('roof_brace', 'wall_brace', 'end_brace') if group_members(result, g)]
+    brace_groups = [g for g in ('roof_brace', 'wall_brace', 'end_brace', 'canopy_brace')
+                    if g in chosen and group_members(result, g)]
     stiff = dict(chosen)
     for group in brace_groups:
         priced = []
@@ -162,7 +163,7 @@ def reduce_strut_brace_cost(context, best, candidates, criteria, rates, budget, 
 def auto_size_mixed(context, selections, candidates, criteria, rates, progress=None, max_solves=18,
                     *, fast=False, initial_result=None, retain_brace_stiffness=False):
     from bracing_design import (GROUPS, candidate_name, candidate_stiffness, group_assessments,
-                               group_cost, member_assessment, solve_selection, stiffness_ceiling,
+                               group_cost, group_members, member_assessment, solve_selection, stiffness_ceiling,
                                bounded_stiffness_floor, reduce_verified_cost)
     from bracing_design import fast_sway_proposal
     current = dict(selections)
@@ -171,7 +172,8 @@ def auto_size_mixed(context, selections, candidates, criteria, rates, progress=N
     from bracing_sizing_diagnostics import require_layout_spacing
     require_layout_spacing(result)
     solves = 1
-    ceilings = {g: stiffness_ceiling(context, result, g, candidates[g], rates) for g in GROUPS if g != 'strut'}
+    ceilings = {g: stiffness_ceiling(context, result, g, candidates[g], rates) for g in GROUPS
+                if g != 'strut' and g in current}
     best = (result, dict(current)) if result["design"]["passes"] else None
     floors, visited, trace, screens = {}, set(), [], 0
     if retain_brace_stiffness:
@@ -183,7 +185,7 @@ def auto_size_mixed(context, selections, candidates, criteria, rates, progress=N
 
     def key_of(choice):
         return (tuple((key, value.name) for key, value in sorted(choice["strut"].members.items())),
-                tuple(candidate_name(choice[g]) for g in GROUPS if g != "strut"))
+                tuple(candidate_name(choice[g]) for g in GROUPS if g != "strut" and g in choice))
 
     for iteration in range(max_solves-1):
         if solves >= max_solves:
@@ -305,7 +307,8 @@ def auto_size_mixed(context, selections, candidates, criteria, rates, progress=N
             raise incomplete
         proposed["strut"] = StrutPlan(members, current["strut"].fallback)
         for group in GROUPS:
-            if group == "strut" or not any(m["kind"] == GROUPS[group] for m in result["cases"][0]["members"]):
+            # group_members also finds portal brace columns/beams (not network members).
+            if group == "strut" or group not in current or not group_members(result, group):
                 continue
             if factor > 1:
                 floors[group] = bounded_stiffness_floor(floors.get(group, 0), candidate_stiffness(current[group]), factor, ceilings[group])
@@ -341,7 +344,7 @@ def auto_size_mixed(context, selections, candidates, criteria, rates, progress=N
             # loses verified taut-rod stability is still an unstable downgrade.
             if (result['design']['taut_tangent_verified'] and not next_result['design']['taut_tangent_verified']
                     and any(candidate_name(proposed[g]) != candidate_name(current[g])
-                            for g in ('roof_brace', 'wall_brace', 'end_brace'))):
+                            for g in ('roof_brace', 'wall_brace', 'end_brace', 'canopy_brace') if g in current)):
                 slack = sorted({c['tangent_status'] for c in next_result['cases'] if c['tangent_status'] != 'positive_with_taut_rods'})
                 raise AnalysisError('Unstable brace downgrade: taut-rod stability unverified ('+', '.join(slack)+')')
         except AnalysisError as error:
@@ -351,7 +354,7 @@ def auto_size_mixed(context, selections, candidates, criteria, rates, progress=N
             # tension-only braces remain taut under simultaneous roof/wall
             # loading. Reject that downgrade and try the sized struts/posts
             # with the last verified brace set, within the exact-solve budget.
-            brace_groups = ('roof_brace', 'wall_brace', 'end_brace')
+            brace_groups = tuple(g for g in ('roof_brace', 'wall_brace', 'end_brace', 'canopy_brace') if g in current)
             changed = [g for g in brace_groups if candidate_name(proposed[g]) != candidate_name(current[g])]
             if 'Unstable' not in str(error) or not changed or solves >= max_solves:
                 raise stop_for_search(initial_result, result, 'Candidate reanalysis failed: '+str(error)) from error

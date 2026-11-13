@@ -34,11 +34,15 @@ WIRE_FITTING_COST_BASIS = ('One matching forged-rated turnbuckle per physical di
                           'grips and other termination hardware excluded by user, 2026-10-31')
 
 
+# Turnbuckle prices adopted by the user for sizes the Costing table lacks.
+ADOPTED_TURNBUCKLE_PRICES = {'M28': 40.}   # forged M28 on a 30 mm rod, user-adopted 2026-11-11
+
+
 def fitting_price(size):
     # Match exact nominal sizes. In particular, the old M30 price is not a
     # price for the M28 forged turnbuckle specified on a 30 mm rod here.
     return next((item["unit_cost"] for item in END_WALL_ROD_TURNBUCKLES.values()
-                 if "M"+str(item["turnbuckle_size"]) == size), None)
+                 if "M"+str(item["turnbuckle_size"]) == size), ADOPTED_TURNBUCKLE_PRICES.get(size))
 
 
 def wire_cost_defaults(diameter, turnbuckle):
@@ -53,7 +57,9 @@ def wire_cost_defaults(diameter, turnbuckle):
 
 
 def rod_options(prices=None):
-    prices = prices or {}
+    # A saved blank price (None) falls back to the default, so older presets
+    # saved with an unpriced 30 mm rod pick up the adopted M28 price.
+    prices = {k: v for k, v in (prices or {}).items() if v is not None}
     return [{"label": f"{d} DIA ROD", "description": f"Grade 300 rod - project schedule",
              "area_mm2": math.pi*d*d/4, "component_type": "scheduled_rod", "grade_mpa": 300.,
              "design_tension_kn": capacity, "forged_turnbuckle": forged, "grade_s_turnbuckle": grade_s,

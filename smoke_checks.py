@@ -45,6 +45,10 @@ def compile_sources(root: Path) -> None:
         py_compile.compile(str(root / name), doraise=True)
     for name in ("bracing_layout.py", "bracing_layout_ui.py", "bracing_layout_regression.py"):
         py_compile.compile(str(root / name), doraise=True)
+    for name in ("bay_layout.py", "bay_layout_regression.py", "eave_node_regression.py",
+                 "building_model.py", "building_model_regression.py", "building_loads.py", "building_loads_regression.py",
+                 "frame_loading.py", "frame_loading_regression.py", "building_service_regression.py"):
+        py_compile.compile(str(root / name), doraise=True)
     for name in ("bracing_analysis.py", "bracing_analysis_desktop.py", "bracing_analysis_ui.py", "bracing_analysis_regression.py", "bracing_roof_loads.py", "bracing_roof_loads_regression.py", "bracing_side_wind.py", "bracing_side_wind_regression.py"):
         py_compile.compile(str(root / name), doraise=True)
     for name in ("bracing_design.py", "bracing_design_regression.py", "bracing_workspace_ui.py", 'bracing_policy.py', 'bracing_policy_regression.py', 'bracing_calculation_cache.py', 'bracing_cache_regression.py', 'bracing_serviceability_regression.py', 'bracing_mullion_design.py', 'bracing_alignment_regression.py', 'bracing_layout_search.py', 'bracing_layout_search_regression.py'):
@@ -1455,95 +1459,6 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
         window.top_profile_combo.setCurrentIndex(original_top_index)
     active_auto_specs = window.active_auto_size_group_specs()
     assert not window.auto_size_design_acceptable([], 0.0)
-    assert not window.save_optimisation_learning([], 0.0)
-    original_learning_path = window.optimisation_learning_path
-    with tempfile.TemporaryDirectory() as learning_dir:
-        learning_path = Path(learning_dir) / "optimisation_learning.json"
-        window.optimisation_learning_path = lambda: str(learning_path)
-        assert window.save_optimisation_learning(active_auto_specs, 0.95)
-        learning_prediction = window.optimisation_surrogate_prediction()
-        assert learning_prediction["sample_count"] == 1
-        assert math.isclose(learning_prediction["nearest_distance"], 0.0, abs_tol=1e-12)
-        assert learning_prediction["section_metrics"]
-        assert not learning_prediction["nearest_trusted_for_shortcut"]
-        assert window.save_optimisation_learning(active_auto_specs, 0.95)
-        confirmed_prediction = window.optimisation_surrogate_prediction()
-        assert not confirmed_prediction["nearest_trusted_for_shortcut"]
-        stored_learning = json.loads(learning_path.read_text(encoding="utf-8"))["records"][0]
-        assert stored_learning["quality"] == "verified_feasible_incumbent"
-        assert stored_learning["confirmation_count"] == 2
-        assert not stored_learning["trusted_for_shortcut"]
-    window.optimisation_learning_path = original_learning_path
-
-    with tempfile.TemporaryDirectory() as learning_dir:
-        learning_path = Path(learning_dir) / "optimisation_learning.json"
-        matrix_path = Path(learning_dir) / "matrix.xls"
-        window.optimisation_learning_path = lambda: str(learning_path)
-        matrix_headers = [
-            "Inactive", "Job Number", "Project", "Job name", "Product Type",
-            "Length", "Width", "Eave Height", "Roof Type & Pitch", "Bays",
-            "Wind Region", "Wall Configuration", "Building Importance Level",
-            "Canopy", "Canopy Rafter Type", "Lean-to", "Lean-to Rafter Type",
-            "Lean-to Column Member", "Truss Depth", "Chord Members", "Double Chords",
-            "Web Members", "Haunch Web Members", "Haunch Webs Qty",
-            "Main Column Member UB/RHS/SHS",
-        ]
-        matrix_values = [
-            "No", "SMOKE-SEED-1", "Smoke Matrix Seed", "", "AG - Test",
-            "40", window.span_input.text(), window.eave_input.text(),
-            f"Gable {window.pitch_input.text()}", f"5*{float(window.load_bay_size_input.text()) * 1000:.0f}",
-            f"Wind Region {window.wind_region_combo.currentText()}", "Roof Only",
-            f"Importance Level {window.importance_combo.currentText()}",
-            "", "", "", "", "", window.depth_input.text(),
-            window.selected_profile(window.top_profile_combo).name, "",
-            window.selected_profile(window.web_profile_combo).name, "", "0",
-            window.selected_profile(window.left_column_profile_combo).name,
-        ]
-
-        def xml_row(values):
-            cells = "".join(
-                f"<Cell><Data ss:Type=\"String\">{html.escape(str(value))}</Data></Cell>"
-                for value in values
-            )
-            return f"<Row>{cells}</Row>"
-
-        matrix_path.write_text(
-            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
-            "<Workbook xmlns=\"urn:schemas-microsoft-com:office:spreadsheet\" "
-            "xmlns:ss=\"urn:schemas-microsoft-com:office:spreadsheet\">"
-            "<Worksheet ss:Name=\"EngineeringMatrixList\"><Table>"
-            f"{xml_row(matrix_headers)}{xml_row(matrix_values)}"
-            "</Table></Worksheet></Workbook>",
-            encoding="utf-8",
-        )
-        import_summary = window.import_optimiser_warm_starts(str(matrix_path))
-        assert import_summary["imported"] == 1
-        matrix_prediction = window.optimisation_surrogate_prediction()
-        assert matrix_prediction["sample_count"] == 1
-        assert matrix_prediction["historical_count"] == 1
-        assert matrix_prediction["verified_count"] == 0
-        assert not matrix_prediction["nearest_trusted_for_shortcut"]
-        matrix_specs = window.active_auto_size_group_specs()
-        window.apply_optimisation_warm_start(matrix_specs)
-        matrix_sections = {group: combo.currentText() for _, combo, group in matrix_specs}
-        assert "UC" not in matrix_sections["LEFT_COLUMN"].upper()
-        assert "UB" in matrix_sections["LEFT_COLUMN"].upper()
-        matrix_records = json.loads(learning_path.read_text(encoding="utf-8"))["records"]
-        assert matrix_records[0]["quality"] == "historical_matrix_seed"
-        assert not matrix_records[0]["verified"]
-        assert matrix_records[0]["warm_start_eligible"]
-    window.optimisation_learning_path = original_learning_path
-    window.left_canopy_type_combo.setCurrentText("Canopy")
-    window.left_canopy_length_input.setText("0")
-    assert window.optimisation_job_features()["left_type"] == "None"
-    window.left_canopy_type_combo.setCurrentText("None")
-    original_wall_states = window.envelope_plan_selector.wall_states()
-    window.envelope_plan_selector.set_wall_states({"left": True, "right": False, "front": False, "back": False})
-    assert not window.symmetric_end_columns_should_match()
-    features = window.optimisation_job_features()
-    assert features["left_wall_clad"] is True
-    assert features["right_wall_clad"] is False
-    window.envelope_plan_selector.set_wall_states(original_wall_states)
 
     for chord_group, chord_combo in [("TOP", window.top_profile_combo), ("BOTTOM", window.bottom_profile_combo)]:
         chord_envelope = window.design_envelope_actions.get(chord_group, {})
@@ -1569,10 +1484,6 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
             assert doubled_label == "Doubled chord zone"
             assert overall_ratio + 1e-9 >= doubled_ratio
     frozen_ratio_cache = {}
-    coordinated_choices, _ = window.auto_size_coordinated_choices(active_auto_specs, frozen_ratio_cache)
-    assert coordinated_choices
-    assert len({id(combo) for combo, _ in coordinated_choices}) == len(coordinated_choices)
-    assert frozen_ratio_cache
     exact_neighbour = window.auto_size_exact_neighbour_candidate(active_auto_specs, frozen_ratio_cache)
     if exact_neighbour is not None:
         frozen_ratio, _, _, neighbour_combo, neighbour_index, _, estimated_saving, _ = exact_neighbour
@@ -1637,7 +1548,7 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
         item["value"] >= 0.0
         for item in window.design_envelope_actions["sls_column_top_deflections"].values()
     )
-    assert "H/100" in window.section_checks_box.toPlainText()
+    assert "H/80" in window.section_checks_box.toPlainText()   # IL1 column sway default (was H/100)
     assert "Wu Cpe Left +" in window.single_load_arrows
     assert "Wu Cpi + with Left +" in window.single_load_arrows
     assert "Ws Cpi - with End -" in window.single_load_arrows
@@ -2763,6 +2674,21 @@ def build_steps(quick: bool):
         ("license and calculation checks", run_license_smoke_checks, 5),
         ("compatible roof purlin selection checks", p(run_tests, "Roof purlin selection regression failed",
             "purlin_selection_regression:PairSelectionTests", "purlin_selection_regression:RoofIntegrationTests"), 3),
+        ("bay list input: parsing, legacy conversion and derived values", p(run_tests, "Bay list regression failed",
+            "bay_layout_regression:BayListTests", "bay_layout_regression:DesktopTests"), 3),
+        ("eave pitching point: top chord node and eave strip loads", p(run_tests, "Eave node regression failed",
+            "eave_node_regression:EaveNodeTests"), 4),
+        ("3D building model schema and preset round trip", p(run_tests, "Building model regression failed",
+            "building_model_regression:ModelTests", "building_model_regression:DesktopTests"), 3),
+        ("3D building loads: per-frame wind, 2D parity and expected differences", p(run_tests, "Building loads regression failed",
+            "building_loads_regression:EngineTests", "building_loads_regression:ExpectedDifferenceTests",
+            "building_loads_regression:DesktopParityTests"), 10),
+        ("3D building loads through the 2D envelope checks", p(run_tests, "Frame loading regression failed",
+            "frame_loading_regression:CombinationTests", "frame_loading_regression:DesktopEnvelopeTests",
+            "frame_loading_regression:ScreeningTests", "frame_loading_regression:DesktopToggleTests"), 55),
+        ("calculation service v2: 3D building requests", p(run_tests, "Building service v2 regression failed",
+            "building_service_regression:ContractTests", "building_service_regression:HeadlessTests",
+            "building_service_regression:ProppedMullionTests", "building_service_regression:ReviewTests"), 50),
         ("3D bracing location planning checks", p(run_tests, "Bracing location planning regression failed",
             "bracing_layout_regression:LayoutModelTests", "bracing_layout_regression:LayoutUITests"), 4),
         ("fixed-layout 3D bracing mechanics and desktop checks", p(run_tests, "Fixed-layout 3D bracing analysis regression failed",
@@ -2770,6 +2696,10 @@ def build_steps(quick: bool):
             "bracing_roof_loads_regression:RoofLoadTests", "bracing_side_wind_regression:SideWindTests"), 28),
         ("bracing section checks, sizing and combined workspace", p(run_tests, "Bracing design/workspace regression failed",
             "bracing_design_regression:DesignMechanicsTests", "bracing_design_regression:WorkspaceTests"), 46),
+        ("open canopies, open-ended roofs and roof friction", p(run_tests,
+            "Bracing canopy/open-roof regression failed", "bracing_canopy_regression"), 25),
+        ("portal frame braces in side-wall bays", p(run_tests,
+            "Portal frame brace regression failed", "bracing_portal_brace_regression"), 4),
         ("braced-bay spacing and small-screen footer", p(run_tests, "Bracing spacing/screen-fit regression failed",
             "bracing_spacing_regression:SpacingTests", "bracing_workspace_fit_regression:WorkspaceFitTests"), 5),
         ("blocked-panel bracing layout search and transactional adoption", p(run_tests,

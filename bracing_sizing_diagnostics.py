@@ -80,6 +80,8 @@ def result_summary(result):
         families=[]
         if settings['enabled']:
             families.append(f"roof c {settings['flexibility_mm_per_kn']:g} ({settings['shear_direction']})")
+            if diaphragm.get('panel_counts',{}).get('canopy'):
+                families.append(f"{diaphragm['panel_counts']['canopy']} open-canopy panels on the roof c")
         if settings.get('side_walls_enabled'):
             families.append(f"side-wall trial c {settings['side_wall_flexibility_mm_per_kn']:g}")
         if settings.get('end_walls_enabled'):
@@ -110,8 +112,11 @@ def result_summary(result):
             for kind,value in case.get('load_path',{}).get('peak_brace_tension_n',{}).items():
                 peaks[kind] = max(peaks.get(kind,0.),value)
     if peaks:
+        labels = [('roof_brace','roof'),('wall_brace','side-wall'),('end_brace','front/back end-wall')]
+        if 'canopy_brace' in peaks:
+            labels.append(('canopy_brace','canopy roof'))
         lines += ['ULS brace peak tension: '+', '.join(f"{label} {peaks.get(kind,0.)/1000:.1f} kN"
-                  for kind,label in (('roof_brace','roof'),('wall_brace','side-wall'),('end_brace','front/back end-wall')))+'.']
+                  for kind,label in labels)+'.']
     drags=[c['case']['roof_drag'] for c in result['cases'] if c['case']['level']=='ULS' and c['case'].get('roof_drag')]
     if drags:
         peak=max(drags,key=lambda d:abs(d['signed_y_force_kn']))
@@ -159,7 +164,7 @@ def stop_for_search(initial, screening, reason, group=None, floor=None, ceiling=
     retained = initial['design']['global_sls']
     movement_failure = sls.get('included_in_design',True) and sls['ratio'] > 1
     names = {'strut': 'Struts', 'end_post': 'End posts', 'roof_brace': 'Roof braces',
-             'wall_brace': 'Side-wall braces', 'end_brace': 'End-wall braces'}
+             'wall_brace': 'Side-wall braces', 'end_brace': 'End-wall braces', 'canopy_brace': 'Canopy roof braces'}
     label = names.get(group, 'Bracing system')
     kind = 'longitudinal_strut' if group == 'strut' else group
     identifiers = {m['id'] for m in screening['cases'][0]['members'] if m['kind'] == kind}
@@ -199,7 +204,9 @@ def describe_location(location, geometry):
     # The geometry schema exposes roof stations as a derived property, so use
     # the actual member x/span to name eave/ridge positions without raw IDs.
     x, span = location["x_mm"], geometry["span_mm"]
-    face = "left eave" if abs(x) < 1e-4 else "right eave" if abs(x-span) < 1e-4 else "ridge" if abs(x-span/2) < 1e-4 else f"roof line {location['line']+1}"
+    face = ("left canopy edge purlin" if x < -1e-4 else "right canopy edge purlin" if x > span+1e-4
+            else "left eave" if abs(x) < 1e-4 else "right eave" if abs(x-span) < 1e-4
+            else "ridge" if abs(x-span/2) < 1e-4 else f"roof line {location['line']+1}")
     return f"Bay {location['bay']+1}, {face}"
 
 

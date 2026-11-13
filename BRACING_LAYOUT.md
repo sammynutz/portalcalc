@@ -15,12 +15,79 @@ the layout and section settings together in the normal preset/history. Configura
 only. Geometry changes retain the original locations and flag them for review;
 the explicit geometry-reset button clears them and can be undone before saving.
 
-The view covers the main building only. It has roof strips, longitudinal wall
-bays and front/back end-wall panels. Roof strips follow the end-wall stations
-plus the gable ridge. End-wall brace endpoints follow actual mullion stations;
-an intermediate ridge point is not an invented ground support. A final partial
-longitudinal bay retains its actual length. These are geometric locations,
-not analysis elements or a declaration that every location is structurally suitable.
+The view has roof strips, longitudinal wall bays and front/back end-wall panels,
+plus a canopy roof face for each open canopy. Roof strips follow the end-wall
+stations plus the gable ridge. End-wall brace endpoints follow actual mullion
+stations; an intermediate ridge point is not an invented ground support. A
+final partial longitudinal bay retains its actual length. These are geometric
+locations, not analysis elements or a declaration that every location is
+structurally suitable.
+
+## Canopy roof faces
+
+An open canopy (type **Canopy**, gable roofs only) adds a face `canopy_left` or
+`canopy_right`. It has one strip per bay, from the main eave line out to the
+canopy edge (`canopy_{side}/bay/b`), drawn beside the roof with reference lines
+and a label. Pin and block canopy panels like any other; the face filter lists
+**Left/Right canopy roof**. The footer shows the canopy widths. Lean-tos do not
+add a face (the 3D analysis rejects them).
+
+A canopy edge has no support along the building except its own roof bracing,
+so each canopy must have at least one braced panel. **Find layout and size**
+and every **Optimise frame + bracing** option add canopy bracing after the main
+layout search (`canopy_bracing`):
+
+- Brace each canopy in the end roof-braced bays: the first and last complete
+  roof-braced bays (every roof strip pinned), or the first and last roof-braced
+  bays if no bay is complete.
+- Add intermediate canopy bays only where a run of unbraced canopy bays would
+  reach the maximum braced-bay spacing (default 5). Each gap is split at the
+  roof-braced bay nearest its middle (`canopy_bays`). With full roof bracing on
+  7 bays the canopy is braced in bays 1, 4 and 7, not in every bay.
+- A blocked canopy panel moves to the nearest allowed bay.
+- A canopy side that already has braced panels is kept as it is.
+
+The main search, its bay-spacing rule and the parsing of `roof/` IDs do not
+change. A fixed layout (**Analyse and check**, **Size selected layout**) with no
+panel on a canopy gets a specific message asking for a canopy roof panel,
+usually in the main roof-braced bays. Canopy braces form their own
+`canopy_brace` design group (see `BRACING_DESIGN.md`).
+
+**Carry-over.** Adding, removing or resizing a canopy keeps the main building's
+saved blocked and pinned panels (`carry_over`), and the editor and analysis both
+use it. Panels of a removed canopy are dropped, and a new canopy starts with
+none. Any change to the main building itself (span, length, bay or end-wall
+stations, eave, pitch or roof shape) is handled as before: the original
+locations are kept and flagged for review.
+
+## Portal frame braces
+
+A portal frame brace is a UB moment frame in one side-wall bay: a UB column
+stitch-welded inside each of the two portal columns, and a UB beam
+moment-connected across the top at eave level, on pinned base plates. It is
+for a bay that cannot take X bracing, such as an open wall, a door or a blocked
+bay. It gives that eave line its own longitudinal support.
+
+- **Locations.** One per side-wall bay, IDs `portal_left/bay/b` and
+  `portal_right/bay/b`, with face filters **Left/Right wall portal brace**.
+  Blocking the wall's X panel does not block the portal brace, which has its
+  own blocked/pinned state.
+- **One per bay.** A bay cannot have both its wall X panel and a portal brace
+  pinned.
+- **In the editor.** Choose a portal brace face filter to pin or block portal
+  braces. Pinned portal braces show as a thick column-beam frame in every view;
+  blocked ones are dashed under the filter.
+- **Model.** `BracingLayout` keeps portal braces apart from X panels:
+  `pinned`/`blocked`/`available` stay X-brace only. `portal_braces`,
+  `portal_blocked` and `available_portals` hold the portal braces, and
+  `selection`/`all_blocked` hold both. Code that rebuilds a layout carries
+  `selection` and `all_blocked`.
+- **Spacing rule.** A portal-braced bay counts as the aligned side-wall
+  bracing of a complete roof-braced anchor bay.
+- **Searches.** **Find layout and size** keeps any portal braces you pin and
+  never adds or removes them. **Optimise frame + bracing** also tries portal
+  braces on a side wall whose end bays cannot take X bracing (see
+  `BRACING_ANALYSIS.md`).
 
 ## Maximum transfer length in bays
 
@@ -49,7 +116,12 @@ section-only sizing. Changing it invalidates the checked-result cache.
 ## Saved contract and BOLT integration
 
 The preset's optional `bracing.layout` object uses schema
-`portalcalc.bracing-layout.v1`. Older presets omit it. The Qt-free model in
+`portalcalc.bracing-layout.v1`, or `portalcalc.bracing-layout.v2` when the
+geometry has an open canopy, or `portalcalc.bracing-layout.v3` when any portal
+frame brace is pinned or blocked (portal IDs are listed in the same
+`pinned_panels`/`blocked_panels` arrays). Older presets omit it. A v1 layout
+reads as a building without canopies or portal braces, and a layout without
+them is still written as v1 or v2. The Qt-free model in
 `bracing_layout.py` validates and serialises the same object, allowing BOLT to
 supply constraints without depending on desktop widgets. BOLT transport and
 automatic import are not connected yet.
@@ -74,7 +146,19 @@ automatic import are not connected yet.
 Coordinates are millimetres: X across the portal from the left column, Y from
 front to back, Z upwards. IDs use zero-based indices. Wall IDs are
 `left_wall/bay/i` and `right_wall/bay/i`; roof IDs are `roof/bay/i/strip/j`;
-end-wall IDs are `front_end/panel/j` and `back_end/panel/j`.
+end-wall IDs are `front_end/panel/j` and `back_end/panel/j`; canopy IDs are
+`canopy_left/bay/i` and `canopy_right/bay/i`.
+
+A v2 geometry adds a `canopies` list. Each entry gives the side, the plan width
+measured out from the main eave line, and the canopy's fall from the main eave
+to its outer edge (negative rises; no steeper than 45 degrees), all in mm:
+
+```json
+"canopies": [{"side": "left", "width_mm": 5000, "drop_mm": 437}]
+```
+
+Canopy strut lines come after the roof stations, so canopy `k` is strut line
+`len(roof_stations) + k`.
 The explicit station arrays support unequal bays. IDs belong to the saved
 geometry and must not be transplanted to a different grid. Unknown IDs,
 overlapping blocked/pinned sets and invalid geometry are rejected.
@@ -231,7 +315,9 @@ installation costs and production portal restraint coupling remain separate
 integration steps. End-wall action in the portal plane remains distinct from
 longitudinal restraint.
 
-Run `python bracing_layout_regression.py` and
-`python bracing_layout_search_regression.py` for focused checks or
+Run `python bracing_layout_regression.py`,
+`python bracing_layout_search_regression.py` and
+`python bracing_canopy_regression.py` (canopy faces, schema v2, carry-over and
+the canopy bracing rule) for focused checks or
 `python smoke_checks.py --full` for the broad suite. Set `QT_QPA_PLATFORM=offscreen`
 for unattended UI checks.

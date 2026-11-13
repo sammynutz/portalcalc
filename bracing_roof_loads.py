@@ -13,7 +13,56 @@ import numpy as np
 
 from loads import (BasicRoofLoads, RoofLoadPlacement, apply_roof_vertical_loads_in_zones,
                    apply_structure_self_weight)
-from wind import low_pitch_cpe_values, SIDE_WALL_CPE_BANDS, area_reduction_factor
+from wind import (low_pitch_cpe_values, SIDE_WALL_CPE_BANDS, area_reduction_factor, action_combination_factors,
+                  open_canopy_cpi, transverse_free_roof_cpn)
+
+CANOPY_TOP_GROUPS = {'left': 'LEFT_CANOPY_TOP', 'right': 'RIGHT_CANOPY_TOP'}
+
+
+def canopy_parts(structure, source=None):
+    """Open canopies on a portal: roof members, nodes, area loads and plan width.
+
+    ``source`` is the preset (its 'canopies' section gives the canopy G/Q/solar
+    kPa, pitch and underside). Plan width is measured from the main eave.
+    """
+    settings = (source or {}).get('canopies', {}) or {}
+    xs = [n.x for e in structure.elements if e.group == 'TOP' for n in (e.start, e.end)]
+    parts = []
+    for side, group in CANOPY_TOP_GROUPS.items():
+        elements = [e for e in structure.elements if e.group == group]
+        if not elements or not xs:
+            continue
+        nodes = sorted({n.id: n for e in elements for n in (e.start, e.end)}.values(), key=lambda n: n.x)
+
+        def kpa(key):
+            try:
+                return -abs(float(settings.get(f'{side}_{key}', 0) or 0))
+            except (TypeError, ValueError):
+                return 0.
+
+        try:
+            pitch = float(settings.get(f'{side}_pitch_deg', 0) or 0)
+        except (TypeError, ValueError):
+            pitch = 0.
+        parts.append({'side': side, 'group': group, 'elements': elements, 'nodes': nodes,
+                      'plan_mm': (min(xs)-nodes[0].x) if side == 'left' else (nodes[-1].x-max(xs)),
+                      'slope_mm': sum(e.length() for e in elements), 'pitch_deg': pitch,
+                      'underside': 'blocked' if str(settings.get(f'{side}_underside', '')).startswith('Blocked') else 'empty',
+                      'loads': BasicRoofLoads(g=kpa('g_kpa'), q=kpa('q_kpa'), solar=kpa('solar_kpa'))})
+    return parts
+
+
+def fully_open(inputs):
+    """No clad wall: the 2D frame treats the roof (and canopies) as free roofs."""
+    return not any((inputs.left_wall_clad, inputs.right_wall_clad, inputs.front_wall_clad, inputs.back_wall_clad))
+
+
+def add_normal_line_load(structure, element, outward_n_mm):
+    """Uniform load normal to a roof member, positive outward (upward side)."""
+    dx, dz = element.end.x-element.start.x, element.end.y-element.start.y
+    sign = 1. if dx >= 0 else -1.
+    structure.add_uniform_global_line_load(element, -sign*dz/element.length()*outward_n_mm,
+                                           sign*dx/element.length()*outward_n_mm)
 
 
 def frame_strip_integrals(stations, segments, reverse=False):
@@ -78,6 +127,8 @@ def building_roof_cases(base_cases, portal, geometry, wind_inputs, source, snow_
         hvac=-abs(float(settings.get('hvac_kpa',0))),other=-abs(float(settings.get('other_kpa',0))),
         placements=placements)
     widths = frame_strip_integrals(g.bay_stations_mm,[(0.,g.length_mm,1.)])
+    canopies = canopy_parts(structure, source)
+    free_roof = fully_open(wind_inputs)
     gravity, live = [], []
     for width in widths:
         for gf,qf,destination in [(1.,0.,gravity),(0.,1.,live)]:
@@ -85,6 +136,13 @@ def building_roof_cases(base_cases, portal, geometry, wind_inputs, source, snow_
             for _,kpa,placement in roof_loads.factored_components(gf,qf):
                 apply_roof_vertical_loads_in_zones(structure,tops,kpa*width/1000,
                     placement.side,placement.from_percent,placement.to_percent,element_groups={'TOP'})
+            # Canopy G/Q/solar as the 2D frame applies them (full canopy, no
+            # snow), on the canopy roof members only.
+            for part in canopies:
+                for _,kpa,_ in part['loads'].factored_components(gf,qf):
+                    if kpa:
+                        apply_roof_vertical_loads_in_zones(structure,part['nodes'],kpa*width/1000,'Both',0.,100.,
+                                                           element_groups={part['group']})
             if gf:
                 apply_structure_self_weight(structure,structure.elements,1.)
             destination.append(_snapshot(structure))
@@ -119,6 +177,28 @@ def building_roof_cases(base_cases, portal, geometry, wind_inputs, source, snow_
                 roof_line = q*(-roof_factor*roof_cp[i]+internal)/1000
                 side_factor = max(area_reduction_factor(wind_inputs,'side_wall',g.eave_mm*width/1e6)*base['pressure_basis']['kce'],.8)
                 side_line = q*(-side_factor*side_cp[i]+internal)/1000
+                if free_roof:
+                    # All walls open: the 2D free-roof net coefficient for
+                    # longitudinal wind (B.4(A), empty under), no Cpi, as 2D.
+                    # 'External max' is 2D 'End +', which 2D takes as uplift.
+                    use_uplift = branch=='External max'
+                    roof_line = q*(-transverse_free_roof_cpn('empty',use_uplift))*width/1000
+                for part in canopies:
+                    if free_roof:
+                        outward = q*(-transverse_free_roof_cpn(part['underside'],use_uplift))*width/1000
+                    else:
+                        # Same per-frame roof bands as the main roof on top; the
+                        # open underside takes the shared canopy Cpi rule with
+                        # this frame's average side-wall Cpe.
+                        canopy_factor = max(area_reduction_factor(wind_inputs,'roof',part['slope_mm']*width/1e6)
+                                            *base['pressure_basis']['kce'],.8)
+                        wall_cpe = side_cp[i]/width if width>1e-9 else 0.
+                        cpi_c,_,_ = open_canopy_cpi(wind_inputs,'End +',part['side'],wind_inputs.building_length_m,
+                                                    g.eave_mm/1000,wall_cpe=wall_cpe)
+                        kci_c = action_combination_factors(wind_inputs,cpi_c)[1]
+                        outward = q*(-canopy_factor*roof_cp[i]+cpi_c*kci_c*width)/1000
+                    for e in part['elements']:
+                        add_normal_line_load(structure,e,outward)
                 for e in structure.elements:
                     if e.group=='TOP':
                         dx, dz = e.end.x-e.start.x,e.end.y-e.start.y
@@ -141,7 +221,7 @@ def building_roof_cases(base_cases, portal, geometry, wind_inputs, source, snow_
                 cases.append(case)
 
     from bracing_side_wind import side_wind_cases
-    transverse_cases=side_wind_cases(portal,g,wind_inputs,gravity,widths)
+    transverse_cases=side_wind_cases(portal,g,wind_inputs,gravity,widths,source=source)
     cases.extend(transverse_cases)
     # Some dominant-opening presets have identical Cpi branches. Preserve
     # source labels but solve each distinct physical load combination once.

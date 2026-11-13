@@ -134,8 +134,10 @@ def solve_shared(assemblies, spans, line):
            abs(a.location['purlin']['area_mm2']/p['area_mm2']-1) > .005 or
            a.location['purlin'].get('beam_inputs') != inputs for a in assemblies):
         raise AnalysisError('50/50 run requires consistent installed profile, linked count, shape and roof inputs')
-    if any(abs(a.location['purlin'].get('bending_span_mm', span)-span) > 1e-3 for a,span in zip(assemblies,spans)):
-        raise AnalysisError('Installed roof bending basis does not match the actual bay span')
+    # The installed purlins are checked at the design (longest) bay, which
+    # covers any shorter bay; a bay longer than that check is not covered.
+    if any(span > a.location['purlin'].get('bending_span_mm', span)+1e-3 for a,span in zip(assemblies,spans)):
+        raise AnalysisError('A bay is longer than the span the installed roof purlins were checked for')
     if any(a.arrangement == 'sheeted_purlin' for a in assemblies):
         raise AnalysisError('Do not mix finite cladding coupling and assigned 50/50 sharing on one roof run')
     kind = {'Single span': 'single', 'Double span': 'double', 'Continuous lapped': 'continuous_lapped'}[inputs['span_type']]
@@ -144,8 +146,12 @@ def solve_shared(assemblies, spans, line):
     actual_releases = list(range(1, len(spans))) if kind == 'single' else list(range(2, len(spans), 2)) if kind == 'double' else []
     if releases is not None and releases != actual_releases:
         raise AnalysisError('Nonstandard release schedule requires declared member capacities, not the preliminary reference check')
-    if max(spans)-min(spans) > 1e-4:
-        raise AnalysisError('Unequal spans require declared member capacities, not the preliminary reference check')
+    # Unequal bays (e.g. a shorter end bay): the run is analysed with its
+    # actual spans, and every bay's reference actions come from the longest
+    # bay's table rating. A shorter bay's own table moment/shear reference is
+    # higher (shorter lateral-buckling segments), so this is conservative.
+    reference_bay = max(range(len(spans)), key=lambda i: spans[i])
+    reference_span = spans[reference_bay]
     lap = float(rating.get('beam_lap_ratio', .15))
     if kind == 'continuous_lapped' and (len(spans) != 5 or p['shape'] != 'Z' or abs(lap-.15) > 1e-8):
         raise AnalysisError('The 5A/5B preliminary reference requires five Z spans with 15% laps')
@@ -212,15 +218,16 @@ def solve_shared(assemblies, spans, line):
         count = 1 if kind == 'single' or (kind == 'double' and i == len(spans)-1 and len(spans)%2) else 2 if kind == 'double' else 5
         if count == 1:
             span_type = 'Single span'
-        caps = a.location['shared_reference_caps'][span_type]
+        caps = assemblies[reference_bay].location['shared_reference_caps'][span_type]
         if 'error' in caps:
             raise AnalysisError(caps['error'])
-        ref = _solve({'spans_mm': [spans[i]]*count, 'roof_i_mm4': p['web_ix_mm4'], 'added_i_mm4': p['web_ix_mm4'],
+        ref = _solve({'spans_mm': [reference_span]*count, 'roof_i_mm4': p['web_ix_mm4'], 'added_i_mm4': p['web_ix_mm4'],
                       'span_type': 'single' if count == 1 else 'double' if count == 2 else 'continuous_lapped',
                       'lap_ratio': lap, 'loads': [{'name': 'unit', 'roof_n_mm': 1., 'added_n_mm': 0.}]})
         reference = {'moment_per_kn_m': max(max(b['roof']['positive_moment_knm'], b['roof']['negative_moment_knm']) for b in ref['cases'][0]['bays']),
                      'deflection_per_kn_m': max(b['roof']['deflection_mm'] for b in ref['cases'][0]['bays']),
-                     'shear_per_kn_m': max(b['roof']['shear_kn'] for b in ref['cases'][0]['bays']), 'capacity': caps}
+                     'shear_per_kn_m': max(b['roof']['shear_kn'] for b in ref['cases'][0]['bays']), 'capacity': caps,
+                     'reference_span_mm': reference_span}
         references[str(i)] = reference
     return {**roof, 'cases': cases, 'line': line, 'added_bays': list(active),
             'existing_count': n,

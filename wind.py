@@ -698,6 +698,22 @@ def opening_area_reduction_factor(surface: str, opening_area_m2: float) -> float
     return interpolate_points(max(opening_area_m2, 0.0), AREA_REDUCTION_TABLE[surface])
 
 
+def open_canopy_cpi(result, cpe_case, side: str, building_length_m: float, eave_m: float,
+                    wall_cpe: Optional[float] = None):
+    """Underside pressure coefficient of an open canopy on the ``side`` wall.
+
+    The space under the canopy is a chamber whose only opening is the open
+    side, length x eave: AS/NZS 1170.2 Table 5.1(B) with an opening ratio of
+    infinity, so Cpi = Ka x Cpe of that wall for either Cpi case. ``wall_cpe``
+    replaces the wall's Cpe (e.g. a per-frame side-wall average in 3D).
+    Returns (cpi, surface, ka); shared by the 2D frame and the 3D bracing model.
+    """
+    surface = wall_surface_for_cpe_case(cpe_case, side)
+    cpe = wall_cpe_for_surface(result, surface) if wall_cpe is None else float(wall_cpe)
+    ka = opening_area_reduction_factor(surface, max(building_length_m, 0.0) * max(eave_m, 0.0))
+    return ka * cpe, surface, ka
+
+
 def action_combination_factors(result_or_inputs, cpi: float = 0.0) -> Tuple[float, float]:
     """Return (Kce, Kci) for the current whole-frame external/internal action combination."""
     inputs = getattr(result_or_inputs, "inputs", result_or_inputs)

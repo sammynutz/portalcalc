@@ -16,6 +16,7 @@ from bracing_analysis_desktop import text_report
 from bracing_design import (DesignCriteria, auto_size, candidate_name, solve_selection,
                            global_sway_basis, panel_installation_rate)
 from bracing_layout import BracingLayout, LayoutGeometry
+from bracing_portal_brace import portal_candidates
 from bracing_layout_ui import BracingLayoutDialog
 from bracing_component_ui import ComponentEditor
 from bracing_components import StrutPlan
@@ -54,7 +55,7 @@ class BracingAnalysisDialog(QDialog):
         layout.setContentsMargins(0,0,0,0)
         self.content_scroll.setWidget(content)
         outer.addWidget(self.content_scroll,1)
-        intro = QLabel("Block panels where braces cannot go, then Find layout and size. Selected panels can also be checked or sized as a fixed layout. Main building: gravity/end wind plus ULS side wind; production portal restraint and connections remain separate.")
+        intro = QLabel("Block panels where braces cannot go, then Find layout and size. Selected panels can also be checked or sized as a fixed layout. Main building and any open canopies (not lean-tos): gravity/end wind plus ULS side wind; production portal restraint and connections remain separate.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
         toolbar = QHBoxLayout()
@@ -204,7 +205,11 @@ class BracingAnalysisDialog(QDialog):
             note=QLabel(f"Main mullion: {context.get('default_end_post')}. Uses the same wind envelope, properties and flybrace basis, plus bracing axial force. A checked adopted section updates main results/costing on Save and close. Main strength/deflection prerequisites apply in either bracing mode.")
             note.setWordWrap(True);inputs.addWidget(note)
         self.brace_combos = {}
-        for group, label in (("roof_brace", "Roof X braces"), ("wall_brace", "Side-wall X braces"), ("end_brace", "End-wall X braces")):
+        brace_rows = [("roof_brace", "Roof X braces"), ("wall_brace", "Side-wall X braces"), ("end_brace", "End-wall X braces")]
+        if context.get("canopy_brace"):
+            # Open canopy roof X-braces: their own group and section.
+            brace_rows.append(("canopy_brace", "Canopy roof X braces"))
+        for group, label in brace_rows:
             combo = QComboBox()
             for brace in self.component_editor.brace_candidates():
                 combo.addItem(brace["label"], brace)
@@ -217,17 +222,52 @@ class BracingAnalysisDialog(QDialog):
             self.brace_combos[group] = combo
             form.addRow(label, combo)
         self.end_brace_combo = self.brace_combos["end_brace"]
+        # Portal frame braces (UB moment frames in side-wall bays): columns and beam
+        # are sized as separate groups from the UB catalogue.
+        self.portal_profiles = portal_candidates(catalog.ub_profiles())
+        self.portal_combos = {}
+        for group, label in (('portal_brace_column', 'Portal brace columns (UB)'), ('portal_brace_beam', 'Portal brace beam (UB)')):
+            combo = QComboBox()
+            for candidate in self.portal_profiles:
+                combo.addItem(candidate.name, candidate.name)
+            name = saved.get(f"{group}_section") or getattr(context.get(group), 'name', None)
+            index = combo.findData(name) if name else 0
+            if name and index < 0:
+                combo.addItem(f"Missing saved section: {name}", None)
+                index = combo.count()-1
+            combo.setCurrentIndex(max(0, index))
+            combo.setToolTip('Used only where the layout has portal frame braces (UB columns stitch-welded inside the '
+                             'portal columns, UB beam moment-connected across the top, pinned bases).')
+            self.portal_combos[group] = combo
+            form.addRow(label, combo)
         inputs.addLayout(form)
         group = QGroupBox("Section-check assumptions")
         grid = QGridLayout(group)
         stored = saved.get("criteria", {}) if isinstance(saved.get("criteria"), dict) else {}
-        labels = ("Angle / rod Fy (MPa)", "Brace Fu (not used in gross yield)", "Other member tension An/Ag", "Other member tension kt", "Strut effective K", "Post effective K", "Local member / purlin L/n", "Accepted rod slack play (mm)")
+        labels = ("Angle / rod Fy (MPa)", "Brace Fu (not used in gross yield)", "Other member tension An/Ag", "Other member tension kt", "Strut effective K", "Post effective K", "Local member / purlin L/n", "Accepted rod slack play (mm)",
+                  "Portal brace column restraint (mm)", "Portal brace beam LTB kr", "Portal brace beam restraint (mm, 0 = bay)")
         self.criteria_inputs = {}
         numeric_criteria = {k:v for k,v in asdict(DesignCriteria()).items() if k not in ('include_serviceability','global_sls_divisor')}
         for i, ((name, value), label) in enumerate(zip(numeric_criteria.items(), labels)):
             box = QDoubleSpinBox()
             box.setDecimals(2)
             box.setRange(.01, 1. if name in {"net_area_factor", "tension_distribution_factor"} else 5. if name.endswith("ke") else 2000.)
+            if name == 'portal_brace_restraint_mm':
+                box.setRange(100., 20000.)
+                box.setDecimals(0)
+                box.setToolTip('Portal frame brace columns: minor-axis buckling and lateral-torsional segment length, '
+                               'from the stitch welds to the portal column (at most the column height). In-plane '
+                               'sway uses 2.0 x height; the beam uses its full span.')
+            if name == 'portal_brace_beam_kr':
+                box.setRange(.7, 1.)
+                box.setSingleStep(.05)
+                box.setToolTip('Portal frame brace beam lateral-torsional buckling rotational restraint factor kr '
+                               '(AS 4100): 0.85 with one knee, 0.7 with both knees restraining the flanges in plan, 1.0 none.')
+            if name == 'portal_brace_beam_restraint_mm':
+                box.setRange(0., 20000.)
+                box.setDecimals(0)
+                box.setToolTip('Lateral restraint spacing along the portal frame brace beam (flybraces); 0 = the bay '
+                               'length (restrained at the knees only).')
             if name == 'slack_play_limit_mm':
                 box.setRange(0., 10.)
                 box.setToolTip('Project-adopted: where zero-force or slack rods leave zero-stiffness modes, the case counts as stable '
@@ -266,10 +306,11 @@ class BracingAnalysisDialog(QDialog):
         self.global_sls_input=QDoubleSpinBox()
         self.global_sls_input.setDecimals(2);self.global_sls_input.setRange(.01,1000000.)
         self.global_sls_input.setValue(float(explicit_global if explicit_global is not None else auto_basis['divisor']))
-        self.global_sls_input.setToolTip('Global longitudinal H/n only. Project default IL1 H/100, IL2+ H/150. Local member/purlin deflection checks retain their separate L/n.')
-        grid.addWidget(self.global_sls_auto,4,0,1,4)
-        grid.addWidget(QLabel('Global longitudinal sway H/'),5,0)
-        grid.addWidget(self.global_sls_input,5,1)
+        self.global_sls_input.setToolTip('Global longitudinal H/n only. Project default IL1 H/80, IL2+ H/150. Local member/purlin deflection checks retain their separate L/n.')
+        sway_row = (len(self.criteria_inputs)+1)//2
+        grid.addWidget(self.global_sls_auto,sway_row,0,1,4)
+        grid.addWidget(QLabel('Global longitudinal sway H/'),sway_row+1,0)
+        grid.addWidget(self.global_sls_input,sway_row+1,1)
         def refresh_global_sls(*_args):
             if self.global_sls_auto.isChecked():
                 self.global_sls_input.setValue(auto_basis['divisor'])
@@ -386,6 +427,22 @@ class BracingAnalysisDialog(QDialog):
         self.panel_installation_input.setToolTip('Once for each physical crossed-brace panel on roof or walls, including both diagonals. SLS diaphragm equivalents are excluded. Included in layout cost comparisons; not a complete installation quote.')
         install_row.addWidget(self.panel_installation_input)
         inputs.addLayout(install_row)
+        portal_row = QHBoxLayout()
+        portal_row.addWidget(QLabel('Allowance per portal brace'))
+        self.portal_allowance_input = QDoubleSpinBox()
+        self.portal_allowance_input.setRange(0., 1000000.)
+        self.portal_allowance_input.setDecimals(2)
+        self.portal_allowance_input.setSingleStep(100.)
+        self.portal_allowance_input.setPrefix('$ ')
+        try:
+            self.portal_allowance_input.setValue(max(0., float(saved.get('portal_brace_allowance', 0.))))
+        except (TypeError, ValueError):
+            self.portal_allowance_input.setValue(0.)
+        self.portal_allowance_input.setEnabled(not read_only)
+        self.portal_allowance_input.setToolTip('Fabrication/connection allowance once per portal frame brace (two moment knees, '
+                                               'two base plates, stitch welding), on top of the UB steel. Default $0.')
+        portal_row.addWidget(self.portal_allowance_input)
+        inputs.addLayout(portal_row)
         inputs.addStretch()
         input_scroll = QScrollArea()
         input_scroll.setWidgetResizable(True)
@@ -452,6 +509,10 @@ class BracingAnalysisDialog(QDialog):
         editor.layoutChanged.connect(self.layout_changed)
         self.component_editor.changed.connect(self.invalidate)
         self.panel_installation_input.valueChanged.connect(self.invalidate)
+        self.portal_allowance_input.valueChanged.connect(self.invalidate)
+        for combo in self.portal_combos.values():
+            combo.setEnabled(not read_only)
+            combo.currentIndexChanged.connect(self.invalidate)
         self.max_braced_bay_spacing.valueChanged.connect(self.invalidate)
         self.visual_mode.currentIndexChanged.connect(self.change_visual_mode)
         self.case_combo.currentIndexChanged.connect(self.show_case)
@@ -534,6 +595,8 @@ class BracingAnalysisDialog(QDialog):
         return {"schema": "portalcalc.bracing-analysis-settings.v1", "strut_section": self.strut_combo.currentData(),
                 "end_post_section": self.post_combo.currentData(),
                 **{f"{g}_label": (c.currentData() or {}).get("label") for g, c in self.brace_combos.items()},
+                **{f"{g}_section": c.currentData() for g, c in self.portal_combos.items()},
+                'portal_brace_allowance': self.portal_allowance_input.value(),
                 "criteria": asdict(self.criteria()),
                 'installation_cost_per_panel': self.panel_installation_input.value(),
                 'layout_search': {'keep_selected': self.keep_current_panels.isChecked(),
@@ -557,15 +620,26 @@ class BracingAnalysisDialog(QDialog):
 
     def valid_settings(self):
         return (all(c.currentData() in self.catalog.profile_by_name for c in (self.strut_combo, self.post_combo))
-                and all(c.currentData() is not None for c in self.brace_combos.values()))
+                and all(c.currentData() is not None for c in self.brace_combos.values())
+                and (not self.layout_editor.model.portal_braces
+                     or all(c.currentData() in self.catalog.profile_by_name for c in self.portal_combos.values())))
+
+    def portal_selections(self):
+        """The portal brace column/beam candidates selected in the combos."""
+        by_name = {candidate.name: candidate for candidate in self.portal_profiles}
+        return {g: by_name.get(c.currentData()) for g, c in self.portal_combos.items()}
 
     def selections(self, context=None):
         fallback = self.catalog.profile_by_name[self.strut_combo.currentData()]
         wires = {option["label"]: option for option in self.component_editor.brace_candidates()}
         strut = self.component_editor.plan(context if context is not None else self.current_context(), fallback) if self.component_editor.mixed.isChecked() else fallback
+        layout = (context or {}).get('layout') or self.layout_editor.model
+        # Portal brace groups only exist for a layout with portal braces.
+        portal = self.portal_selections() if getattr(layout, 'portal_braces', None) else {}
         return {"strut": strut,
                 "end_post": self.catalog.profile_by_name[self.post_combo.currentData()],
-                **{g: wires.get((c.currentData() or {}).get("label"), c.currentData()) for g, c in self.brace_combos.items()}}
+                **{g: wires.get((c.currentData() or {}).get("label"), c.currentData()) for g, c in self.brace_combos.items()},
+                **{g: c for g, c in portal.items() if c is not None}}
 
     def current_context(self, require_selected=True):
         editor = self.layout_editor
@@ -579,7 +653,9 @@ class BracingAnalysisDialog(QDialog):
         source.setdefault("bracing", {}).update(layout=payload, analysis_3d=self.snapshot())
         return {**self.context, "layout": actual, "nominal_layout": payload, "source_preset": source,
                 'max_braced_bay_spacing':self.max_braced_bay_spacing.value(),
-                'cost_rates': {**self.context['cost_rates'], 'braced_panel_installation': self.panel_installation_input.value()},
+                'cost_rates': {**self.context['cost_rates'], 'braced_panel_installation': self.panel_installation_input.value(),
+                               'portal_brace_allowance': self.portal_allowance_input.value()},
+                **{g: c for g, c in self.portal_selections().items() if c is not None},
                 'stressed_skin': self.snapshot()['stressed_skin'],
                 'brace_policy': self.component_editor.snapshot()['brace_policy'],
                 "source_hash": hashlib.sha256(json.dumps(source, sort_keys=True, allow_nan=False).encode()).hexdigest()}
@@ -660,6 +736,10 @@ class BracingAnalysisDialog(QDialog):
         for group, combo in self.brace_combos.items():
             with QSignalBlocker(combo):
                 combo.setCurrentIndex(combo.findText(candidate_name(chosen[group])))
+        for group, combo in self.portal_combos.items():
+            if group in chosen:
+                with QSignalBlocker(combo):
+                    combo.setCurrentIndex(combo.findData(candidate_name(chosen[group])))
 
     def run_layout_search(self):
         if self._running or self.read_only or not self.valid_settings():
@@ -692,7 +772,7 @@ class BracingAnalysisDialog(QDialog):
                 raise AnalysisError('Layout search returned an unverified or inconsistent candidate; layout and sections unchanged')
             # Adopt only a checked success, as one undoable layout edit.
             editor = self.layout_editor
-            editor.model = BracingLayout(editor.model.geometry, editor.model.blocked, selected.pinned)
+            editor.model = BracingLayout(editor.model.geometry, sorted(editor.model.all_blocked), sorted(selected.selection))
             editor.remember()
             editor.save_button.hide()
             self.component_editor.refresh_bracing(selected.pinned)

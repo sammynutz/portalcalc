@@ -28,6 +28,7 @@ from bracing_design import DesignCriteria, auto_size, solve_selection
 from bracing_layout import BracingLayout
 from bracing_layout_search import find_layout, practical_seeds
 from bracing_restraint import OPTION, floor_candidates
+from bracing_spacing import max_bay_spacing
 
 BRACE_GROUPS = ('roof_brace', 'wall_brace', 'end_brace')
 # Groups whose stiffness restrains frame sway: roof girders and end-wall bracing.
@@ -49,26 +50,59 @@ def _frame_state(window):
 WEB_STATE = ('auto_web_profile_assignments', 'auto_web_joint_doubler_sides', 'auto_web_assignment_basis')
 
 
+TOPOLOGY_STATE = ('_panel_count_override', '_panel_topology_cache_signature', '_panel_topology_cache_count')
+
+
 def capture_state(window):
-    """Preset plus the auto-sized truss web assignments held outside it."""
+    """Preset plus what the auto-size holds outside it: the truss web
+    assignments and the main truss panel count (topology) it chose."""
     return {'preset': copy.deepcopy(window.collect_preset_data()),
-            **{key: copy.deepcopy(getattr(window, key, {})) for key in WEB_STATE}}
+            **{key: copy.deepcopy(getattr(window, key, {})) for key in WEB_STATE},
+            'panel_topology': {key: copy.deepcopy(getattr(window, key, None)) for key in TOPOLOGY_STATE}}
 
 
-def restore_state(window, state):
+def restore_state(window, state, exact=False):
+    """Re-apply a captured state and solve.
+
+    ``exact=True`` also restores the main truss panel count, so the window
+    holds exactly the captured frame (with its web assignments, which are per
+    panel member). Otherwise apply_preset_data clears the panel count and the
+    solve uses the default count for the restored truss depth: a warm start
+    of sections for a new auto-size, which re-chooses the panel count.
+    """
+    # apply_preset_data resets the topology suppression (it sets it only for a
+    # future-canopy design); keep a caller's hold, e.g. the optimiser's.
+    held = getattr(window, '_suppress_panel_topology_search', False)
     window.apply_preset_data(copy.deepcopy(state['preset']))
+    window._suppress_panel_topology_search = bool(held or getattr(window, '_suppress_panel_topology_search', False))
     for key in WEB_STATE:
         setattr(window, key, copy.deepcopy(state[key]))
+    topology = state.get('panel_topology') if exact else None
+    if topology is not None:
+        for key, value in topology.items():
+            setattr(window, key, copy.deepcopy(value))
     previous = getattr(window, '_preserve_web_assignments_on_solve', False)
+    previous_topology = window._suppress_panel_topology_search
     window._preserve_web_assignments_on_solve = bool(state['auto_web_profile_assignments'])
+    if topology is not None:
+        window._suppress_panel_topology_search = True   # hold the restored count
     try:
         window.generate_and_solve()
     finally:
         window._preserve_web_assignments_on_solve = previous
+        window._suppress_panel_topology_search = previous_topology
 
 
 def _size_frame(window):
-    outcome = window.auto_size_current_preset(show_completion=False, save_learning=False)
+    # The same per-auto-size load-vector cache as Optimise Structure
+    # (run_structure_optimisation): combination loads are applied once per
+    # geometry/spring/case signature instead of on every trial solve.
+    previous = getattr(window, 'optimisation_load_vector_cache', None)
+    window.optimisation_load_vector_cache = {}
+    try:
+        outcome = window.auto_size_current_preset(show_completion=False)
+    finally:
+        window.optimisation_load_vector_cache = previous
     return {**_frame_state(window), 'verified': bool(outcome.get('verified'))}
 
 
@@ -83,7 +117,11 @@ def _candidates(window, context):
     dialog = _workspace(window, context)
     try:
         return {'strut': dialog.strut_profiles, 'end_post': dialog.post_profiles,
-                **{group: dialog.component_editor.brace_candidates() for group in BRACE_GROUPS}}
+                **{group: dialog.component_editor.brace_candidates() for group in BRACE_GROUPS},
+                # Portal frame brace columns/beams: catalogue UBs (used only with portal braces).
+                **{group: list(dialog.portal_profiles) for group in ('portal_brace_column', 'portal_brace_beam')},
+                # Open canopy roof braces: the same brace catalogue, sized as their own group.
+                **({'canopy_brace': dialog.component_editor.brace_candidates()} if context.get('canopy_brace') else {})}
     finally:
         dialog.deleteLater()
 
@@ -134,7 +172,10 @@ def check_saved_locations(window):
     saved = window.bracing_location_layout
     if saved is None:
         return
-    if BracingLayout.from_dict(saved).geometry != window.current_bracing_layout_geometry():
+    from bracing_layout import carry_over
+    layout, current = BracingLayout.from_dict(saved), window.current_bracing_layout_geometry()
+    # A canopy-only change keeps the main building's saved panels (carry_over).
+    if layout.geometry != current and carry_over(layout, current) is None:
         raise AnalysisError(
             "The building dimensions have changed since the bracing locations were saved, so the blocked "
             "panels no longer line up with the building. Open the 3D bracing workspace, click 'Use current "
@@ -143,15 +184,23 @@ def check_saved_locations(window):
 
 
 def _with_layout(context, pinned):
-    return {**context, 'layout': BracingLayout(context['layout'].geometry, sorted(context['layout'].blocked), sorted(pinned))}
+    from bracing_layout import canopy_bracing
+    layout = context['layout']
+    # Open canopies are braced in the end roof-braced bays (plus spacing-rule bays).
+    # ``pinned`` is the whole selection (X panels and any portal braces).
+    pinned = set(pinned) | canopy_bracing(layout.geometry, layout.blocked, pinned, max_bay_spacing(context))
+    return {**context, 'layout': BracingLayout(layout.geometry, sorted(layout.all_blocked), sorted(pinned))}
 
 
 def _store_bracing(window, context, pinned, selections):
     """Save the bracing as the workspace's Save and close would."""
+    from bracing_layout import canopy_bracing
+    pinned = set(pinned) | canopy_bracing(context['layout'].geometry, context['layout'].blocked, pinned,
+                                          max_bay_spacing(context))
     dialog = _workspace(window, context)
     try:
         editor = dialog.layout_editor
-        editor.model = BracingLayout(editor.model.geometry, editor.model.blocked, sorted(pinned))
+        editor.model = BracingLayout(editor.model.geometry, sorted(editor.model.all_blocked), sorted(pinned))
         editor.remember()
         dialog.component_editor.refresh_bracing(set(pinned))
         dialog.adopt_sections(selections)

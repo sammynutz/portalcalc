@@ -219,6 +219,7 @@ class DesignMechanicsTests(unittest.TestCase):
         c['face_cladding'] = {'left_wall': False, 'right_wall': True}
         result = solve_selection(c,s,DesignCriteria(),{'shs':3.,'ub':4.,'wb':5.})
         rods = rod_options()
+        rods[-1] = {**rods[-1], 'fitting_unit_cost': None}   # an unpriced 30 mm rod
         angle = {'label': 'EA 100x100x10', 'area_mm2': 1900.}
         ceiling = stiffness_ceiling(c,result,'wall_brace',[*rods,angle],{'shs':3.,'ub':4.,'wb':5.})
         self.assertAlmostEqual(ceiling, candidate_stiffness(rods[2]))  # M28 unpriced, angle prohibited

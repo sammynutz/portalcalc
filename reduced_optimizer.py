@@ -861,7 +861,7 @@ def build_screen_from_portalcalc(app) -> tuple[ReducedElasticScreen, dict, dict]
     structure = getattr(app, "structure", None)
     active_specs = app.active_auto_size_group_specs()
     if structure is None or not active_specs:
-        raise ValueError("Generate and solve a frame before running Physics Optimise.")
+        raise ValueError("Generate and solve a frame before running Optimise.")
     total_dofs = len(structure.nodes) * 3
     baseline_matrix = structure.elastic_stiffness_matrix()
     fixed_matrix = baseline_matrix.copy()

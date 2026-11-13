@@ -440,7 +440,9 @@ class DesktopTests(unittest.TestCase):
         opened = end_wind_cases(WindInputs(orientation="Any", front_wall_clad=False, back_wall_clad=True))
         self.assertTrue(all(c["front_kpa"] == 0 for c in opened))
         self.assertTrue(any(c["back_kpa"] != 0 for c in opened))
-        with self.assertRaisesRegex(AnalysisError, "No end-wall pressure"):
+        # Both ends open: friction is the only along-building load, and this
+        # default building is too short for any (see bracing_canopy_regression).
+        with self.assertRaisesRegex(AnalysisError, "No along-building wind load"):
             end_wind_cases(WindInputs(front_wall_clad=False, back_wall_clad=False))
 
     def test_actual_desktop_analysis_preserves_portal_and_exports_complete_evidence(self):
@@ -466,7 +468,7 @@ class DesktopTests(unittest.TestCase):
         self.assertNotEqual(result["nominal_layout"]["geometry"]["span_mm"], result["analysis_layout"]["geometry"]["span_mm"])
         for case in result["cases"]:
             self.assertTrue(all(m["axial_n"] >= 0 for m in case["members"] if m["tension_only"]))
-        w.building_length_input.setText("48")
+        w.set_bays([8000.0] * 6)  # 48 m
         with self.assertRaisesRegex(AnalysisError, "dimensions changed"):
             prepare_context(w)
 

@@ -190,9 +190,11 @@ class RatedComponentTests(unittest.TestCase):
         checked = member_assessment(result, 0, rods[0], DesignCriteria(net_area_factor=.1))
         self.assertAlmostEqual(checked["ratio"], 1.)
         self.assertEqual(checked["case_checks"][0]["grade_mpa"], 300.)
-        self.assertIsNone(rods[-1]["fitting_unit_cost"])
+        # M28 (30 mm rod) is not in the Costing table; the user adopted $40.
+        self.assertEqual(rods[-1]["fitting_unit_cost"], 40.)
+        self.assertEqual(rod_options({"30": None})[-1]["fitting_unit_cost"], 40.)   # saved blank -> default
         with self.assertRaisesRegex(AnalysisError, "M28"):
-            group_cost(result, "roof_brace", rods[-1], {"ub": 3.})
+            group_cost(result, "roof_brace", {**rods[-1], "fitting_unit_cost": None}, {"ub": 3.})
         priced = rod_options({"30": 100.})[-1]
         self.assertEqual(group_cost(result, "roof_brace", priced, {"ub": 3.})["listed_fittings_cost"], 100.)
 

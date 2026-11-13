@@ -145,8 +145,11 @@ face, and the roof-to-member-base longitudinal force residual. The direct base
 half of end-wall pressure is kept separate from the load carried by bracing.
 The summary labels external roof friction separately from normal end-wall
 pressure, including its force, coefficient, loaded area and preliminary
-open-sided applicability assumption. Wall/underside/exposed-member drag are
-excluded. The end-wind leeward coefficient uses length/span,
+open-sided applicability assumption. Underside friction is included on the main
+roof when both end walls are open and on every open canopy. Wall and
+exposed-member drag are excluded. A building with both end walls open has no
+end-wall pressure, so its along-building load is friction only. The end-wind
+leeward coefficient uses length/span,
 not the transverse portal's ratio/pitch; pressure reductions count the actually
 applied end/internal surfaces. Worked case evidence records the coefficient and
 reduction basis. A member-capacity pass in this subset is not final brace sizing.
@@ -157,6 +160,35 @@ The underlying model remains the first-order end-wind model in
 `BRACING_ANALYSIS.md`. End posts and roof/side/end braces have common group sizes.
 Struts default to per-location assemblies; uniform dedicated steel is an explicit
 alternative. A scoped member/SLS pass is not complete structural acceptance.
+
+### Canopy roof braces and canopy edge purlins
+
+A building with an open canopy has a fourth brace group, `canopy_brace`, for the
+X-braces on the canopy roof faces. Buildings without a canopy have no such group,
+and their selections, candidates and results do not change. The group has:
+
+- its own **Canopy roof X braces** selector in Sections / criteria, starting at
+  the roof brace size, saved with the workspace settings;
+- member checks, the ULS "canopy roof" peak tension in Result summary, material
+  and fitting cost, and the per-panel installation allowance;
+- auto-sizing, including SLS stiffness proposals and verified cost reduction,
+  and the mixed-strut sizing loops;
+- the project brace-family preference. The unclad-wall rod rule does not apply,
+  because a canopy roof is not a wall.
+
+**Optimise frame + bracing** does not step the canopy braces with the roof and
+end-wall brace steps, which target frame restraint. Each option's canopy braces
+are sized by the 3D auto-size.
+
+The canopy edge is a strut line, checked and sized like the roof lines with
+per-location assemblies. The installed member there is the **canopy edge
+purlin** from Sections > Canopies (section or **Auto (lightest passing)**, and
+spacing). Its 2D Metroll check gives the installed-purlin record (span, tributary
+width of half the spacing, bending snapshot) that the strut check combines with
+the 3D axial force. Diagnostics name the location "left/right canopy edge
+purlin". If the canopy purlin check does not pass, the strut location reports a
+canopy-specific missing-purlin error. See `BRACING_ANALYSIS.md` (**Canopies**) for
+the canopy loads and network.
 
 The toolbar's **Include serviceability** toggle selects the design basis. It is
 on by default, including in older presets. On means strength plus overall
@@ -172,13 +204,75 @@ The pre-existing main mullion strength/deflection requirements remain mandatory
 for mullion replacements in both modes; the toggle applies to additional bracing
 serviceability, not to downgrading the main building's mullion design.
 
+### Portal frame braces
+
+A layout with portal frame braces (UB moment frames in side-wall bays; see
+`BRACING_ANALYSIS.md` and `BRACING_LAYOUT.md`) has two more design groups. They
+exist only when the layout has a portal brace; other results are unchanged.
+
+| Group | Members | Selector |
+|---|---|---|
+| `portal_brace_column` | Both columns of every portal brace | **Portal brace columns (UB)** |
+| `portal_brace_beam` | The eave beam of every portal brace | **Portal brace beam (UB)** |
+
+Candidates are the catalogue UBs, defaulting to 310UB40.4 columns and
+250UB31.4 beams. They are not rods, so the brace-family preference and the
+unclad-wall rod rule do not apply.
+
+**Checks.** Each case is checked with the recovered N, V and M through
+`member_checks.check_member` (combined axial plus bending, and shear). Each
+member is split into equal segments between lateral restraints. Every segment
+is checked with its own peak moment and the AS 4100 Table 5.6.1 moment
+modifier from its end moments, αm = 1.75 + 1.05 βm + 0.3 βm² ≤ 2.5
+(`linear_moment_modifier`), and the governing segment is reported. The
+member bending capacity stays capped at φMs.
+
+- **Columns.**
+  - In-plane (major-axis) effective length 2.0 h. The brace is the sway system
+    for that eave line, so the columns buckle in a sway mode, not a braced one.
+    The AS 4100 sway chart with a pinned base (γ = 10) gives about 2.0, for
+    example 1.96 with equal column and beam I, h = 7.5 m and L = 9 m. A braced
+    value such as 0.7 does not apply.
+  - Minor-axis and lateral-torsional segments are at most **Portal brace column
+    restraint** (Sections / criteria, default 1500 mm), from the stitch welds to
+    the portal column plus stiffeners where required.
+  - The moment is zero at the pinned base, so a full-height segment would have
+    αm 1.75. The top segment, which governs, is in single curvature with αm
+    about 1.1.
+- **Beam.**
+  - In-plane length = span.
+  - Minor-axis and LTB segments = **Portal brace beam restraint** (default 0 =
+    the bay, restrained at the knees only).
+  - **Portal brace beam LTB kr** defaults to 0.85; 0.7 applies when both knees
+    restrain the flanges in plan.
+  - Sway bends the beam in double curvature, giving αm 2.5.
+
+Connections, base plates, stitch welds and stiffeners are not designed.
+
+On PortalTest1 the portal brace members reach only 0.39–0.49 utilisation while
+global sway is at 0.95–1.0. Their sizes are set by sway stiffness, so these
+capacity refinements do not change them there.
+
+**Cost.** UB steel with each cut rounded up to UB stock lengths at the rolled
+rate. There is also **Allowance per portal brace** (Sections / criteria,
+default $0), charged once per portal brace for its two moment knees, two base
+plates and stitch welding, and shown as its own cost item.
+
+**Sizing.** Auto-sizing sizes both groups from their demands. Global-sway
+proposals step them by strong-axis E·I. The SLS stiffness screen ranks them
+alongside the X-brace groups: it takes a finite-difference derivative of each
+portal brace's condensed block and rebuilds the blocks for the trial solves,
+and the exact reanalysis decides. The per-location sizer handles them like the
+brace groups.
+
 ## Global sway and local deflection limits
 
 The project-adopted default for IL1 **in-plane eave sway and global 3D
-longitudinal sway is H/100**; IL2+ retains H/150. Global bracing sway follows
-the actual main in-plane eave criterion, including explicit main overrides.
-At a 6 m eave, H/100 permits 60 mm. This is an adopted project criterion, not
-a claim of a universal code limit.
+longitudinal sway is H/80** (relaxed from H/100 on 11 November 2026); IL2+
+retains H/150. Global bracing sway follows the actual main in-plane eave
+criterion, including explicit main overrides. At a 6 m eave, H/80 permits
+75 mm. This is an adopted project criterion, not a claim of a universal code
+limit. Storage buildings keep their separate H/100 eave limit.
 
 Global sway is separate from local member/purlin L/n (default **L/150**), and
 does not alter the main mullion's separate local wind-deflection prerequisite.
@@ -485,7 +579,7 @@ Fu=410 MPa assumption remains editable; this change does not infer a new Fu.
 Scheduled Grade 300 rod strengths and G1570 rope strengths remain unchanged.
 Other editable assumptions default to An/Ag=0.70,
 kt=0.85, strut/post effective K=1.0 and local SLS L/150. Global sway follows
-the main criterion (project IL1 H/100; IL2+ H/150). Catalogue steel
+the main criterion (project IL1 H/80; IL2+ H/150). Catalogue steel
 sections retain their own material properties. Project holes/threads,
 connections and restraints must establish the appropriate net-area, distribution
 and effective-length values; defaults do not verify connection details.
@@ -549,7 +643,7 @@ selection is never paired with a previous candidate's passing result.
 Eligibility uses the actual front/back/left/right cladding flags and pinned
 panels from the building context. Side-wall and end-wall braces currently have
 one section per group: if an installed brace is on any unclad face, that entire
-group must use rod (including its clad faces). Roof bracing remains independent.
+group must use rod (including its clad faces). Roof and canopy roof bracing remain independent.
 Angles are not a substitute for the required rod. Manual wire/angle selections
 on these wall groups are visibly unverified and cannot produce a passing design;
 auto-sizing filters them out. The policy does not add or move any braces.
@@ -707,7 +801,9 @@ physical brace candidates, costs or strength checks. Conventional ULS and bare
 SLS stability remain independent prerequisites. Wall families have separate
 trial c inputs, apply only to clad faces and retain fixed-anchor/collector
 assumptions for sensitivity testing. End-wall in-plane shear is transverse,
-with no direct longitudinal resistance.
+with no direct longitudinal resistance. Open canopy roofs follow the roof
+option with one roof-calibrated panel per canopy bay; their surrogates are
+likewise SLS stiffness only and never replace the `canopy_brace` group.
 
 The actual purlin offset from the idealised roof interface is recorded;
 collector connection stiffness/capacity remains assumed.

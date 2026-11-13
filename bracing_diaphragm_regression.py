@@ -354,6 +354,135 @@ class DiaphragmDesignTests(unittest.TestCase):
         self.assertTrue(all('diaphragm_members' in case for case in result['cases'] if case['case']['level']=='SLS'))
 
 
+class CanopyDiaphragmTests(unittest.TestCase):
+    """Open-canopy roof panels follow the main roof stressed-skin toggle."""
+    @classmethod
+    def setUpClass(cls):
+        from main import ShapeCatalog
+        from bracing_canopy_regression import CanopyNetworkTests
+        fixture=CanopyNetworkTests();fixture.setUp()
+        cls.fixture=fixture;cls.g=fixture.g
+        cls.layout,cls.model,cls.roof,cls.dofs,cls.lookup=fixture.build(fixture.main|set(
+            f'canopy_{side}/bay/{b}' for side in ('left','right') for b in range(len(fixture.g.bay_stations_mm)-1)))
+        rod=design_fixtures.rod
+        drag=lambda d,scale:{**fixture.drag,'signed_y_pressure_kpa':d*.05*scale,
+            'canopies':[{**c,'signed_y_pressure_kpa':d*.1*scale} for c in fixture.drag['canopies']]}
+        cases=[{'name':f'{level} {d}','level':level,'front_kpa':(.4 if d==1 else -.1)*scale,
+                'back_kpa':(.1 if d==1 else -.4)*scale,'roof_drag':drag(d,scale)}
+               for level,scale in (('ULS',1.),('SLS',.6)) for d in (1,-1)]
+        cls.context={'layout':cls.layout,'nominal_layout':cls.layout.to_dict(),'portal':fixture.macro,'cases':cases,
+            'source_hash':'fixture','source_preset':{},'front_clad':True,'back_clad':True,
+            'roof_brace':rod(16),'wall_brace':rod(16),'end_brace':rod(16),'canopy_brace':rod(16)}
+        p=ShapeCatalog('Shape_Catalog.xlsx').profile_by_name
+        cls.selections={'strut':p['100*4 SHS'],'end_post':p['100*4 SHS'],'roof_brace':rod(20),
+                        'wall_brace':rod(20),'end_brace':rod(16),'canopy_brace':rod(16)}
+        cls.rates={'shs':3.,'ub':4.,'wb':5.}
+        cls.bare=solve_selection(cls.context,cls.selections,DesignCriteria(),cls.rates)
+        cls.result=solve_selection({**cls.context,'stressed_skin':asdict(DiaphragmSettings(True))},
+                                   cls.selections,DesignCriteria(),cls.rates)
+
+    def canopy_panels(self,evidence):
+        return [p for p in evidence['panels'] if p['family']=='canopy']
+
+    def test_one_panel_per_canopy_bay_on_existing_eave_and_edge_nodes(self):
+        g=self.g;bays=len(g.bay_stations_mm)-1
+        enhanced,e=stressed_skin_model(self.model,self.layout,self.lookup,DiaphragmSettings(True),{})
+        self.assertEqual(e['panel_counts'],{'roof':2*bays,'side_wall':0,'end_wall':0,'canopy':2*bays})
+        self.assertEqual({p['id'] for p in self.canopy_panels(e)},
+                         {f'diaphragm/canopy_{side}/bay/{b}' for side in ('left','right') for b in range(bays)})
+        self.assertIn('OPEN CANOPY ROOFS',e['basis'])
+        self.assertEqual(enhanced.nodes,self.model.nodes);self.assertEqual(enhanced.fixed,self.model.fixed)
+        self.assertEqual(len(self.model.members),len(enhanced.members)-sum(len(p['member_ids']) for p in e['panels']))
+        members={m.id:m for m in enhanced.members}
+        key=lambda x,y,z:self.lookup[(round(float(x),6),round(float(y),6),round(float(z),6))]
+        for p in self.canopy_panels(e):
+            side=p['face'].split('_')[1];b=p['bay']
+            y0,y1=g.bay_stations_mm[b],g.bay_stations_mm[b+1]
+            root=g.span_mm if side=='right' else 0.
+            tip_x,tip_z=g.canopy_tip(side)
+            eave=[key(root,y,g.roof_z(root)) for y in (y0,y1)]
+            edge=[key(tip_x,y,tip_z) for y in (y0,y1)]
+            first,second=(members[i] for i in p['member_ids'])
+            self.assertEqual((first.start,first.end),(eave[0],edge[1]))
+            self.assertEqual((second.start,second.end),(edge[0],eave[1]))
+            self.assertTrue(first.tension_only and second.tension_only)
+            self.assertEqual({first.kind,second.kind},{'roof_diaphragm'})
+            # Rev B roof proxy: a = bay length across ribs, b = sloped canopy width.
+            width,drop=g.canopy(side);a=y1-y0;slope=math.hypot(width,drop)
+            c=3.*(a/slope**2)/(8500./12104.**2)
+            self.assertAlmostEqual(p['flexibility_mm_per_kn'],c)
+            self.assertAlmostEqual(p['calibration']['b_parallel_to_ribs_mm'],slope)
+            length=math.hypot(a,slope)
+            self.assertAlmostEqual(first.area_mm2,length**3/(200.*c*slope**2))
+            self.assertEqual(first.area_mm2,second.area_mm2)
+            self.assertAlmostEqual(p['longitudinal_projection'],a/length)
+            for field in ('n_mm','s_mm','length_mm','member_ids','shear_direction','area_mm2',
+                          'equivalent_diameter_mm','implied_longitudinal_flexibility_mm_per_kn','calibration'):
+                self.assertIn(field,p)
+        # The narrower left canopy is softer: the proxy scales with a/b^2.
+        left,right=(next(p for p in self.canopy_panels(e) if p['face']==f'canopy_{s}') for s in ('left','right'))
+        self.assertGreater(left['flexibility_mm_per_kn'],right['flexibility_mm_per_kn'])
+
+    def test_canopies_follow_the_roof_toggle_only(self):
+        enhanced,e=stressed_skin_model(self.model,self.layout,self.lookup,
+            DiaphragmSettings(side_walls_enabled=True,end_walls_enabled=True),
+            dict.fromkeys(('left_wall','right_wall','front_end','back_end'),True))
+        self.assertEqual(e['panel_counts']['canopy'],0)
+        self.assertFalse(any('canopy' in m.id for m in enhanced.members[len(self.model.members):]))
+        self.assertNotIn('OPEN CANOPY ROOFS',e['basis'])
+
+    def test_sls_only_canopy_panels_reduce_canopy_edge_movement_and_racking(self):
+        g,r,bare=self.g,self.result,self.bare
+        self.assertEqual(r['member_envelopes'],bare['member_envelopes'])
+        self.assertEqual(r['design']['estimated_cost'],bare['design']['estimated_cost'])
+        self.assertEqual(set(r['section_checks']),set(bare['section_checks']))
+        nodes={side:{'edge':[self.lookup[(round(g.canopy_tip(side)[0],6),round(float(y),6),round(g.canopy_tip(side)[1],6))]
+                             for y in g.bay_stations_mm],
+                     'eave':[self.lookup[(round(float(g.canopy_root_x(side)),6),round(float(y),6),round(g.roof_z(g.canopy_root_x(side)),6))]
+                             for y in g.bay_stations_mm]} for side in ('left','right')}
+        sls=0
+        for case,base in zip(r['cases'],bare['cases']):
+            self.assertLess(np.max(np.abs(case['balance_force_error_n'])),1e-4)
+            self.assertLess(np.max(np.abs(case['balance_moment_error_nmm'])),1e-2)
+            if case['case']['level']=='ULS':
+                self.assertEqual(case,base);continue
+            sls+=1
+            self.assertEqual(case['bare_sls']['displacements_mm'],base['displacements_mm'])
+            canopy=[m for m in case['diaphragm_members'] if '/canopy_' in m['id']]
+            self.assertEqual(len(canopy),4*(len(g.bay_stations_mm)-1))
+            self.assertGreater(max(m['axial_n'] for m in canopy),1.)
+            y=lambda result,i:result['displacements_mm'][i][1]
+            for side in nodes.values():
+                for edge,eave in zip(side['edge'],side['eave']):
+                    # Canopy edge Y movement and its racking relative to the
+                    # main eave both fall at every frame. The eave line itself
+                    # is held by the roof bracing; the whole-slope roof panels
+                    # can redistribute it by a few microns either way.
+                    self.assertLess(abs(y(case,edge)),abs(y(base,edge))-1e-3)
+                    self.assertLess(abs(y(case,edge)-y(case,eave)),abs(y(base,edge)-y(base,eave))-1e-3)
+        self.assertEqual(sls,2)
+        skin=r['stressed_skin']
+        self.assertLess(skin['enhanced_max_longitudinal_mm'],skin['bare_max_longitudinal_mm'])
+        panels={p['id'] for p in r['stressed_skin']['panels']}
+        self.assertTrue({p['id'] for c in r['cases'] for p in c.get('diaphragm_panels',[])}<=panels)
+        json.dumps(r,allow_nan=False)
+
+    def test_report_and_summary_name_the_canopy_panels(self):
+        from bracing_sizing_diagnostics import result_summary
+        result=copy.deepcopy(self.result)
+        # The synthetic drag carries no wind metadata for the report text.
+        for case in result['cases']:
+            case['case'].pop('roof_drag');case['case'].update(source_direction='Any',cpi=.2)
+        report=text_report(result)
+        self.assertIn('Open canopy roofs ON (follow the roof)',report)
+        self.assertIn("'canopy': 4",report)
+        self.assertIn('OPEN CANOPY ROOFS',report)
+        self.assertIn('diaphragm/canopy_left/bay/0 |',report)
+        self.assertIn('4 open-canopy panels on the roof reference c',result_summary(result)['text'])
+        plain=copy.deepcopy(result);plain['stressed_skin']['panel_counts'].pop('canopy')
+        self.assertNotIn('Open canopy roofs',text_report(plain))
+
+
 class DiaphragmWorkspaceTests(unittest.TestCase):
     def test_rev_b_action_migrates_legacy_direct_inputs_and_exports_panel_calibration(self):
         os.environ['QT_QPA_PLATFORM']='offscreen';os.environ['PORTALCALC_LICENSE_ENFORCED']='0'

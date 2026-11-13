@@ -9,7 +9,7 @@ import time
 
 import numpy as np
 
-from bracing_layout import BracingLayout, LayoutGeometry
+from bracing_layout import BracingLayout, LayoutGeometry, brace_group, carry_over
 from bracing_analysis import (AnalysisError, PortalReduction, build_braced_building,
                               solve_building_case)
 from bracing_restraint import OPTION as RESTRAINT_OPTION
@@ -47,16 +47,42 @@ def roof_friction_drag(inputs, q_kpa, mean_height_m, reverse=False, roof_profile
     start, end = (0., max(0.,d-cutoff)) if reverse else (min(cutoff,d),d)
     area = b*max(0.,d-cutoff)
     cf = coefficients[roof_profile]
+    sign = -1 if reverse else 1
     enclosed = all((inputs.front_wall_clad,inputs.back_wall_clad,inputs.left_wall_clad,inputs.right_wall_clad))
-    return {'profile':roof_profile,'cf':cf,'surface':'External roof; sheet ribs/corrugations across longitudinal wind',
-            'q_kpa':q_kpa,'signed_y_pressure_kpa':(-1 if reverse else 1)*q_kpa*cf,
+    # Wind passes under the main roof only when both end walls are open; an
+    # open canopy always has its underside exposed. Each exposed surface
+    # carries the same friction on the same projected area.
+    both_ends_open = not inputs.front_wall_clad and not inputs.back_wall_clad
+    surfaces = 2 if both_ends_open else 1
+    drag = {'profile':roof_profile,'cf':cf,'surface':'External roof; sheet ribs/corrugations across longitudinal wind',
+            'q_kpa':q_kpa,'signed_y_pressure_kpa':sign*q_kpa*cf*surfaces,
             'mean_roof_height_m':h,'breadth_m':b,'depth_m':d,'d_over_h':d/h,'d_over_b':d/b,
             'windward_exclusion_m':cutoff,'y_start_m':start,'y_end_m':end,
-            'projected_area_m2':area,'signed_y_force_kn':(-1 if reverse else 1)*q_kpa*cf*area,
+            'projected_area_m2':area,'signed_y_force_kn':sign*q_kpa*cf*area*surfaces,
             'application':'Enclosed building' if enclosed else 'PRELIMINARY: enclosed-building external-roof method extended to an open-sided building',
             'preliminary_open_sided':not enclosed,'source':'AS/NZS 1170.2:2021 (Amendment 2), clauses 2.4.2, 5.5 and Table 5.9',
             'url':END_WIND_PRESSURE_URL,
             'basis':'Projected roof area b * max(d - 4*min(h,b), 0); full force delivered to roof nodes. No Ka/Kce/Kci reduction. No wall, underside or exposed-member drag.'}
+    if both_ends_open:
+        drag.update(surface='External roof top and underside (both end walls open); sheet ribs/corrugations across longitudinal wind',
+                    surfaces=['top','underside'],
+                    basis=('Projected roof area b * max(d - 4*min(h,b), 0) on each of the top and underside (both end walls '
+                           'open, so wind passes under the roof); full force delivered to roof nodes. No Ka/Kce/Kci reduction. '
+                           'PRELIMINARY: enclosed-building friction method applied to both surfaces. No wall or exposed-member drag.'))
+    canopies = []
+    for side in ('left','right'):
+        width = float(getattr(inputs, f'{side}_canopy_length_m', 0.) or 0.)
+        if width <= 1e-9:
+            continue
+        canopy_area = width*max(0.,d-cutoff)
+        canopies.append({'side':side,'width_m':width,'surfaces':['top','underside'],
+                         'signed_y_pressure_kpa':sign*q_kpa*cf*2,'y_start_m':start,'y_end_m':end,
+                         'projected_area_m2':canopy_area,'signed_y_force_kn':sign*q_kpa*cf*canopy_area*2,
+                         'basis':('Open canopy: projected canopy plan area width * max(d - 4*min(h,b), 0) on the top and '
+                                  'the open underside, same Cf and windward exclusion as the main roof. PRELIMINARY.')})
+    if canopies:
+        drag['canopies'] = canopies
+    return drag
 
 
 def end_wind_cases(inputs, roof_profile='5-Rib (Trimdek)'):
@@ -118,8 +144,13 @@ def end_wind_cases(inputs, roof_profile='5-Rib (Trimdek)'):
                     'leeward_cpe':end_cpe,'effective_surface_count':surface_count,
                     'kce':kce,'kci':kci,'source':END_WIND_PRESSURE_SOURCE,'url':END_WIND_PRESSURE_URL,
                     'scope':'Normal end-wall pressures plus external roof friction; wall/underside/exposed-member drag and transverse-wind cases excluded'}
-    if not any(abs(case["front_kpa"]) + abs(case["back_kpa"]) > 1e-12 for case in cases):
-        raise AnalysisError("No end-wall pressure loads: this model requires at least one clad end wall; a free-roof wind model is not included")
+    def along_building(case):
+        drag = case['roof_drag']
+        friction = abs(drag['signed_y_force_kn'])+sum(abs(c['signed_y_force_kn']) for c in drag.get('canopies',()))
+        return abs(case["front_kpa"]) + abs(case["back_kpa"]) + friction
+    if not any(along_building(case) > 1e-12 for case in cases):
+        raise AnalysisError("No along-building wind load: there is no clad end wall, and the building is too short for "
+                            "roof friction (length must exceed 4 x min(h, b))")
     return cases
 
 
@@ -147,19 +178,98 @@ def eave_tributary_width(points, eave, roof_end):
     return {'width_mm':span/2+inset,'adjacent_sheet_span_mm':span,'sheet_edge_offset_mm':inset}
 
 
+def canopy_edge_purlin(window, g, side):
+    """Installed-purlin record for a canopy edge strut line, or None.
+
+    Same fields as a main roof line, from the 2D canopy edge purlin check
+    (canopy loads and the open underside). None when that check does not
+    pass; the strut location then reports the missing edge purlin.
+    """
+    check = (getattr(window, 'canopy_purlin_checks', None) or {}).get(side) or {}
+    match = check.get('match') or {}
+    if match.get('status') != 'OK':
+        return None
+    area = match['area_mm2']
+    weight = area*7.85e-6*9.80665
+    width_m = check['tributary_width_mm']/1000
+    span_type = check['span_type']
+    entry = {'section': match['section'], 'area_mm2': area, 'installed_count': 1,
+             'installed_count_source': 'Canopy edge purlin',
+             'tributary_width_mm': check['tributary_width_mm'], 'original_roof_spacing_mm': check['spacing_mm'],
+             'apex_tributary_widths_mm': [], 'eave_tributary': None,
+             'tributary_width_source': 'Canopy edge purlin: half the canopy purlin spacing',
+             'bending_ratio': max(check['outward_kn_m']/match['outward_capacity_kn_m'],
+                                  check['inward_strength_kn_m']/match['inward_strength_capacity_kn_m']),
+             'service_ratio': check['inward_service_kn_m']/match['inward_service_capacity_kn_m'],
+             'added_bending_ratio': 1.2*weight/match['inward_strength_capacity_kn_m'],
+             'added_service_ratio': weight/match['inward_service_capacity_kn_m'],
+             'basis_key': (f"{match['section']}|{span_type}|{match.get('tables')}|{match.get('outward_bridging')}|"
+                           f"{match.get('inward_bridging')}|canopy_{side}_edge"),
+             'zone': 'edge', 'nearest_installed_x_mm': g.canopy_tip(side)[0], 'node_offset_mm': 0.,
+             'bending_snapshot': copy.deepcopy(match), 'canopy_side': side, 'canopy_check': copy.deepcopy(check),
+             'source': ('Canopy edge purlin: Metroll bending-table check with canopy loads and the open underside; '
+                        'axial member compression/tension calculated or separately declared in the 3D workspace'),
+             'bending_span_mm': check['span_mm'],
+             'beam_inputs': {'span_type': span_type, 'outward_kn_m': check['outward_kn_m'],
+                             'inward_strength_kn_m': check['inward_strength_kn_m'],
+                             'service_kn_m': check['inward_service_kn_m'],
+                             'service_outward_kn_m': check['wind_service_upward_kpa']*width_m,
+                             'service_inward_kn_m': check['wind_service_downward_kpa']*width_m,
+                             'permanent_kn_m': check['permanent_kpa']*width_m,
+                             'gravity_service_kn_m': (check['permanent_kpa']+check['live_kpa'])*width_m,
+                             'end_roof_local_cases': []}}
+    entry['bending_key'] = hashlib.sha256(json.dumps({
+        key: entry[key] for key in ("section", "area_mm2", "bending_ratio", "service_ratio",
+            "added_bending_ratio", "added_service_ratio", "basis_key", "bending_span_mm", "bending_snapshot", "beam_inputs",
+            'tributary_width_mm', 'original_roof_spacing_mm', 'apex_tributary_widths_mm', 'eave_tributary')
+    }, sort_keys=True).encode()).hexdigest()
+    return entry
+
+
+def actual_canopies(structure, left, right, nominal):
+    """Open canopies on the 2D portal: (side, plan width, tip drop, tip node).
+
+    Widths and the fall are taken from the actual 2D canopy roof members,
+    measured from the main eaves. Canopies must attach at the main eave on a
+    gable roof (the braced eave line), and must be in the bracing layout.
+    """
+    result = []
+    for side, eave in (('left', left), ('right', right)):
+        members = [e for e in structure.elements if e.group == f'{side.upper()}_CANOPY_TOP']
+        if not members:
+            continue
+        if nominal.roof_shape != 'Gable':
+            raise AnalysisError('The 3D bracing analysis supports open canopies on gable roofs only')
+        if nominal.canopy(side) is None:
+            raise AnalysisError(f'The {side} canopy is not in the bracing layout geometry')
+        nodes = [n for e in members for n in (e.start, e.end)]
+        root = min(nodes, key=lambda n: abs(n.x-eave.x))
+        if abs(root.x-eave.x) > 1. or abs(root.y-eave.y) > 1.:
+            raise AnalysisError(f'The {side} canopy must attach at the main eave for the 3D bracing analysis; '
+                                'clear its eave height override')
+        tip = (min if side == 'left' else max)(nodes, key=lambda n: n.x)
+        result.append((side, abs(tip.x-eave.x), eave.y-tip.y, tip))
+    return result
+
+
 def prepare_context(window, allow_unconfigured=False):
     nominal = window.current_bracing_layout_geometry()
     if window.bracing_location_layout is None and not allow_unconfigured:
         raise AnalysisError("Save a bracing layout and pin the brace panels to analyse first")
     saved = BracingLayout.from_dict(window.bracing_location_layout) if window.bracing_location_layout is not None else BracingLayout(nominal)
+    if saved.geometry != nominal:
+        # Adding or changing a canopy keeps the main building's saved panels.
+        saved = carry_over(saved, nominal) or saved
     if saved.geometry != nominal and not allow_unconfigured:
         raise AnalysisError("Building dimensions changed. Review and save the bracing locations before analysis")
-    if not saved.pinned and not allow_unconfigured:
+    if not saved.selection and not allow_unconfigured:
         raise AnalysisError("Pin the brace panels to analyse in the 3D location editor first. Available panels are not installed braces.")
     if window.structure is None:
         raise AnalysisError("A current 2D portal model is required")
-    if any(e.group.startswith(("LEFT_CANOPY", "RIGHT_CANOPY", "LEFT_LEAN", "RIGHT_LEAN")) for e in window.structure.elements):
-        raise AnalysisError("The first 3D analysis supports the main building only; remove canopies/lean-tos for this analysis")
+    groups = {e.group for e in window.structure.elements}
+    if any(group.startswith(("LEFT_LEAN", "RIGHT_LEAN")) for group in groups):
+        raise AnalysisError("The 3D bracing analysis does not support lean-tos yet (open canopies are supported); "
+                            "remove the lean-to for this analysis")
     structure = copy.deepcopy(window.structure)
     structure.clear_loads()
     top = [e for e in structure.elements if e.group == "TOP"]
@@ -167,13 +277,15 @@ def prepare_context(window, allow_unconfigured=False):
         raise AnalysisError("No main portal roof elements are available")
     nodes = [n for e in top for n in (e.start, e.end)]
     left, right = min(nodes, key=lambda n: n.x), max(nodes, key=lambda n: n.x)
+    canopies = actual_canopies(structure, left, right, nominal)
     # The editor stores nominal building dimensions. Analysis must use actual
     # column/chord centrelines, including the desktop's section offsets.
     span = right.x-left.x
     g = LayoutGeometry.create(span, nominal.length_mm, left.y, nominal.pitch_deg, nominal.roof_shape,
                               bay_stations_mm=nominal.bay_stations_mm,
-                              end_wall_stations_mm=[x*span/nominal.span_mm for x in nominal.end_wall_stations_mm])
-    layout = BracingLayout(g, saved.blocked, saved.pinned) if saved.geometry == nominal else BracingLayout(g)
+                              end_wall_stations_mm=[x*span/nominal.span_mm for x in nominal.end_wall_stations_mm],
+                              canopies=[{'side':side,'width_mm':width,'drop_mm':drop} for side,width,drop,_ in canopies])
+    layout = BracingLayout(g, sorted(saved.all_blocked), sorted(saved.selection)) if saved.geometry == nominal else BracingLayout(g)
     # Remove legacy eave restraints in the private copy. Otherwise the 3D
     # network would inherit restraint credit from the system it is analysing.
     for node in (left, right):
@@ -181,7 +293,8 @@ def prepare_context(window, allow_unconfigured=False):
         structure.restrained_dofs = [d for d in structure.restrained_dofs if d != node.ux]
     # Likewise any adopted 3D sway restraint: the network itself provides it.
     structure.sway_springs = []
-    points = [(left.x+x, g.roof_z(x)) for x in g.roof_stations]
+    # Roof stations, then each canopy's outer edge (the canopy-edge strut line).
+    points = [(left.x+x, g.roof_z(x)) for x in g.roof_stations] + [(tip.x, tip.y) for _,_,_,tip in canopies]
     portal = PortalReduction(structure, points)
     wind_inputs = window.wind_inputs_from_ui(g.span_mm, g.pitch_deg, g.eave_mm)
     source = copy.deepcopy(window.collect_preset_data())
@@ -295,6 +408,10 @@ def prepare_context(window, allow_unconfigured=False):
                 "added_bending_ratio", "added_service_ratio", "basis_key", "bending_span_mm", "bending_snapshot", "beam_inputs",
                 'tributary_width_mm', 'original_roof_spacing_mm', 'apex_tributary_widths_mm','eave_tributary')
         }, sort_keys=True).encode()).hexdigest()
+    for side,_,_,_ in canopies:
+        entry = canopy_edge_purlin(window, g, side)
+        if entry is not None:
+            installed[str(g.canopy_line(side))] = entry
     from purlin_strut_tables import snapshot as strut_table_snapshot
     return {
         "layout": layout, "nominal_layout": saved.to_dict(), "nominal_geometry": nominal, "portal": portal, "cases": cases,
@@ -305,12 +422,14 @@ def prepare_context(window, allow_unconfigured=False):
         "end_brace": copy.deepcopy(window.selected_end_wall_brace_size()),
         "end_brace_options": [copy.deepcopy(window.end_wall_brace_size_combo.itemData(i))
                               for i in range(window.end_wall_brace_size_combo.count())],
+        # Canopy roof X-braces: their own group, starting at the roof brace size.
+        **({"canopy_brace": copy.deepcopy(window.selected_brace_size(window.roof_brace_size_combo))} if canopies else {}),
         "source_preset": source,
         "source_hash": hashlib.sha256(json.dumps(source, sort_keys=True, allow_nan=False).encode()).hexdigest(),
         "default_end_post": profile.get("section"),
         'global_sls_basis':{'divisor':window.eave_deflection_divisor(),
             'importance_level':wind_inputs.importance_level,
-            'source':'Main in-plane eave sway criterion; project default IL1 H/100, IL2+ H/150; main overrides retained'},
+            'source':'Main in-plane eave sway criterion; project default IL1 H/80, IL2+ H/150; main overrides retained'},
         'mullion_basis':mullion_basis,
         "front_clad": wind_inputs.front_wall_clad, "back_clad": wind_inputs.back_wall_clad,
         'face_cladding': {'left_wall': wind_inputs.left_wall_clad, 'right_wall': wind_inputs.right_wall_clad,
@@ -319,7 +438,9 @@ def prepare_context(window, allow_unconfigured=False):
                        "ub": window.costing_rate_from_input(window.ub_cost_input, "ub_rate_per_kg"),
                        "wb": window.costing_rate_from_input(window.wb_cost_input, "wb_rate_per_kg"),
                        "purlin": window.costing_rate_from_input(window.purlin_cost_input, "purlin_rate_per_kg"),
-                       'braced_panel_installation': (window.bracing_3d_settings or {}).get('installation_cost_per_panel', 50.)},
+                       'braced_panel_installation': (window.bracing_3d_settings or {}).get('installation_cost_per_panel', 50.),
+                       'portal_brace_allowance': (window.bracing_3d_settings or {}).get('portal_brace_allowance', 0.)},
+        **default_portal_brace_sections(window),
         "installed_purlins": installed,
         # The 2D portal's credited restraint: 3D sizing keeps at least its brace stiffness.
         'adopted_restraint': (copy.deepcopy(getattr(window, 'bracing_3d_restraint', None))
@@ -327,6 +448,34 @@ def prepare_context(window, allow_unconfigured=False):
         'stressed_skin': copy.deepcopy((window.bracing_3d_settings or {}).get('stressed_skin')),
         "purlin_strut_tables": strut_table_snapshot(window.metroll_tables or {}),
     }
+
+
+DEFAULT_PORTAL_BRACE_SECTIONS = {'portal_brace_column': '310 UB 40.4', 'portal_brace_beam': '250 UB 31.4'}
+
+
+def default_portal_brace_sections(window):
+    """Portal brace column/beam candidates: the saved workspace choices, else defaults."""
+    from bracing_portal_brace import portal_candidates
+    candidates = portal_candidates(window.catalog.ub_profiles())
+    if not candidates:
+        return {}
+    saved = window.bracing_3d_settings or {}
+    by_name = {c.name: c for c in candidates}
+    return {group: by_name.get(saved.get(f'{group}_section')) or by_name.get(name) or candidates[0]
+            for group, name in DEFAULT_PORTAL_BRACE_SECTIONS.items()}
+
+
+PORTAL_BRACE_LIMITATION = (
+    "Portal frame braces are UB moment frames in side-wall bays: a column stitch-welded inside each portal column and a "
+    "beam moment-connected across the top at eave level, with pinned bases on their own base plates. Each is a 2D "
+    "frame in the wall plane, condensed onto the two eave Y translations: the columns carry their own axial forces to "
+    "their own bases, the stitch-weld offset and the portal columns' weak-axis stiffness are ignored, and the brace "
+    "carries no cladding or self-weight load. Members are checked segment by segment between lateral restraints, "
+    "with each segment's peak moment and AS 4100 Table 5.6.1 moment modifier from its end moments (2.5 for the "
+    "beam in double curvature). Columns: in-plane (sway) effective length 2.0 h; minor-axis and LTB segments at "
+    "most the stitch-weld/stiffener restraint spacing. Beam: in-plane length = span; minor-axis and LTB segments = "
+    "the beam restraint spacing (default the bay) with the entered kr (default 0.85). Connections, base plates, "
+    "stitch welds and stiffeners are not designed; they are covered by the per-brace allowance only.")
 
 
 LIMITATIONS = [
@@ -342,6 +491,7 @@ LIMITATIONS = [
     "Brace base translations are fixed. Foundation flexibility, column weak-axis flexure and connection eccentricities are not modelled. No diaphragm or sheeting stiffness.",
     "Forces are analysis demands only. No brace net-section/connection checks, strut buckling or combined purlin bending/axial capacity checks; a solved model is not a passing design.",
     "Results do not replace Phase 1 checks, alter the 2D portal springs, section selections, costing or the full-computations export.",
+    "Open canopies (not lean-tos) are part of each portal (stiffness, self-weight, canopy G/Q/solar and canopy wind) and add a braceable canopy roof face: one strip per bay from the main eave line to the canopy edge, with the canopy edge purlin as the edge strut. Canopy roof friction acts on the top and the open underside and is shared between the eave line and the canopy edge. Canopies must attach at the main eave of a gable roof. No canopy diaphragm credit; intermediate canopy purlin lines are not in the network.",
 ]
 
 
@@ -480,26 +630,66 @@ def transverse_sls_summary(portal, cases, sls_basis):
                      'Report only: the production 2D portal check remains the serviceability acceptance.'}
 
 
+PORTAL_BRACE_GROUPS = ('portal_brace_column', 'portal_brace_beam')
+
+
+def portal_brace_section_record(profile):
+    from bracing_portal_brace import section_of
+    section = section_of(profile)
+    return {'section': section.name, 'area_mm2': section.area_mm2, 'inertia_mm4': section.inertia_mm4}
+
+
+def portal_brace_envelope(cases):
+    """ULS peak actions per portal brace member (``{brace id}/{member}``)."""
+    envelopes = {}
+    for case in cases:
+        if case['case']['level'] != 'ULS':
+            continue
+        name = case['case']['name']
+        for brace in case.get('portal_braces', ()):
+            for member in brace['members']:
+                key = f"{brace['id']}/{member['member']}"
+                row = envelopes.setdefault(key, {'id': key, 'brace': brace['id'], 'member': member['member'],
+                                                 'section': member['section'], 'length_mm': member['length_mm'],
+                                                 'tension_n': 0., 'compression_n': 0., 'shear_n': 0., 'moment_nmm': 0.})
+                for field, case_key, value in (('tension_n', 'tension_case', max(member['axial_n'], 0.)),
+                                               ('compression_n', 'compression_case', max(-member['axial_n'], 0.)),
+                                               ('shear_n', 'shear_case', member['shear_n']),
+                                               ('moment_nmm', 'moment_case', member['moment_nmm'])):
+                    if value > row[field]:
+                        row[field], row[case_key] = value, name
+    return list(envelopes.values())
+
+
 def prepare_analysis_models(context, strut_profile, end_post_profile):
     """Shared physical assembly for full checks and lightweight SLS trials."""
     layout, portal = context["layout"], context["portal"]
+    for side, _, _ in layout.geometry.canopies:
+        if layout.pinned and not any(p.startswith(f"canopy_{side}/") for p in layout.pinned):
+            raise AnalysisError(f"The {side} canopy has no roof bracing, so its outer edge has no support along the building. "
+                                f"Pin at least one {side} canopy roof panel in the bracing locations (usually in the main "
+                                "roof's braced bays), or use Find layout and size, which adds it.")
     post_faces = {face for face, clad in (("front_end", context["front_clad"]), ("back_end", context["back_clad"]))
                   if clad or any(layout.panels[p].face == face for p in layout.pinned)}
     from bracing_components import StrutPlan, assembly_properties, wire_modulus
     if isinstance(strut_profile, StrutPlan):
         expected = {f"strut/bay/{i}/line/{j}" for i in range(len(layout.geometry.bay_stations_mm)-1)
-                    for j in range(len(layout.geometry.roof_stations))}
+                    for j in range(len(layout.geometry.strut_lines))}
         if set(strut_profile.members) != expected:
             raise AnalysisError("Strut plan must specify every current bay and roof line exactly once")
-    used = {"roof_brace" if layout.panels[p].face.startswith("roof") else "end_brace" if layout.panels[p].face in {"front_end", "back_end"} else "wall_brace" for p in layout.pinned}
+    used = {brace_group(layout.panels[p].face) for p in layout.pinned}
+    groups = ("roof_brace", "wall_brace", "end_brace") + (("canopy_brace",) if context.get("canopy_brace") else ())
     moduli = {group: wire_modulus(context[group]) if group in used and context[group].get("component_type") == "wire_rope" else 200000.
-              for group in ("roof_brace", "wall_brace", "end_brace")}
+              for group in groups}
     model, roof_grid, portal_dofs, point_nodes = build_braced_building(
         layout, portal, strut_profile.A, context["roof_brace"]["area_mm2"],
         context["wall_brace"]["area_mm2"], context["end_brace"]["area_mm2"], end_post_profile.A,
         end_post_faces=post_faces,
         strut_overrides=strut_profile.overrides() if isinstance(strut_profile, StrutPlan) else None,
-        brace_moduli=moduli)
+        brace_moduli=moduli,
+        canopy_brace_area_mm2=(context.get("canopy_brace") or {}).get("area_mm2"),
+        portal_brace_sections={'column': context.get('portal_brace_column'), 'beam': context.get('portal_brace_beam')}
+        if layout.portal_braces else None)
     from bracing_diaphragm import DiaphragmSettings, stressed_skin_model, align_fixed_nodes, recover_diaphragm
     diaphragm_settings = DiaphragmSettings.from_dict(context.get('stressed_skin'))
     diaphragm = {'settings': vars(diaphragm_settings), 'active':diaphragm_settings.active}
@@ -549,6 +739,7 @@ def analyse_context(context, strut_profile, end_post_profile, reuse_cases=None):
         envelopes.append({"id": member.id, "kind": member.kind, "panel_id": member.panel_id,
                           "tension_n": max(0., tension[0]), "tension_case": tension[1],
                           "compression_n": max(0., -compression[0]), "compression_case": compression[1]})
+    portal_brace_envelopes = portal_brace_envelope(cases)
     roof_nodes = {n for row in roof_grid for n in row}
     sls = [(float(np.linalg.norm(displacement)), case["case"]["name"], i, displacement)
            for case in cases if case["case"]["level"] == "SLS" and not transverse_sls(case["case"])
@@ -579,7 +770,11 @@ def analyse_context(context, strut_profile, end_post_profile, reuse_cases=None):
         "nominal_layout": context["nominal_layout"], "analysis_layout": layout.to_dict(),
         "sections": {"strut": strut_record,
                      "end_post": {"section": end_post_profile.name, "area_mm2": end_post_profile.A},
-                     **{kind: context[kind] for kind in ("roof_brace", "wall_brace", "end_brace")}},
+                     **{kind: context[kind] for kind in ("roof_brace", "wall_brace", "end_brace")},
+                     **({"canopy_brace": context["canopy_brace"]} if context.get("canopy_brace") else {}),
+                     **({group: portal_brace_section_record(context[group]) for group in PORTAL_BRACE_GROUPS}
+                        if layout.portal_braces else {})},
+        **({'portal_brace_envelopes': portal_brace_envelopes} if portal_brace_envelopes else {}),
         "nodes": [{"index": i, "label": model.node_labels[i], "point_mm": p} for i, p in enumerate(model.nodes)],
         "portal_full_dofs": len(portal.k), "portal_interface_dofs": len(portal.stiffness),
         "member_envelopes": envelopes, "cases": cases,
@@ -590,7 +785,8 @@ def analyse_context(context, strut_profile, end_post_profile, reuse_cases=None):
         'frame_restraint': frame_restraint_summary(portal, cases),
         "limitations": ([line.replace('No diaphragm or sheeting stiffness.',
                          'Enabled roof/wall diaphragm stiffness is included in SLS only.') for line in LIMITATIONS]
-                        + [diaphragm['basis']] if diaphragm['active'] else list(LIMITATIONS)),
+                        + [diaphragm['basis']] if diaphragm['active'] else list(LIMITATIONS))
+                       + ([PORTAL_BRACE_LIMITATION] if layout.portal_braces else []),
     }
 
 
@@ -635,6 +831,9 @@ def text_report(result):
         lines += ['', title, diaphragm['source'], diaphragm['basis'],
                   'Calibration mode: '+('Rev B empirical reference geometry; a across ribs / b along ribs; c_panel = c_reference * (a/b^2)/(a_ref/b_ref^2)' if geometry_mode else 'Direct panel c override; no geometry scaling'),
                   f"Roof {'ON' if settings['enabled'] else 'OFF'}: {c_label} = {settings['flexibility_mm_per_kn']:g} mm/kN; direction = {settings['shear_direction']}.",
+                  *([f"Open canopy roofs {'ON' if settings['enabled'] else 'OFF'} (follow the roof): {c_label} = {settings['flexibility_mm_per_kn']:g} mm/kN; "
+                     f"{diaphragm['panel_counts']['canopy']} canopy bay panel(s); direction = {settings['shear_direction']}."]
+                    if 'canopy' in diaphragm.get('panel_counts',{}) else []),
                   f"Side walls {'ON' if settings.get('side_walls_enabled') else 'OFF'}: {c_label} = {settings.get('side_wall_flexibility_mm_per_kn',6.):g} mm/kN, longitudinal shear.",
                   f"End walls {'ON' if settings.get('end_walls_enabled') else 'OFF'}: {c_label} = {settings.get('end_wall_flexibility_mm_per_kn',6.):g} mm/kN, transverse shear.",
                   f"Included panels by family: {diaphragm.get('panel_counts',{})}; excluded open faces: {diaphragm.get('excluded_open_faces',[])}.",

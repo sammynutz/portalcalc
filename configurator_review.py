@@ -21,6 +21,16 @@ from portalcalc_service import (
 
 
 REVIEW_STATUS = "reviewedForEstimate"
+# Non-section selections a reviewer may change, as (preset group, key).
+REVIEW_SELECTION_PATHS = (
+    ("geometry", "end_wall_brace_size"),
+    ("bracing", "roof_brace_size"),
+    ("bracing", "wall_brace_size"),
+    ("storage_loads", "rail_profile"),
+    ("storage_loads", "stub_profile"),
+    ("crane_beam", "beam_profile"),
+    ("crane_beam", "rail_profile"),
+)
 CANCELLED_STATUS = "cancelled"
 TRUSS_DEPTH_INCREMENT_MM = 50.0
 TRUSS_DEPTH_MIN_SPAN_RATIO = 0.03
@@ -75,6 +85,10 @@ def load_review_request(path: Path) -> LoadedReviewRequest:
         prepared = prepare_request(raw)
     except ValueError as exc:
         raise ReviewConfigurationError(str(exc)) from exc
+    if len(prepared.groups) > 1:
+        raise ReviewConfigurationError(
+            f"this building has {len(prepared.groups)} sizing groups; Configurator Review handles one 2D frame, "
+            "so review a multi-group building through the calculation service instead")
     validate_review_truss_depth(prepared.inputs)
     return LoadedReviewRequest(raw=copy.deepcopy(raw), prepared=prepared, request_path=path)
 
@@ -139,21 +153,30 @@ def merge_reviewable_selections(
     if isinstance(current_geometry, dict) and isinstance(merged_geometry, dict):
         if "truss_depth_mm" in current_geometry:
             merged_geometry["truss_depth_mm"] = copy.deepcopy(current_geometry["truss_depth_mm"])
-    selection_paths = (
-        ("geometry", "end_wall_brace_size"),
-        ("bracing", "roof_brace_size"),
-        ("bracing", "wall_brace_size"),
-        ("storage_loads", "rail_profile"),
-        ("storage_loads", "stub_profile"),
-        ("crane_beam", "beam_profile"),
-        ("crane_beam", "rail_profile"),
-    )
-    for group, key in selection_paths:
+    for group, key in REVIEW_SELECTION_PATHS:
         source_group = current.get(group)
         target_group = merged.get(group)
         if isinstance(source_group, dict) and isinstance(target_group, dict) and key in source_group:
             target_group[key] = copy.deepcopy(source_group[key])
     return merged
+
+
+def reviewed_building(original_building: Mapping[str, Any], final_inputs: Mapping[str, Any]) -> dict[str, Any]:
+    """v2 review: the configurator's building with only the reviewer's selections applied.
+
+    Frame-type sections, truss depth and web/topology state come from the
+    merged frame inputs (``merge_reviewable_selections``). Other reviewable
+    selections live in the building's ``design_inputs``.
+    """
+    from portalcalc_service import building_with_frame_inputs
+
+    building = building_with_frame_inputs(original_building, final_inputs)
+    design_inputs = building.setdefault("design_inputs", {})
+    for group, key in REVIEW_SELECTION_PATHS:
+        source_group = final_inputs.get(group)
+        if isinstance(source_group, Mapping) and key in source_group:
+            design_inputs.setdefault(group, {})[key] = copy.deepcopy(source_group[key])
+    return json_safe(building)
 
 
 def build_reviewed_result(

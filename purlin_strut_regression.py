@@ -354,13 +354,37 @@ class SharedMechanicsTests(unittest.TestCase):
         self.assertGreaterEqual(sls['deflection_mm'], sls['table_adjusted_deflection_mm'])
         self.assertAlmostEqual(sls['ratio'], sls['deflection_mm']/(8000/150))
 
+    def test_shorter_end_bay_uses_the_longest_bay_reference(self):
+        """A 7 m end bay after an 8 m bay: actual spans, 8 m table reference for both."""
+        equal = fixture()
+        for assembly in equal:
+            assembly.location['purlin']['bending_span_mm'] = 8000.
+        uneven = solve_shared(equal, [8000., 7000.], 0)
+        base = solve_shared(fixture(), [8000., 8000.], 0)
+        for bay in ('0', '1'):
+            self.assertEqual(uneven['references'][bay]['reference_span_mm'], 8000.)
+            for key in ('moment_per_kn_m', 'shear_per_kn_m', 'deflection_per_kn_m'):
+                self.assertAlmostEqual(uneven['references'][bay][key], base['references'][bay][key])
+            self.assertEqual(uneven['references'][bay]['capacity'], base['references'][bay]['capacity'])
+        # The run itself is analysed with the actual spans: less load on the short bay.
+        c = next(c for c in uneven['cases'] if c['name'] == 'ULS outward')
+        self.assertAlmostEqual(c['applied_load_n'], -(8000.+7000.))  # roof run + added ply, 1 kN/m
+        self.assertLess(abs(c['applied_load_n']+c['support_reaction_n']), 1e-6)
+        short = c['bays'][1]['roof']
+        same = next(c for c in base['cases'] if c['name'] == 'ULS outward')['bays'][1]['roof']
+        self.assertLess(short['positive_moment_knm'], same['positive_moment_knm'])
+
     def test_unsupported_restraint_and_reference_configurations_cannot_pass(self):
         a = fixture()
         a[0].components[-1]['data']['shared_cladding_fixed'] = False
         with self.assertRaisesRegex(AnalysisError, 'screw-fixed'):
             solve_shared(a, [8000., 8000.], 0)
-        with self.assertRaisesRegex(AnalysisError, 'Unequal'):
-            solve_shared(fixture(), [8000., 7000.], 0)
+        # A bay longer than the installed purlins' checked span is not covered.
+        a = fixture()
+        for assembly in a:
+            assembly.location['purlin']['bending_span_mm'] = 8000.
+        with self.assertRaisesRegex(AnalysisError, 'longer than the span'):
+            solve_shared(a, [8000., 9000.], 0)
         a = fixture()
         a[0].location['purlin']['axial_rating']['beam_roof_releases'] = '1'
         with self.assertRaisesRegex(AnalysisError, 'Nonstandard'):

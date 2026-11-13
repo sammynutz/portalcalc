@@ -7,7 +7,7 @@ from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (QComboBox, QDialog, QHBoxLayout, QLabel, QListWidget,
                               QPushButton, QToolTip, QVBoxLayout, QWidget)
 
-from bracing_layout import BracingLayout, FACE_LABELS
+from bracing_layout import BracingLayout, FACE_LABELS, carry_over
 from bracing_sizing_diagnostics import governing_case_member
 
 
@@ -48,7 +48,8 @@ class BracingLayoutCanvas(QWidget):
         self.update()
 
     def orientation_label(self, face):
-        label = {'left_wall': 'LEFT', 'right_wall': 'RIGHT', 'front_end': 'FRONT', 'back_end': 'BACK'}[face]
+        label = {'left_wall': 'LEFT', 'right_wall': 'RIGHT', 'front_end': 'FRONT', 'back_end': 'BACK',
+                 'canopy_left': 'LEFT CANOPY', 'canopy_right': 'RIGHT CANOPY'}[face]
         if face in self.face_cladding:
             label += ' (CLAD)' if self.face_cladding[face] else ' (OPEN)'
         return label
@@ -76,8 +77,13 @@ class BracingLayoutCanvas(QWidget):
         points = []
         for node, movement in zip(self.result["nodes"], movements):
             x, y, z = node["point_mm"]
-            nx = x*nominal.span_mm/ag.span_mm
-            zscale = nominal.roof_z(nx)/ag.roof_z(x)
+            if x < -1e-6 or x > ag.span_mm+1e-6:
+                # Canopy edge: keep its offset from the eave; heights as analysed.
+                nx = x if x < 0 else nominal.span_mm+(x-ag.span_mm)
+                zscale = 1.
+            else:
+                nx = x*nominal.span_mm/ag.span_mm
+                zscale = nominal.roof_z(nx)/ag.roof_z(x)
             point = (nx, y, z*zscale)
             if deformed:
                 point = (point[0]+movement[0]*nominal.span_mm/ag.span_mm*self.deformation_factor,
@@ -180,6 +186,32 @@ class BracingLayoutCanvas(QWidget):
                 painter.setBrush(Qt.NoBrush)
                 painter.setPen(QPen(QColor("#e69b18"), 2.6))
                 painter.drawPolygon(polygon)
+        # Portal frame braces share their wall bay's outline. They are editable
+        # (hit-tested) only under a portal brace face filter; a pinned one is
+        # drawn as a thick column-beam frame in every view, a blocked one dashed.
+        for panel in self.layout_model.portal_panels.values():
+            active = self.face == panel.face
+            blocked = panel.id in self.layout_model.portal_blocked
+            pinned = panel.id in self.layout_model.portal_braces
+            projected = [project(point) for point in panel.vertices]
+            polygon = QPolygonF([p[0] for p in projected])
+            if active:
+                color = QColor("#d74343" if blocked else "#9a5b13" if pinned else "#50748d")
+                color.setAlpha(55 if blocked else 45 if pinned else 13)
+                painter.setBrush(color)
+                painter.setPen(QPen(QColor("#8b9eac"), .8))
+                painter.drawPolygon(polygon)
+                self.hit_panels.append((polygon, panel.id, sum(p[1] for p in projected) / len(projected)))
+            if (pinned or (blocked and active)) and (not self.face or active):
+                v = [p[0] for p in projected]
+                painter.setPen(QPen(QColor("#b63232" if blocked else "#9a5b13"), 2.2 if blocked else 3.6,
+                                    Qt.DashLine if blocked else Qt.SolidLine))
+                for a, b in ((v[0], v[3]), (v[1], v[2]), (v[3], v[2])):   # columns and eave beam
+                    painter.drawLine(a, b)
+            if panel.id == self.selected:
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(QColor("#e69b18"), 2.6))
+                painter.drawPolygon(polygon)
         # Structural reference lines are a geometric guide, not analysis members.
         g = self.layout_model.geometry
         painter.setPen(QPen(QColor("#415f74"), 1.1))
@@ -189,6 +221,10 @@ class BracingLayoutCanvas(QWidget):
                 painter.drawLine(project(a)[0], project(b)[0])
             for x in (0, g.span_mm):
                 painter.drawLine(project((x, y, 0))[0], project((x, y, g.roof_z(x)))[0])
+            for side, _, _ in g.canopies:
+                root = g.canopy_root_x(side)
+                tip_x, tip_z = g.canopy_tip(side)
+                painter.drawLine(project((root, y, g.roof_z(root)))[0], project((tip_x, y, tip_z))[0])
         for y in (0, g.length_mm):
             for x in g.end_wall_stations_mm[1:-1]:
                 painter.drawLine(project((x, y, 0))[0], project((x, y, g.roof_z(x)))[0])
@@ -242,6 +278,9 @@ class BracingLayoutCanvas(QWidget):
         anchors = {'front_end': (g.span_mm/2, 0, 0), 'back_end': (g.span_mm/2, g.length_mm, 0),
                    'left_wall': (0, g.length_mm/2, g.eave_mm*.4),
                    'right_wall': (g.span_mm, g.length_mm/2, g.eave_mm*.4)}
+        for side, _, _ in g.canopies:
+            tip_x, tip_z = g.canopy_tip(side)
+            anchors[f'canopy_{side}'] = ((tip_x+g.canopy_root_x(side))/2, g.length_mm/2, (tip_z+g.roof_z(g.canopy_root_x(side)))/2)
         for face, anchor in anchors.items():
             point = project(anchor)[0]
             text = self.orientation_label(face)
@@ -254,8 +293,10 @@ class BracingLayoutCanvas(QWidget):
             painter.setPen(QColor('#284960'))
             painter.drawText(rect, Qt.AlignCenter, text)
         painter.drawText(16, self.height()-34, 'Left / right are viewed from the FRONT')
+        canopies = "".join(f"  |  {side} canopy {width / 1000:g} m" for side, width, _ in g.canopies)
         painter.drawText(16, self.height() - 16,
-                         f"{g.span_mm / 1000:g} m span  x  {g.length_mm / 1000:g} m long  |  {len(g.bay_stations_mm) - 1} bays")
+                         f"{g.span_mm / 1000:g} m span  x  {g.length_mm / 1000:g} m long  |  {len(g.bay_stations_mm) - 1} bays"
+                         + canopies)
         painter.end()
 
     def member_at(self, point):
@@ -306,8 +347,8 @@ class BracingLayoutCanvas(QWidget):
             return
         identifier = self.panel_at(event.position())
         if identifier:
-            panel = self.layout_model.panels[identifier]
-            status = "Blocked" if identifier in self.layout_model.blocked else "Pinned brace" if identifier in self.layout_model.pinned else "Available"
+            panel = self.layout_model.all_panels[identifier]
+            status = {"blocked": "Blocked", "pinned": "Pinned brace", "available": "Available"}[self.layout_model.state(identifier)]
             QToolTip.showText(event.globalPosition().toPoint(), f"{panel.label}\n{status}", self)
             self.panelHovered.emit(identifier)
         else:
@@ -345,10 +386,13 @@ class BracingLayoutDialog(QDialog):
         except ValueError as error:
             self.model = BracingLayout(geometry)
             self.load_error = str(error)
+        if self.model.geometry != geometry:
+            # Adding or changing a canopy keeps the main building's saved panels.
+            self.model = carry_over(self.model, geometry) or self.model
         self._history = [self.model.to_dict()]
         self._history_index = 0
         layout = QVBoxLayout(self)
-        intro = QLabel("Mark where bracing cannot go. All other panels remain available for layout search. Pin panels for fixed-layout analysis; Keep selected panels as required retains them during search. This view covers the main building; canopies and lean-tos are not included.")
+        intro = QLabel("Mark where bracing cannot go. All other panels remain available for layout search. Pin panels for fixed-layout analysis; Keep selected panels as required retains them during search. Open canopies show as canopy roof faces (Find layout braces them in the main roof's braced bays); lean-tos are not included.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
         controls = QHBoxLayout()
@@ -441,7 +485,7 @@ class BracingLayoutDialog(QDialog):
         self.face_filter.clear()
         self.face_filter.addItem("All panels", "")
         for face, title in FACE_LABELS.items():
-            if any(p.face == face for p in self.model.panels.values()):
+            if any(p.face == face for p in self.model.all_panels.values()):
                 self.face_filter.addItem(title, face)
         index = self.face_filter.findData(previous)
         self.face_filter.setCurrentIndex(max(index, 0))
@@ -450,17 +494,18 @@ class BracingLayoutDialog(QDialog):
     def refresh_panels(self):
         face = self.face_filter.currentData() or ""
         selected = self.canvas.selected
-        if selected not in self.model.panels or (face and self.model.panels[selected].face != face):
+        panels = self.model.all_panels
+        if selected not in panels or (face and panels[selected].face != face):
             selected = None
             self.location_label.setText("Choose a panel in the view or list.")
         self.canvas.face = face
         self.clear_button.setText("Clear shown face" if face else "Clear all locations")
         self.panel_list.blockSignals(True)
         self.panel_list.clear()
-        for panel in self.model.panels.values():
+        for panel in panels.values():
             if face and panel.face != face:
                 continue
-            state = "BLOCKED" if panel.id in self.model.blocked else "PINNED" if panel.id in self.model.pinned else "Available"
+            state = {"blocked": "BLOCKED", "pinned": "PINNED", "available": "Available"}[self.model.state(panel.id)]
             self.panel_list.addItem(f"{state} | {panel.label}")
             item = self.panel_list.item(self.panel_list.count() - 1)
             item.setData(Qt.UserRole, panel.id)
@@ -470,7 +515,8 @@ class BracingLayoutDialog(QDialog):
         self.panel_list.blockSignals(False)
         self.canvas.set_layout(self.model)
         self.canvas.selected = selected
-        self.status_label.setText(f"{len(self.model.blocked)} blocked  |  {len(self.model.pinned)} pinned braces  |  {len(self.model.available)} available panels (includes pins)")
+        self.status_label.setText(f"{len(self.model.blocked)} blocked  |  {len(self.model.pinned)} pinned braces  |  {len(self.model.available)} available panels (includes pins)"
+                                  + (f"  |  {len(self.model.portal_braces)} portal braces" if self.model.portal_braces else ""))
         changed = self.model.geometry != self.current_geometry
         problem = f"Saved layout could not be read: {self.load_error}. Saving replaces it with the displayed layout." if self.load_error else (
             "Building dimensions have changed. The view shows the saved dimensions. Update the geometry before saving new locations; this clears locations and can be undone." if changed else "")
@@ -516,16 +562,14 @@ class BracingLayoutDialog(QDialog):
             self.canvas.update()
 
     def describe_panel(self, identifier):
-        if identifier in self.model.panels:
-            self.location_label.setText(self.model.panels[identifier].label)
+        if identifier in self.model.all_panels:
+            self.location_label.setText(self.model.all_panels[identifier].label)
 
     def clear_face(self):
         if self.read_only:
             return
         face = self.face_filter.currentData()
-        ids = {p.id for p in self.model.panels.values() if not face or p.face == face}
-        self.model.blocked.difference_update(ids)
-        self.model.pinned.difference_update(ids)
+        self.model.clear({p.id for p in self.model.all_panels.values() if not face or p.face == face})
         self.remember()
 
     def use_current_geometry(self):

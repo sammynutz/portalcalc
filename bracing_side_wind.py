@@ -11,10 +11,11 @@ import math
 
 import numpy as np
 
-from bracing_roof_loads import _snapshot, _combine
+from bracing_roof_loads import _snapshot, _combine, canopy_parts, fully_open
 from wind import (CPI_CASE_OPTIONS, SIDE_WALL_CPE_BANDS, active_cpi_for_case,
                   action_combination_factors, area_reduction_factor, calculate_wind,
-                  direction_bearing_degrees, low_pitch_cpe_values, wind_pressure_scale)
+                  direction_bearing_degrees, free_roof_cpn, low_pitch_cpe_values, open_canopy_cpi,
+                  wind_pressure_scale)
 
 # Level, wind pressure type and G factors. SLS 0G is the main portal's Ws-only
 # sway combination; G + Ws follows the main serviceability set.
@@ -24,9 +25,19 @@ SOURCE='AS/NZS 1170.2:2021 Amd 2, Tables 5.2(A/B/C), 5.3(A/B/C), 5.4/5.5 and 5.9
 URL='https://webstore.ansi.org/preview-pages/SAI/preview_00-2666920554-primary.pdf'
 
 
-def roof_cpe_segments(wind, geometry, right, use_max):
-    """Return horizontal X bands; keep pitched downwind Cpe in both branches."""
+def roof_cpe_segments(wind, geometry, right, use_max, left_ext=0., right_ext=0., split_x=None):
+    """Return horizontal X bands; keep pitched downwind Cpe in both branches.
+
+    ``left_ext``/``right_ext`` are open canopy plan widths beyond the eaves: as
+    in the 2D frame, the roof is then continuous from canopy tip to canopy tip,
+    with zones measured from the windward tip and, for a pitched gable, the
+    upwind/downwind split at ``split_x`` (half the total roof slope length).
+    X is from the main left eave, so canopy bands run from -left_ext to
+    span+right_ext. Without canopies the bands are unchanged.
+    """
     g=geometry
+    if left_ext>1e-9 or right_ext>1e-9:
+        return _continuous_roof_segments(wind,g,right,use_max,left_ext,right_ext,split_x)
     if g.pitch_deg<10 or (g.roof_shape=='Skillion' and right):
         bands=[(max(0.,a*wind.h_m*1000),min(g.span_mm,b*wind.h_m*1000),cpmax if use_max else cpmin)
                for _,a,b,cpmax,cpmin in low_pitch_cpe_values(wind.h_m/(g.span_mm/1000))]
@@ -40,6 +51,37 @@ def roof_cpe_segments(wind, geometry, right, use_max):
         bands=[(0.,g.span_mm,up.cpe_max if use_max else up.cpe_min)]
     bands=[(a,b,cp) for a,b,cp in bands if b>a]
     return sorted((g.span_mm-b,g.span_mm-a,cp) for a,b,cp in bands) if right else bands
+
+
+def _continuous_roof_segments(wind, g, right, use_max, left_ext, right_ext, split_x):
+    lo,hi=-left_ext,g.span_mm+right_ext
+    if g.roof_shape!='Gable':
+        raise ValueError('Canopies on a skillion roof are not supported in the 3D model')
+    if g.pitch_deg<10:
+        # Distances from the windward canopy tip; h/d from the main span, as 2D.
+        width=hi-lo
+        bands=[(max(0.,a*wind.h_m*1000),min(width,b*wind.h_m*1000),cpmax if use_max else cpmin)
+               for _,a,b,cpmax,cpmin in low_pitch_cpe_values(wind.h_m/(g.span_mm/1000))]
+        bands=[(a,b,cp) for a,b,cp in bands if b>a]
+        return sorted((hi-b,hi-a,cp) for a,b,cp in bands) if right else [(lo+a,lo+b,cp) for a,b,cp in bands]
+    split=g.span_mm/2 if split_x is None else split_x
+    up=next(z for z in wind.roof_zones if z.name=='Upwind rafter')
+    down=next(z for z in wind.roof_zones if z.name=='Downwind rafter')
+    upwind=up.cpe_max if use_max else up.cpe_min
+    bands=[(split,hi,upwind),(lo,split,down.cpe_max)] if right else [(lo,split,upwind),(split,hi,down.cpe_max)]
+    return sorted((a,b,cp) for a,b,cp in bands if b>a)
+
+
+def half_slope_x(elements, origin):
+    """X (from the main left eave) halfway along the continuous roof slope."""
+    pieces=sorted(((min(e.start.x,e.end.x),max(e.start.x,e.end.x),e.length()) for e in elements))
+    half=sum(length for _,_,length in pieces)/2
+    run=0.
+    for a,b,length in pieces:
+        if run+length>=half and length>0:
+            return a+(b-a)*(half-run)/length-origin
+        run+=length
+    return pieces[-1][1]-origin
 
 
 def side_wall_segments(height_m, span_mm, right):
@@ -64,10 +106,33 @@ def apply_element_patch(structure, element, start, finish, fx_n_mm, fz_n_mm, equ
     equivalents[element.id]=equivalents.get(element.id,np.zeros(6))+local
 
 
-def side_wind_cases(portal, geometry, inputs, gravity, widths):
+def _patch_normal(structure, element, origin, bands, q_width, factor, internal, equivalents):
+    """Normal pressure q*(-cp*factor + internal) over each X band of a roof member."""
+    xa,xb=element.start.x-origin,element.end.x-origin;dx=xb-xa;dz=element.end.y-element.start.y
+    if abs(dx)<1e-9:
+        return
+    sign=1. if dx>=0 else -1.
+    nx,nz=-sign*dz/element.length(),sign*dx/element.length()
+    for a,b,cp in bands:
+        lo,hi=max(min(xa,xb),a),min(max(xa,xb),b)
+        if hi<=lo:
+            continue
+        ta,tb=sorted(((lo-xa)/dx,(hi-xa)/dx))
+        outward=q_width*(-cp*factor+internal)
+        apply_element_patch(structure,element,ta,tb,nx*outward,nz*outward,equivalents)
+
+
+def side_wind_cases(portal, geometry, inputs, gravity, widths, source=None):
     g=geometry;structure=copy.deepcopy(portal.structure)
     tops=[e for e in structure.elements if e.group=='TOP']
     origin=min(n.x for e in tops for n in (e.start,e.end))
+    apex_x=max((n for e in tops for n in (e.start,e.end)),key=lambda n:n.y).x-origin
+    canopies=canopy_parts(structure,source)
+    free_roof=fully_open(inputs)
+    left_ext=sum(p['plan_mm'] for p in canopies if p['side']=='left')
+    right_ext=sum(p['plan_mm'] for p in canopies if p['side']=='right')
+    split_x=(half_slope_x(tops+[e for p in canopies for e in p['elements']],origin)
+             if canopies and g.roof_shape=='Gable' and g.pitch_deg>=10 else None)
     end_area=sum((b-a)*(g.roof_z(a)+g.roof_z(b))/2 for a,b in zip(g.roof_stations,g.roof_stations[1:]))/1e6
     roof_length=sum(e.length() for e in tops)
     cases=[]
@@ -78,11 +143,15 @@ def side_wind_cases(portal, geometry, inputs, gravity, widths):
         wind=calculate_wind(directional)
         for use_max in (True,False):
             cpe_case=('Right' if right else 'Left')+(' +' if use_max else ' -')
-            roof_bands=roof_cpe_segments(wind,g,right,use_max)
+            roof_bands=roof_cpe_segments(wind,g,right,use_max,left_ext,right_ext,split_x)
             end_bands=side_wall_segments(wind.h_m,g.span_mm,right)
+            # Open canopy undersides: the shared single-opening rule (as 2D).
+            canopy_cpi={part['side']:open_canopy_cpi(wind,cpe_case,part['side'],inputs.building_length_m,
+                                                     g.eave_mm/1000)[0] for part in canopies}
             for cpi_case,(level,pressure_type,g_factors) in ((c,l) for c in CPI_CASE_OPTIONS for l in LEVELS):
                 scale=wind_pressure_scale(wind,pressure_type);q=wind.wu_kn_m2*scale
-                cpi=active_cpi_for_case(wind,cpi_case,cpe_case)
+                # A fully open structure is a free roof in 2D: net Cpn, no Cpi.
+                cpi=0. if free_roof else active_cpi_for_case(wind,cpi_case,cpe_case)
                 kce,kci=action_combination_factors(wind,cpi)
                 end_factor=max(area_reduction_factor(wind,'side_wall',end_area)*kce,.8)
                 ends={face:[(a,b,sign*q*(cp*end_factor-cpi*kci) if clad else 0.) for a,b,cp in end_bands]
@@ -93,12 +162,31 @@ def side_wind_cases(portal, geometry, inputs, gravity, widths):
                 for index,width in enumerate(widths):
                     structure.clear_loads();equivalents={}
                     roof_factor=max(area_reduction_factor(wind,'roof',roof_length*width/1e6)*kce,.8)
+                    for part in canopies:
+                        if free_roof:
+                            windward=(part['side']=='right')==right
+                            cpn=free_roof_cpn(part['pitch_deg'],wind.h_over_d,'windward' if windward else 'leeward',
+                                              part['underside'],use_max)
+                            for e in part['elements']:
+                                _patch_normal(structure,e,origin,[(-math.inf,math.inf,cpn)],q*width/1000,1.,0.,equivalents)
+                        else:
+                            factor=max(area_reduction_factor(wind,'roof',part['slope_mm']*width/1e6)*kce,.8)
+                            internal=canopy_cpi[part['side']]*action_combination_factors(wind,canopy_cpi[part['side']])[1]
+                            for e in part['elements']:
+                                _patch_normal(structure,e,origin,roof_bands,q*width/1000,factor,internal,equivalents)
                     for e in tops:
                         xa,xb=e.start.x-origin,e.end.x-origin;dx=xb-xa;dz=e.end.y-e.start.y
                         sign=1. if dx>=0 else -1.
                         # Outward roof normal has positive Z on either slope.
                         nx,nz=-sign*dz/e.length(),sign*dx/e.length()
-                        for a,b,cp in roof_bands:
+                        if free_roof:
+                            # Net free-roof coefficient (B.5, empty under) on the
+                            # windward/leeward slope, as the 2D frame applies it.
+                            windward=((xa+xb)/2<=apex_x)!=right
+                            cpn=free_roof_cpn(g.pitch_deg,wind.h_over_d,'windward' if windward else 'leeward','empty',use_max)
+                            outward=-cpn*q*width/1000
+                            apply_element_patch(structure,e,0.,1.,nx*outward,nz*outward,equivalents)
+                        for a,b,cp in ([] if free_roof else roof_bands):
                             lo,hi=max(min(xa,xb),a),min(max(xa,xb),b)
                             if hi<=lo:
                                 continue

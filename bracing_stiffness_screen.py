@@ -2,17 +2,20 @@
 
 Portal geometry/sections and layout stay fixed. Captured simultaneous SLS loads
 are reused; tension-only equilibrium is resolved for each shortlisted trial.
-Only brace EA is varied in this first implementation.
+Brace EA is varied, and the strong-axis E I of portal frame brace columns and
+beams (their condensed wall-frame blocks are rebuilt for the trials).
 """
 from dataclasses import dataclass, replace
 from time import perf_counter
 
 import numpy as np
 
-from bracing_analysis import AnalysisError, _elastic_factor, _solve_factor
+from bracing_analysis import AnalysisError, _elastic_factor, _solve_factor, building_sway_node
+from bracing_layout import BRACE_GROUPS
+from bracing_portal_brace import PORTAL_BRACE_GROUPS, scaled_frame
 
-
-BRACE_GROUPS = ('roof_brace', 'wall_brace', 'end_brace')
+SCREEN_GROUPS = BRACE_GROUPS + PORTAL_BRACE_GROUPS
+PORTAL_STEP = 1e-4   # finite-difference step for a portal brace block derivative
 
 
 @dataclass(frozen=True)
@@ -67,6 +70,14 @@ class LightweightSlsScreen:
             for group in BRACE_GROUPS:
                 indices = [i for i, m in enumerate(self.members) if m.kind == group and active[i]]
                 rhs.append(-(r[indices].T @ (ks[indices]*(r[indices] @ u[free]))))
+            for group in PORTAL_BRACE_GROUPS:
+                # d(block)/d(I multiplier) by a small finite difference per brace.
+                vector = np.zeros(u.size)
+                for brace in getattr(model, 'portal_braces', ()):
+                    base = brace['frame'].stiffness
+                    stepped = scaled_frame(brace['frame'], group, 1.+PORTAL_STEP).stiffness
+                    vector[brace['dofs']] += (stepped-base)/PORTAL_STEP @ u[brace['dofs']]
+                rhs.append(-vector[free])
             key = taut.tobytes()
             if key not in tangent_factors:
                 tangent_factors[key] = _elastic_factor(tangent)
@@ -77,8 +88,8 @@ class LightweightSlsScreen:
         return max(response.ratio(displacement) for response in self.responses)
 
     def predict(self, group, ea_ratio):
-        """Local derivative wrt EA multiplier; large steps are ranking only."""
-        index = BRACE_GROUPS.index(group)
+        """Local derivative wrt EA (or portal brace E I) multiplier; large steps are ranking only."""
+        index = SCREEN_GROUPS.index(group)
         ratios = []
         for u, derivatives in self.derivatives:
             trial = u.copy()
@@ -87,8 +98,14 @@ class LightweightSlsScreen:
         return max(ratios)
 
     def evaluate(self, group, ea_ratio):
-        self.model.members = [replace(m, area_mm2=m.area_mm2*ea_ratio)
-                              if m.kind == group else m for m in self.members]
+        blocks = list(self.model.blocks)
+        if group in PORTAL_BRACE_GROUPS:
+            for brace in getattr(self.model, 'portal_braces', ()):
+                dofs, _ = blocks[brace['block']]
+                self.model.blocks[brace['block']] = (dofs, scaled_frame(brace['frame'], group, ea_ratio).stiffness)
+        else:
+            self.model.members = [replace(m, area_mm2=m.area_mm2*ea_ratio)
+                                  if m.kind == group else m for m in self.members]
         ratios = []
         try:
             for case in self.cases:
@@ -101,6 +118,7 @@ class LightweightSlsScreen:
             return max(ratios)
         finally:
             self.model.members = list(self.members)
+            self.model.blocks = blocks
 
 
 def sway_proposal(context, result, chosen, candidates, criteria, rates, tried):
@@ -119,8 +137,8 @@ def sway_proposal(context, result, chosen, candidates, criteria, rates, tried):
                 'scope': 'Fixed portal sections/layout; brace EA upgrades only; full checks required',
                 'catalogue_predictions': 0, 'lightweight_trials': [], 'sls_solves': 0}
     options = []
-    for group in BRACE_GROUPS:
-        if group in tried or not group_members(result, group):
+    for group in SCREEN_GROUPS:
+        if group in tried or group not in chosen or not group_members(result, group):
             continue
         old_ea = candidate_stiffness(chosen[group])
         old_cost = group_cost(result, group, chosen[group], rates)['total']
@@ -141,11 +159,12 @@ def sway_proposal(context, result, chosen, candidates, criteria, rates, tried):
         evidence['fallback'] = 'No eligible untried upgrade'
         return None, evidence
 
-    local = {**context, **{g: chosen[g] for g in BRACE_GROUPS}}
+    local = {**context, **{g: chosen[g] for g in SCREEN_GROUPS if g in chosen}}
     _, model, _, _, _, _ = prepare_analysis_models(local, chosen['strut'], chosen['end_post'])
     divisor = global_sway_basis(result, criteria, context)['divisor']
+    # The same main-building nodes as the global sway check (no canopy edges).
     responses = [MovementResponse(f'Node {i+1} longitudinal sway', ((3*i+1, 1.),), p[2]/divisor)
-                 for i, p in enumerate(model.nodes) if p[2] > 0]
+                 for i, p in enumerate(model.nodes) if building_sway_node(model.node_labels[i], p[2])]
     # Longitudinal acceptance only: transverse SLS frame sway does not govern.
     cases = [case for case in result['cases'] if case['case']['level'] == 'SLS'
              and case['case'].get('wind_family') != 'transverse']
@@ -166,7 +185,7 @@ def sway_proposal(context, result, chosen, candidates, criteria, rates, tried):
     evidence['catalogue_predictions'] = len(options)
     # Diversify groups, then fill the remaining slots by predicted response/cost.
     shortlist = []
-    for group in BRACE_GROUPS:
+    for group in SCREEN_GROUPS:
         first = next((row for row in options if row['group'] == group), None)
         if first is not None:
             shortlist.append(first)

@@ -173,8 +173,9 @@ def component_area(component):
 def purlin_check(component, force_kn, case_name, level, sls_divisor=150., criteria=None):
     data = component["data"]
     rating = data.get("axial_rating", {})
-    if abs(data.get("bending_span_mm", data.get("analysis_span_mm", 0))-data.get("analysis_span_mm", 0)) > 1e-3:
-        return {"case": case_name, "mode": "Installed bending check does not match this bay span", "ratio": None, "passes": False}
+    # The installed bending check is at the design (longest) bay and covers shorter bays.
+    if data.get("analysis_span_mm", 0) > data.get("bending_span_mm", data.get("analysis_span_mm", 0))+1e-3:
+        return {"case": case_name, "mode": "Bay is longer than the installed bending check span", "ratio": None, "passes": False}
     existing = component["existing"]
     if existing and method(rating) == METHOD:
         return installed_check(component, force_kn, case_name, level, sls_divisor, criteria)
@@ -325,10 +326,15 @@ def strut_locations(context, ratings=None, counts=None):
     installed = context.get("installed_purlins", {})
     locations = []
     for bay, (a, b) in enumerate(zip(g.bay_stations_mm, g.bay_stations_mm[1:])):
-        for line, x in enumerate(g.roof_stations):
+        # Roof stations, then each open canopy's edge purlin line.
+        for line, (x, _, _) in enumerate(g.strut_lines):
             identifier = f"strut/bay/{bay}/line/{line}"
             source = installed.get(str(line))
             if source is None:
+                side = g.strut_lines[line][2]
+                if side is not None:
+                    raise AnalysisError(f"The {side} canopy edge purlin needs a passing canopy edge purlin check "
+                                        "(Sections > Canopies) before the 3D bracing can be analysed")
                 raise AnalysisError("A checked installed purlin profile is required for each roof strut line")
             data = {**source}
             # Exact span/bending/restraint snapshot key protects against reuse
