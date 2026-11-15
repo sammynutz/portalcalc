@@ -1,9 +1,8 @@
-"""Isolated runtime adapter for the current PortalCalc desktop calculation.
+"""Runs a calculation request on the frame engine, with no window and no Qt.
 
-The public service contract is Qt-free (see :mod:`portalcalc_service`). This
-adapter is intentionally isolated while calculation orchestration is migrated
-out of ``MainWindow``. It never shows the window, suppresses optimiser dialogs
-and disables optimiser-learning writes.
+The request/result contract is in :mod:`portalcalc.service.contract`. This
+backend applies the request's inputs to a :class:`HeadlessFrameEngine`, solves
+(and sizes, for ``autoSize``) and returns the design dossier.
 
 A v2 (building) request is calculated one sizing group at a time. Each group
 is its own 2D frame, checked or sized against only its gridlines' building
@@ -13,7 +12,6 @@ loads. The groups are combined into one dossier.
 from __future__ import annotations
 
 import copy
-import os
 from dataclasses import replace
 from typing import Any, Mapping
 
@@ -27,81 +25,69 @@ from portalcalc.service.contract import (
 
 
 class HeadlessPortalCalcBackend:
+    """Runs a prepared request on a fresh :class:`HeadlessFrameEngine`."""
+
     def calculate(self, request: PreparedCalculationRequest) -> Mapping[str, Any]:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        from portalcalc.desktop.main_window import MainWindow
+        engine = self.create_engine()
+        if request.building is None:
+            return self._frame_dossier(engine, request, request.inputs)
+        from portalcalc.building.model import BuildingModel
+        engine.building_load_mode = request.load_basis
+        engine.building_model_override = BuildingModel.from_dict(dict(request.building))
+        groups = list(request.groups) or [{"id": "G1", "gridlines": None,
+                                           "representative": request.representative_gridline,
+                                           "inputs": request.inputs}]
+        dossiers = {}
+        for group in groups:
+            engine.building_load_gridlines = group["gridlines"]
+            dossier = self._frame_dossier(engine, request, group["inputs"])
+            dossier["building_results"] = engine.building_service_results(
+                request.building, dossier.get("inputs") or group["inputs"], group_id=group["id"])
+            dossiers[group["id"]] = dossier
+        return combine_group_dossiers(request, groups, dossiers)
 
-        app = QApplication.instance()
-        owns_app = app is None
-        if app is None:
-            app = QApplication([])
-        window = self.create_window(MainWindow)
-        window.confirm_on_close = False
-        try:
-            if request.building is None:
-                return self._frame_dossier(window, request, request.inputs)
-            from portalcalc.building.model import BuildingModel
-            window.building_load_mode = request.load_basis
-            window.building_model_override = BuildingModel.from_dict(dict(request.building))
-            groups = list(request.groups) or [{"id": "G1", "gridlines": None,
-                                               "representative": request.representative_gridline,
-                                               "inputs": request.inputs}]
-            dossiers = {}
-            for group in groups:
-                window.building_load_gridlines = group["gridlines"]
-                dossier = self._frame_dossier(window, request, group["inputs"])
-                dossier["building_results"] = window.building_service_results(
-                    request.building, dossier.get("inputs") or group["inputs"], group_id=group["id"])
-                dossiers[group["id"]] = dossier
-            return combine_group_dossiers(request, groups, dossiers)
-        finally:
-            window.close()
-            if owns_app:
-                app.quit()
-
-    def _frame_dossier(self, window, request, inputs) -> dict:
+    def _frame_dossier(self, engine, request, inputs) -> dict:
         """Check or size one 2D frame (the whole v1 request, or one v2 sizing group)."""
-        window.apply_preset_data(copy.deepcopy(dict(inputs)))
+        engine.apply_preset_data(copy.deepcopy(dict(inputs)))
         # apply_preset_data resets the panel override, and an unpreserved solve
         # clears web assignments, so nothing carries over between sizing groups.
         panel_count = (inputs.get("calculation_service") or {}).get("main_truss_panel_count")
         if panel_count is not None:
-            window._panel_count_override = int(panel_count)
+            engine._panel_count_override = int(panel_count)
         web_state = calculation_web_selection_state(inputs)
         assignments = web_state["assignments"]
         if assignments:
-            window.auto_web_profile_assignments = copy.deepcopy(assignments)
-            window.auto_web_joint_doubler_sides = copy.deepcopy(
+            engine.auto_web_profile_assignments = copy.deepcopy(assignments)
+            engine.auto_web_joint_doubler_sides = copy.deepcopy(
                 web_state["doubler_sides"]
             )
-            window.auto_web_assignment_basis = {
-                group: window.web_assignment_basis_signature(group) for group in assignments
+            engine.auto_web_assignment_basis = {
+                group: engine.web_assignment_basis_signature(group) for group in assignments
             }
-        previous_preserve = getattr(window, "_preserve_web_assignments_on_solve", False)
-        previous_topology = window._suppress_panel_topology_search
-        window._preserve_web_assignments_on_solve = bool(assignments)
-        window._suppress_panel_topology_search = panel_count is not None
+        previous_preserve = getattr(engine, "_preserve_web_assignments_on_solve", False)
+        previous_topology = engine._suppress_panel_topology_search
+        engine._preserve_web_assignments_on_solve = bool(assignments)
+        engine._suppress_panel_topology_search = panel_count is not None
         try:
-            window.generate_and_solve()
+            engine.generate_and_solve()
         finally:
-            window._preserve_web_assignments_on_solve = previous_preserve
-            window._suppress_panel_topology_search = previous_topology
-        self._raise_if_unsolved(window)
+            engine._preserve_web_assignments_on_solve = previous_preserve
+            engine._suppress_panel_topology_search = previous_topology
+        self._raise_if_unsolved(engine)
         optimiser = None
         if request.mode is CalculationMode.AUTO_SIZE:
-            optimiser = self.optimise_window(window)
-            self._raise_if_unsolved(window)
-        dossier = window.calculation_design_dossier()
+            optimiser = engine.auto_size_current_preset(show_completion=False)
+            self._raise_if_unsolved(engine)
+        dossier = engine.calculation_design_dossier()
         from portalcalc.frame.future_canopy_design import secondary_checks
-        dossier["secondary_steel_checks"] = secondary_checks(window)
+        dossier["secondary_steel_checks"] = secondary_checks(engine)
         from portalcalc.wind import calculate_wind
-        wind_basis = window.wind_inputs_from_ui(float(window.span_input.text()) * 1000,
-                                                float(window.pitch_input.text()),
-                                                float(window.eave_input.text()) * 1000)
+        wind_basis = engine.wind_inputs_from_ui(float(engine.span_input.text()) * 1000,
+                                                float(engine.pitch_input.text()),
+                                                float(engine.eave_input.text()) * 1000)
         dossier["wind_direction_checks"] = {}
         for case in ("Left +", "Right +", "End +"):
-            source = window.wind_source_direction_for_case(wind_basis.orientation, case)
+            source = engine.wind_source_direction_for_case(wind_basis.orientation, case)
             wind_result = calculate_wind(replace(wind_basis, orientation=source))
             dossier["wind_direction_checks"][case] = {
                 "source_direction": source,
@@ -109,43 +95,40 @@ class HeadlessPortalCalcBackend:
                 "ultimate_pressure_kpa": wind_result.wu_kn_m2,
                 "service_pressure_kpa": wind_result.ws_kn_m2,
             }
-        if window.frame_system_combo.currentText() == "Truss" and (optimiser is not None or panel_count is not None):
+        if engine.frame_system_combo.currentText() == "Truss" and (optimiser is not None or panel_count is not None):
             dossier.setdefault("inputs", {}).setdefault("calculation_service", {})[
                 "main_truss_panel_count"
-            ] = int(window.panel_count_label.text())
+            ] = int(engine.panel_count_label.text())
         if optimiser is not None:
             dossier["verified"] = bool(optimiser.get("verified"))
             dossier["optimisation"] = copy.deepcopy(optimiser)
         if optimiser is not None or assignments:
             dossier.setdefault("inputs", {}).setdefault("calculation_service", {})[
                 "auto_web_profile_assignments"
-            ] = copy.deepcopy(window.auto_web_profile_assignments)
+            ] = copy.deepcopy(engine.auto_web_profile_assignments)
             dossier["inputs"]["calculation_service"][
                 "auto_web_joint_doubler_sides"
-            ] = copy.deepcopy(window.auto_web_joint_doubler_sides)
+            ] = copy.deepcopy(engine.auto_web_joint_doubler_sides)
         dossier["warnings"] = [
             "Preliminary proposal only; engineering review and approval are required.",
         ]
         dossier["engine_provenance"] = {
-            "runtime": "isolated MainWindow compatibility backend",
+            "runtime": "headless frame engine",
             **calculation_source_provenance(),
         }
         return dossier
 
     @staticmethod
-    def optimise_window(window):
-        return window.auto_size_current_preset(show_completion=False)
+    def create_engine():
+        from portalcalc.frame.engine.headless import HeadlessFrameEngine
+
+        return HeadlessFrameEngine()
 
     @staticmethod
-    def create_window(window_class):
-        """Allow search adapters to specialise reporting/cost objectives."""
-        return window_class()
-
-    @staticmethod
-    def _raise_if_unsolved(window: Any) -> None:
-        if window.structure is not None and window.design_envelope_actions is not None:
+    def _raise_if_unsolved(engine: Any) -> None:
+        if engine.structure is not None and engine.design_envelope_actions is not None:
             return
-        detail = window.results_box.toPlainText().strip()
+        detail = engine.results_box.toPlainText().strip()
         raise ValueError(detail or "PortalCalc did not produce a solved model")
 
 

@@ -20,6 +20,7 @@ import math
 import os
 import sys
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -96,33 +97,50 @@ def merged(base, changes):
     return data
 
 
-def solve_scenario(name):
-    from PySide6.QtWidgets import QApplication
-    from portalcalc.desktop.main_window import MainWindow
-    from portalcalc.service.contract import json_safe
+@contextmanager
+def solved_engine(name, kind="window"):
+    """The scenario applied, solved (and optimised if the scenario says so).
 
-    app = QApplication.instance() or QApplication([])  # noqa: F841 (kept alive for the window)
+    ``kind`` is "window" (the offscreen desktop window) or "headless" (the engine
+    with plain fields and no Qt). Yields the engine; ``engine.structure`` is None
+    if the model could not be generated.
+    """
     changes, optimise = SCENARIOS[name]
     preset = merged(json.loads(data_path(FACTORY_DEFAULTS).read_text(encoding="utf-8")), changes)
-    window = MainWindow()
-    window.confirm_on_close = False
+    if kind == "headless":
+        from portalcalc.frame.engine.headless import HeadlessFrameEngine
+        engine = HeadlessFrameEngine()
+    else:
+        from PySide6.QtWidgets import QApplication
+        from portalcalc.desktop.main_window import MainWindow
+        app = QApplication.instance() or QApplication([])  # noqa: F841 (kept alive for the window)
+        engine = MainWindow()
+        engine.confirm_on_close = False
     try:
-        window.apply_preset_data(preset)
-        window.generate_and_solve()
-        if window.structure is None or window.design_envelope_actions is None:
+        engine.apply_preset_data(preset)
+        engine.generate_and_solve()
+        if optimise and engine.structure is not None and engine.design_envelope_actions is not None:
+            engine.auto_size_current_preset(show_completion=False)
+        yield engine
+    finally:
+        if kind != "headless":
+            engine.close()
+
+
+def solve_scenario(name, kind="window"):
+    from portalcalc.service.contract import json_safe
+
+    with solved_engine(name, kind) as engine:
+        if engine.structure is None or engine.design_envelope_actions is None:
             return {"solved": False}
-        if optimise:
-            window.auto_size_current_preset(show_completion=False)
-        dossier = json_safe(window.calculation_design_dossier())
+        dossier = json_safe(engine.calculation_design_dossier())
         result = results_only(dossier)
         result["solved"] = True
         result["sections"] = dict((dossier.get("inputs") or {}).get("sections", {}))
-        displacements = [abs(float(x)) for x in window.displacements]
+        displacements = [abs(float(x)) for x in engine.displacements]
         result["displacement_max_abs"] = float(f"{max(displacements):.10g}")
         result["displacement_sum_abs"] = float(f"{sum(displacements):.10g}")
         return result
-    finally:
-        window.close()
 
 
 def differences(expected, actual, path=""):
