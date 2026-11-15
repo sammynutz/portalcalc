@@ -57,6 +57,44 @@ class EaveNodeTests(unittest.TestCase):
         top = w.profile_depth_mm(w.selected_profile(w.top_profile_combo))
         return float(w.eave_input.text()) * 1000 + inset * math.tan(theta) - (b["purlin_mm"] + top / 2) / math.cos(theta)
 
+    def test_truss_depth_outside_the_optimise_range_is_warned(self):
+        w = self.solve(roof_shape="Gable")
+        self.assertEqual(w.truss_depth_outside_range_note(), "")
+        span = float(w.span_input.text()) * 1000
+        w.max_truss_depth_input.setText("950")
+        w.depth_input.setText("1200")
+        try:
+            note = w.truss_depth_outside_range_note()
+            self.assertIn("1200 mm", note)
+            self.assertIn("Max truss depth", note)
+            self.assertIn("started from 950 mm", note)
+            w.depth_input.setText(f"{0.03 * span - 200:.0f}")          # below the 3% minimum
+            self.assertIn("minimum (3% of span)", w.truss_depth_outside_range_note())
+            w.depth_input.setText("940")                                # rounds up into range: no warning
+            self.assertEqual(w.truss_depth_outside_range_note(), "")
+        finally:
+            w.max_truss_depth_input.setText("")
+
+    def test_matched_columns_on_symmetric_buildings(self):
+        w = self.solve(roof_shape="Gable")
+        self.assertTrue(w.columns_should_match())
+        left, right = w.left_column_profile_combo, w.right_column_profile_combo
+        names = [left.itemText(i) for i in range(left.count())]
+        try:
+            w._matched_columns = True
+            specs = {group: combo for _, combo, group in w.auto_size_group_specs()}
+            self.assertIs(specs["RIGHT_COLUMN"], left)                 # one decision
+            left.setCurrentIndex(names.index(names[3]))
+            self.assertEqual(right.currentText(), names[3])
+            right.setCurrentIndex(right.findText(names[5]))
+            self.assertEqual(left.currentText(), names[5])           # either side leads
+        finally:
+            w._matched_columns = False
+        left.setCurrentIndex(2)
+        self.assertEqual(right.currentText(), names[5])               # independent outside Optimise
+        self.assertFalse(self.solve(roof_shape="Skillion").columns_should_match())
+        self.assertFalse(self.solve(roof_shape="Gable", left_support="Fixed", right_support="Pinned").columns_should_match())
+
     def test_gable_node_formula_and_frame_geometry(self):
         w = self.solve(roof_shape="Gable")
         node = self.hand_node(w)

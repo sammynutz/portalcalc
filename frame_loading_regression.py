@@ -137,12 +137,13 @@ class CombinationTests(unittest.TestCase):
 
     def test_deduplicated_counts(self):
         self.assertEqual(distinct_frames(self.legacy), [["GL1", "GL6"], ["GL2", "GL3", "GL4", "GL5"]])
-        self.assertEqual(len(frame_load_combinations(self.legacy)), 2 * 57)
+        self.assertEqual(len(frame_load_combinations(self.legacy)), 2 * 65)
         self.assertEqual(len(distinct_frames(self.frames)), 6)
         combos = frame_load_combinations(self.frames)
-        # Gravity (9) and side wind (32) shared by tributary class; end wind (32) per frame.
-        self.assertEqual(len(combos), 2 * 9 + 2 * 32 + 6 * 32)
-        self.assertEqual(len(frame_load_combinations(self.frames, gridlines=["GL3"])), 9 + 64)
+        # Gravity (17: five plain + four crane ULS + eight crane SLS) and side wind (32)
+        # shared by tributary class; end wind (32) per frame.
+        self.assertEqual(len(combos), 2 * 17 + 2 * 32 + 6 * 32)
+        self.assertEqual(len(frame_load_combinations(self.frames, gridlines=["GL3"])), 17 + 64)
 
     def test_long_building_shares_its_middle_frames(self):
         preset = variant(wind__building_length_m="96")
@@ -291,7 +292,8 @@ class DesktopToggleTests(DesktopEnvelopeTests):
         w.generate_and_solve()
         text = w.results_box.toPlainText()
         self.assertIn("BUILDING LOADS", text)
-        self.assertIn("Combinations     : 274 of 274", text)
+        # No crane: the crane cases are not checked (5 gravity cases per tributary class).
+        self.assertIn("Combinations     : 266 of 266", text)
         self.assertIn("@GL", text)
         saved = w.collect_preset_data()
         self.assertEqual(saved["wind"]["frame_load_basis"], "building")

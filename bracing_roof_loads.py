@@ -105,7 +105,66 @@ def _combine(*terms):
     return {'loads_n': loads.tolist(), 'member_equivalent_loads': {k:v.tolist() for k,v in members.items()}}
 
 
-def building_roof_cases(base_cases, portal, geometry, wind_inputs, source, snow_service_kpa=0.):
+def crane_cases(structure, crane, gravity, live):
+    """3D crane cases: the crane on one frame (``crane['frame_index']``), G/Q on every frame.
+
+    Crab left/right x lateral +/-X (loads.CRANE_CASES), with the 2D frame's
+    crane actions (crane_beam.apply_crane_actions; the runway self weight is
+    not added):
+    - SLS "G + Crane" and "G + 0.7Q + Crane": racking is measured against the
+      "SLS / G" shape (rails aligned under dead load). G is kept in the solve so
+      the tension-only rods are in their dead-load state.
+    - ULS "1.2G + 1.5Q + Crane": the bracing members are checked for the crane.
+    """
+    from crane_beam import apply_crane_actions
+    from loads import CRANE_CASES
+    nodes = {n.id: n for n in structure.nodes}
+    crane_nodes = {side: nodes[crane['node_ids'][side]] for side in ('left', 'right')}
+    frame = crane['frame_index']
+    cases = []
+    for crane_label, position in CRANE_CASES:
+        states = {}
+        for level, serviceability in (('SLS', True), ('ULS', False)):
+            structure.clear_loads()
+            apply_crane_actions(structure, crane_nodes, crane['portal_actions'], position, serviceability, 0.)
+            states[level] = _snapshot(structure)
+        for level, gf, qf, label in (('SLS', 1., 0., 'G + Crane'), ('SLS', 1., .7, 'G + 0.7Q + Crane'),
+                                     ('ULS', 1.2, 1.5, '1.2G + 1.5Q + Crane')):
+            cases.append({
+                'name': f"{level} / {label} / frame {frame+1}: {crane_label}", 'level': level,
+                'front_kpa': 0., 'back_kpa': 0., 'source_direction': None, 'cpi': 0.,
+                'g_factor': gf, 'q_factor': qf, 'wind_family': 'crane',
+                'crane_position': position, 'crane_frame': frame, 'crane_label': crane_label,
+                **({'crane_baseline': 'SLS / G'} if level == 'SLS' else {}),
+                'portal_loads': [_combine((gf, a), (qf, b), (1. if i == frame else 0., states[level]))
+                                 for i, (a, b) in enumerate(zip(gravity, live))]})
+    cases += buffer_cases(crane, gravity)
+    return cases
+
+
+def buffer_cases(crane, gravity):
+    """ULS crane buffer impact on the end stops, front and back separately.
+
+    The factored buffer force (``crane['buffer']``: force per rail x ULS
+    factor) acts along the building on BOTH runways at the impacted end frame
+    (front stops -Y at frame 1, back stops +Y at the last frame), at runway
+    level; the runway beam carries it to the braced bays. With 1.2G.
+    """
+    buffer = crane.get('buffer') or {}
+    force = float(buffer.get('force_kn', 0.) or 0.)*float(buffer.get('uls_factor', 1.))*1000.
+    if force <= 0.:
+        return []
+    last = len(gravity)-1
+    return [{'name': f'ULS / 1.2G + Crane buffer / {label}', 'level': 'ULS',
+             'front_kpa': 0., 'back_kpa': 0., 'source_direction': None, 'cpi': 0.,
+             'g_factor': 1.2, 'q_factor': 0., 'wind_family': 'crane', 'crane_buffer': label,
+             'wall_tier_loads': [{'face': face, 'frame': frame, 'fy_n': sign*force}
+                                 for face in ('left_wall', 'right_wall')],
+             'portal_loads': [_combine((1.2, a)) for a in gravity]}
+            for label, frame, sign in (('front stops', 0, -1.), ('back stops', last, 1.))]
+
+
+def building_roof_cases(base_cases, portal, geometry, wind_inputs, source, snow_service_kpa=0., crane=None):
     """Expand end-wind cases to G/Q and coincident G + normal-wind cases.
 
     The existing end-wall pressures and friction are retained. The two roof
@@ -223,12 +282,15 @@ def building_roof_cases(base_cases, portal, geometry, wind_inputs, source, snow_
     from bracing_side_wind import side_wind_cases
     transverse_cases=side_wind_cases(portal,g,wind_inputs,gravity,widths,source=source)
     cases.extend(transverse_cases)
+    if crane:
+        cases.extend(crane_cases(structure, crane, gravity, live))
     # Some dominant-opening presets have identical Cpi branches. Preserve
     # source labels but solve each distinct physical load combination once.
     unique = {}
     for case in cases[4:]+cases[:4]:
         signature = hashlib.sha256(json.dumps({k:case.get(k) for k in
-            ('level','front_kpa','back_kpa','portal_loads','roof_drag','end_wall_pressure_segments')},sort_keys=True).encode()).hexdigest()
+            ('level','front_kpa','back_kpa','portal_loads','roof_drag','end_wall_pressure_segments',
+             'wall_tier_loads')},sort_keys=True).encode()).hexdigest()
         if signature in unique:
             unique[signature].setdefault('equivalent_case_names',[]).append(case['name'])
         else:
@@ -240,5 +302,12 @@ def building_roof_cases(base_cases, portal, geometry, wind_inputs, source, snow_
         'transverse_wind':{'enabled':True,'levels':['ULS','SLS'],'directions':['Left to right','Right to left'],
             'basis':'Simultaneous roof/wall external and internal pressures and both roof alternatives: ULS with 0.9G/1.2G, SLS at serviceability pressure as Ws and G + Ws. Conventional bare bracing only. End-wall suction varies across the span. Roof friction parallel to sheet ribs is included where applicable. Transverse SLS reports per-frame eave sway only; it does not govern 3D sizing.'},
         'basis':'Full portal distributed loads and member self-weight, condensed/recovered with the original frame stiffness. G includes solar/fire/HVAC/other. End frames have half adjacent-bay roof tributaries; wind zones use bay support shape functions. Longitudinal wind includes roof/clad side-wall normal pressures and roof friction. Transverse ULS/SLS cases include roof/side-wall normal pressures, roof friction and varying end-wall suction. Local Kl patches are excluded from the global model.',
-        'excluded':'Transverse SLS diaphragm credit, crane/storage actions, wall/underside/exposed-member friction and purlin continuity reaction redistribution are outside this model.'}
+        'crane':(None if not crane else {'frame': crane['frame_index']+1, 'frame_y_mm': crane['frame_y_mm'],
+            'basis': 'Crane on one frame (crab left/right x lateral +/-X): SLS G + Crane and G + 0.7Q + Crane '
+                     '(racking from the G-only shape), ULS 1.2G + 1.5Q + Crane (brace strength). Runway self weight '
+                     'not added. ULS 1.2G + buffer impact on the end stops (front and back separately): '
+                     'the factored buffer force on both runways at runway level, carried by the runway beam '
+                     'to the side-wall bracing.',
+            'buffer': copy.deepcopy(crane.get('buffer'))}),
+        'excluded':'Transverse SLS diaphragm credit, storage actions, wall/underside/exposed-member friction and purlin continuity reaction redistribution are outside this model.'+('' if crane else ' No crane.')}
     return list(unique.values()), basis

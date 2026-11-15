@@ -121,7 +121,9 @@ def _candidates(window, context):
                 # Portal frame brace columns/beams: catalogue UBs (used only with portal braces).
                 **{group: list(dialog.portal_profiles) for group in ('portal_brace_column', 'portal_brace_beam')},
                 # Open canopy roof braces: the same brace catalogue, sized as their own group.
-                **({'canopy_brace': dialog.component_editor.brace_candidates()} if context.get('canopy_brace') else {})}
+                **({'canopy_brace': dialog.component_editor.brace_candidates()} if context.get('canopy_brace') else {}),
+                # Mid-height SHS struts of tall side-wall bays.
+                **({'wall_tier_strut': list(dialog.wall_tier_profiles)} if context.get('wall_tier_strut') is not None else {})}
     finally:
         dialog.deleteLater()
 

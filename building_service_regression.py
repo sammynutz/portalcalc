@@ -251,7 +251,8 @@ class HeadlessTests(_Desktop):
         plain["sizing_groups"] = [{"id": "ends", "gridlines": ["GL1", "GL6"]},
                                   {"id": "interior", "gridlines": ["GL2", "GL3", "GL4", "GL5"]}]
         split = self.service().run(v2_request(plain))
-        self.assertEqual(split["building"]["combinations"]["by_group"]["ends"]["total"], 9 + 32 + 2 * 32)
+        # No crane, so the crane cases are not checked: 5 gravity + 32 side wind + 2 x 32 end wind.
+        self.assertEqual(split["building"]["combinations"]["by_group"]["ends"]["total"], 5 + 32 + 2 * 32)
         self.assertLess(split["dossier"]["group_dossiers"]["ends"]["overall_governing"]["ratio"],
                         split["dossier"]["group_dossiers"]["interior"]["overall_governing"]["ratio"])
         sized = result["building"]["sized_building"]

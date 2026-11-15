@@ -45,7 +45,8 @@ def compile_sources(root: Path) -> None:
         py_compile.compile(str(root / name), doraise=True)
     for name in ("bracing_layout.py", "bracing_layout_ui.py", "bracing_layout_regression.py"):
         py_compile.compile(str(root / name), doraise=True)
-    for name in ("bay_layout.py", "bay_layout_regression.py", "eave_node_regression.py",
+    for name in ("bay_layout.py", "bay_layout_regression.py", "eave_node_regression.py", "bracing_crane_regression.py",
+                 "bracing_wall_tier_regression.py",
                  "building_model.py", "building_model_regression.py", "building_loads.py", "building_loads_regression.py",
                  "frame_loading.py", "frame_loading_regression.py", "building_service_regression.py"):
         py_compile.compile(str(root / name), doraise=True)
@@ -857,8 +858,12 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     assert "left_shallow_depth_mm" not in canopy_preset_data
 
     names = [combo.name for combo in window.load_combinations]
-    assert "1.2G + 1.5Q + Crane Left" in names
-    assert "1.2G + 1.5Q + Crane Right" in names
+    for crane_label in ("Crane Left, H +X", "Crane Left, H -X", "Crane Right, H +X", "Crane Right, H -X"):
+        assert f"1.2G + 1.5Q + {crane_label}" in names
+        assert f"SLS: {crane_label}" in names                  # crane live only, no dead load
+        assert f"SLS: 0.7Q + {crane_label}" in names
+    crane_sls = [c for c in window.load_combinations if c.is_serviceability and c.crane_position != "none"]
+    assert len(crane_sls) == 8 and all(c.g_factor == 0.0 and c.q_factor in (0.0, 0.7) for c in crane_sls)
     assert "1.2G + Wu (End +, Cpi +)" in names
     assert window.envelope_plan_selector.wall_states() == {"back": True, "left": True, "right": True, "front": True}
 
@@ -2468,25 +2473,41 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     assert window.crane_beam_phi2_input.text() == "14.35"
     window.load_combination_combo.setCurrentText("1.2G + 1.5Q")
     window.generate_and_solve()
-    assert "CRANE LOAD" not in window.results_box.toPlainText()
+    # Every combination carries the runway beam self weight; crane wheel loads only in crane cases.
+    assert "runway self weight only" in window.results_box.toPlainText()
 
-    window.load_combination_combo.setCurrentText("1.2G + 1.5Q + Crane Left")
+    window.load_combination_combo.setCurrentText("1.2G + 1.5Q + Crane Left, H +X")
     window.generate_and_solve()
     left_text = window.results_box.toPlainText()
-    assert "Position     : left column only" in left_text
-    assert "Horiz load" in left_text
+    assert "CRANE LOAD (from the crane beam calculation)" in left_text
+    assert "crab left, lateral +X on both columns (ULS)" in left_text
 
-    window.load_combination_combo.setCurrentText("1.2G + 1.5Q + Crane Right")
+    window.load_combination_combo.setCurrentText("1.2G + 1.5Q + Crane Right, H -X")
     window.generate_and_solve()
     right_text = window.results_box.toPlainText()
-    assert "Position     : right column only" in right_text
-    assert "Horiz load" in right_text
+    assert "crab right, lateral -X on both columns (ULS)" in right_text
 
+    # Portal crane actions come from the crane beam wheel loads (R = P1 + P2 (L - a) / L).
     window.crane_rating_input.setText("20")
-    window.load_combination_combo.setCurrentText("1.2G + 1.5Q + Crane Left")
+    window.apply_crane_rating_to_crane_beam_inputs()
+    window.load_combination_combo.setCurrentText("1.2G + 1.5Q + Crane Left, H +X")
     window.generate_and_solve()
+    crane_inputs = window.crane_beam_inputs_from_ui()
+    crane_actions = window.crane_portal_actions
+    reach = (crane_inputs.span_mm - crane_inputs.wheelbase_mm) / crane_inputs.span_mm
+    assert math.isclose(crane_actions["uls_vertical_max_kn"],
+                        (crane_inputs.pmax_21_kn + crane_inputs.pmax_22_kn * reach) * 1.5, rel_tol=1e-9)
+    assert math.isclose(crane_actions["sls_vertical_min_kn"],
+                        crane_inputs.pstatic_min_11_kn + crane_inputs.pstatic_min_12_kn * reach, rel_tol=1e-9)
+    assert math.isclose(crane_actions["uls_lateral_kn"],
+                        (abs(crane_inputs.phb_21_kn) + abs(crane_inputs.phb_22_kn) * reach) * 1.4, rel_tol=1e-9)
+    # Crane node at the stub mid height: 950 + runway depth + column depth / 2 below the bottom chord node.
+    left_node = crane_actions["nodes"]["left"]
+    left_column_depth = window.selected_profile(window.left_column_profile_combo).depth
+    assert math.isclose(left_node["below_chord_mm"], 950.0 + crane_actions["runway_depth_mm"] + left_column_depth / 2.0)
+    assert math.isclose(left_node["eccentricity_mm"], left_column_depth / 2.0 + 300.0)
     text = window.results_box.toPlainText()
-    assert "Horiz load   :   37.500 kN per loaded column" in text
+    assert "Left column  :" in text and "stub mid height" in text
     assert window.costing_summary["crane_beam_total_kg"] > 0.0
     crane_item = window.costing_summary["crane_beam_item"]
     assert crane_item["rate_bucket"] in {"ub", "wb"}
@@ -2504,17 +2525,37 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
         rel_tol=1e-9,
     )
     assert "crane minor length: base to crane height" in window.section_checks_box.toPlainText()
-    assert "Crane rail deflection SLS" in window.section_checks_box.toPlainText()
-    assert "H/250" in window.section_checks_box.toPlainText()
-    assert "crane rail" in window.column_deflection_check_label.text()
-    assert "H/250" in window.column_deflection_check_label.text()
+    section_text = window.section_checks_box.toPlainText()
+    assert "Crane rail racking SLS (mean of both rails, frame alone)" in section_text
+    assert "REPORT ONLY" in section_text
+    assert "Crane rail gauge change SLS (right minus left)" in section_text
+    assert "H/250" in section_text
+    deflection_label = window.column_deflection_check_label.text()
+    assert "crane racking, frame alone" in deflection_label and "report only, checked in 3D" in deflection_label
+    assert "#8a8f98" in deflection_label            # greyed out
+    assert "crane gauge" in deflection_label
+    # Racking (frame alone) is reported but never governs or fails the 2D checks.
+    serviceability_checks = [window.auto_size_serviceability_ratio()[1],
+                             *(window.column_group_deflection_ratio(g)[1] for g in ("LEFT_COLUMN", "RIGHT_COLUMN"))]
+    assert not any("racking" in str(label).lower() for label in serviceability_checks)
+    assert window.governing_column_deflection_overlay["kind"] != "Crane rail racking"
+    # Racking is the mean rail movement and gauge change the difference, under crane cases only.
+    racking = window.design_envelope_actions["sls_crane_rail_deflection"]
+    gauge = window.design_envelope_actions["sls_crane_gauge_change"]
+    # Crane live load only (or with 0.7Q): rail movement from the dead-load alignment.
+    assert racking["combo"].startswith(("SLS: Crane", "SLS: 0.7Q + Crane"))
+    assert gauge["combo"].startswith(("SLS: Crane", "SLS: 0.7Q + Crane"))
+    assert math.isclose(racking["signed_value"], 0.5 * (racking["left_mm"] + racking["right_mm"]), rel_tol=1e-9)
+    assert math.isclose(gauge["signed_value"], gauge["right_mm"] - gauge["left_mm"], rel_tol=1e-9)
+    assert gauge["limit_mm"] == 15.0
 
-    left_fx = [arrow[2] for arrow in window.single_load_arrows["Crane Q left"] if abs(arrow[2]) > 0.0]
-    right_fx = [arrow[2] for arrow in window.single_load_arrows["Crane Q right"] if abs(arrow[2]) > 0.0]
-    both_fx = [arrow[2] for arrow in window.single_load_arrows["Crane Q both"] if abs(arrow[2]) > 0.0]
-    assert left_fx == [-25_000.0]
-    assert right_fx == [25_000.0]
-    assert len(both_fx) == 2 and min(both_fx) < 0.0 and max(both_fx) > 0.0
+    # Lateral crane forces act the same way on both columns (racking, not spreading).
+    left_fx = [arrow[2] for arrow in window.single_load_arrows["Crane Q crab left, H +X"] if abs(arrow[2]) > 0.0]
+    right_fx = [arrow[2] for arrow in window.single_load_arrows["Crane Q crab right, H -X"] if abs(arrow[2]) > 0.0]
+    assert len(left_fx) == 2 and all(fx > 0.0 for fx in left_fx)
+    assert len(right_fx) == 2 and all(fx < 0.0 for fx in right_fx)
+    runway_fy = [arrow[3] for arrow in window.single_load_arrows["Crane G runway"]]
+    assert len(runway_fy) == 2 and all(math.isclose(fy, -crane_actions["permanent_kn"] * 1000.0) for fy in runway_fy)
 
     weird_path = Path(__file__).resolve().parent / "presets" / "Truss Deflection Weirdness.json"
     if weird_path.exists():
@@ -2678,6 +2719,11 @@ def build_steps(quick: bool):
             "bay_layout_regression:BayListTests", "bay_layout_regression:DesktopTests"), 3),
         ("eave pitching point: top chord node and eave strip loads", p(run_tests, "Eave node regression failed",
             "eave_node_regression:EaveNodeTests"), 4),
+        ("3D crane rail racking and crane brace cases", p(run_tests, "3D crane racking regression failed",
+            "bracing_crane_regression:CraneRackingTests"), 120),
+        ("two-tier side-wall bracing, crane runway strut and buffer impact", p(run_tests, "Wall tier regression failed",
+            "bracing_wall_tier_regression:GeometryTests", "bracing_wall_tier_regression:NetworkTests",
+            "bracing_wall_tier_regression:StressedSkinDefaultTests"), 4),
         ("3D building model schema and preset round trip", p(run_tests, "Building model regression failed",
             "building_model_regression:ModelTests", "building_model_regression:DesktopTests"), 3),
         ("3D building loads: per-frame wind, 2D parity and expected differences", p(run_tests, "Building loads regression failed",

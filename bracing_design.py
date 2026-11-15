@@ -5,6 +5,7 @@ Connection acceptance, geometric stability and production portal sizing remain
 separate. Catalogue search is grouped/iterative, not a global layout optimum.
 """
 from dataclasses import asdict, dataclass, replace
+import copy
 import functools
 import hashlib
 import json
@@ -28,6 +29,9 @@ GROUPS = {"strut": "longitudinal_strut", "end_post": "end_post",
           "roof_brace": "roof_brace", "wall_brace": "wall_brace", "end_brace": "end_brace",
           # Only for buildings with an open canopy; absent from selections otherwise.
           "canopy_brace": "canopy_brace",
+          # Mid-height SHS strut of two-tier (tall) side-wall bays; only when the
+          # building has tall wall bays. Crane walls use the runway beam instead.
+          "wall_tier_strut": "wall_tier_strut",
           # Portal frame braces (UB moment frames in side-wall bays); only when
           # the layout has them. Their members are not network axial members.
           "portal_brace_column": "portal_brace_column", "portal_brace_beam": "portal_brace_beam"}
@@ -331,15 +335,16 @@ def member_assessment(result, member_index, candidate, criteria):
             tributary = (stations[index+1]-stations[index-1]) / 2
             pressure = case["case"]["front_kpa"] if abs(a[1]) < 1e-5 else case["case"]["back_kpa"]
             pressure_load = abs(pressure) / 1000 * tributary  # N/mm
-        line_load = local_weight if group == "longitudinal_strut" else pressure_load
+        strut_like = group in ("longitudinal_strut", "wall_tier_strut")
+        line_load = local_weight if strut_like else pressure_load
         if case["case"]["level"] == "ULS":
             # Strut gravity is a separate local simply-supported beam check.
             # Post self-weight is conservatively added to compression without
             # taking beneficial gravity credit against wind tension.
-            moment = line_load*length**2/8/1e6 * (1.2 if group == "longitudinal_strut" else 1.)
-            shear = line_load*length/2/1000 * (1.2 if group == "longitudinal_strut" else 1.)
+            moment = line_load*length**2/8/1e6 * (1.2 if strut_like else 1.)
+            shear = line_load*length/2/1000 * (1.2 if strut_like else 1.)
             gravity_n = 1.2*local_weight*length if group == "end_post" else 0.
-            ke = criteria.strut_ke if group == "longitudinal_strut" else criteria.post_ke
+            ke = criteria.strut_ke if strut_like else criteria.post_ke
             actions = MemberActions(compression_kn=max(-force, 0.)+gravity_n/1000,
                                     tension_kn=max(force, 0.), moment_knm=moment, shear_kn=shear,
                                     effective_length_y_mm=length*ke, effective_length_z_mm=length*ke)
@@ -467,18 +472,26 @@ def panel_installation_rate(rates):
 
 
 def panel_installation_cost(result, rates):
-    """Once per physical X panel, independent of case count and rod slackness."""
+    """Once per physical X, independent of case count and rod slackness.
+
+    A two-tier side-wall bay (four diagonals) is two X's.
+    """
     kinds = {'roof_brace', 'wall_brace', 'end_brace', 'canopy_brace'}
-    panels = {m['id'][6:].rsplit('/', 1)[0] for m in result['cases'][0]['members']
-              if m['kind'] in kinds and m['id'].startswith('brace/')}
+    diagonals = {}
+    for m in result['cases'][0]['members']:
+        if m['kind'] in kinds and m['id'].startswith('brace/'):
+            panel = m['id'][6:].rsplit('/', 1)[0]
+            diagonals[panel] = diagonals.get(panel, 0)+1
+    panels = sorted(diagonals)
+    count = sum(max(1, math.ceil(n/2)) for n in diagonals.values())
     rate = panel_installation_rate(rates)
     return {'group': 'panel_installation', 'section': 'Installation allowance',
-            'panel_count': len(panels), 'panels': sorted(panels), 'rate_per_panel': rate,
+            'panel_count': count, 'panels': panels, 'rate_per_panel': rate,
             'member_count': 0, 'installed_kg': 0., 'purchased_kg': 0., 'material_rate_per_kg': 0.,
             'installed_length_m': 0., 'purchased_length_m': 0.,
-            'material_cost': 0., 'listed_fittings_cost': 0., 'installation_cost': len(panels)*rate,
-            'total': len(panels)*rate,
-            'allowance': 'Once per installed physical X panel, including both diagonals; roof, side and end walls. SLS diaphragm equivalents excluded.'}
+            'material_cost': 0., 'listed_fittings_cost': 0., 'installation_cost': count*rate,
+            'total': count*rate,
+            'allowance': 'Once per installed physical X, including both diagonals (a two-tier side-wall bay is two X\'s); roof, side and end walls. SLS diaphragm equivalents excluded.'}
 
 
 def portal_brace_allowance_cost(result, rates):
@@ -559,8 +572,9 @@ def attach_design(result, selections, criteria, rates, context=None):
     movements = []
     for case in result["cases"]:
         # Global longitudinal sway only. Transverse SLS frame sway is reported
-        # separately against the main in-plane criterion and does not govern.
-        if case["case"]["level"] != "SLS" or case["case"].get("wind_family") == "transverse":
+        # separately against the main in-plane criterion and does not govern;
+        # crane cases have their own racking check (crane_racking below).
+        if case["case"]["level"] != "SLS" or case["case"].get("wind_family") in ("transverse", "crane"):
             continue
         for node, displacement in zip(result["nodes"], case["displacements_mm"]):
             height = node["point_mm"][2]
@@ -574,8 +588,13 @@ def attach_design(result, selections, criteria, rates, context=None):
     drift.update(divisor=sway_basis['divisor'],basis=sway_basis)
     play = slack_play_assessment(result, criteria.slack_play_limit_mm)
     stable = play['stable']
+    # Crane rail racking of the crane frame (bracing_analysis_desktop.crane_racking_summary).
+    crane = copy.deepcopy(result.get('crane_racking'))
+    if crane is not None:
+        crane['included_in_design'] = criteria.include_serviceability
+    crane_passes = crane is None or crane['passes']
     member_sls = [row for check in checks.values() for row in check['case_checks'] if row.get('level')=='SLS']
-    sls_pass = drift['passes'] and all(row['ratio'] is not None and row['ratio']<=1 for row in member_sls)
+    sls_pass = drift['passes'] and crane_passes and all(row['ratio'] is not None and row['ratio']<=1 for row in member_sls)
     from bracing_spacing import max_bay_spacing,spacing_assessment
     from bracing_layout import BracingLayout
     physical=(context or {}).get('layout')
@@ -583,13 +602,17 @@ def attach_design(result, selections, criteria, rates, context=None):
         physical=BracingLayout.from_dict(result['analysis_layout'])
     maximum=max_bay_spacing(context or {'source_preset':result.get('source_preset',{})})
     spacing=spacing_assessment(physical,maximum) if physical is not None else {'passes':True,'enforced':False}
-    passes = all(row["passes"] for row in checks.values()) and (not criteria.include_serviceability or drift["passes"]) and stable and spacing['passes']
+    passes = (all(row["passes"] for row in checks.values())
+              and (not criteria.include_serviceability or (drift["passes"] and crane_passes))
+              and stable and spacing['passes'])
     request = {"source_hash": result["source_hash"], "sections": {g: candidate_name(c) for g, c in selections.items()},
                "section_properties": {g: candidate_properties(c, criteria) for g, c in selections.items()},
                "net_fracture_multiplier": .85, "criteria": asdict(criteria),
                "cost_rates": {**rates, 'braced_panel_installation': installation['rate_per_panel']}}
     request['stressed_skin'] = result.get('stressed_skin', {}).get('settings', {})
     request['global_sls_basis'] = sway_basis
+    if result.get('crane_racking_basis'):
+        request['crane_racking_basis'] = {k: v for k, v in result['crane_racking_basis'].items() if k != 'basis'}
     request['max_braced_bay_spacing']=maximum
     if result.get('mullion_basis'):
         request['mullion_basis']=result['mullion_basis']
@@ -611,6 +634,7 @@ def attach_design(result, selections, criteria, rates, context=None):
                         'preliminary_brace_tension_checks': brace_screen,
                         "member_checks_pass": all(r["passes"] for r in checks.values()),
                         "global_sls": drift, "taut_tangent_verified": stable,
+                        'crane_racking': crane,
                         'slack_play': play['evidence'],
                         "estimated_cost": sum(row["total"] for row in costs), "cost_items": costs,
                         'materials_and_fittings_cost': materials_and_fittings,
@@ -666,8 +690,8 @@ def attach_design(result, selections, criteria, rates, context=None):
 
 
 def solve_selection(context, selections, criteria, rates, reuse_cases=None):
-    local = {**context, **{g: selections[g] for g in ("roof_brace", "wall_brace", "end_brace", "canopy_brace")
-                           + PORTAL_BRACE_GROUPS if g in selections}}
+    local = {**context, **{g: selections[g] for g in ("roof_brace", "wall_brace", "end_brace", "canopy_brace",
+                                                      "wall_tier_strut") + PORTAL_BRACE_GROUPS if g in selections}}
     result = analyse_context(local, selections["strut"], selections["end_post"], reuse_cases=reuse_cases)
     return attach_design(result, selections, criteria, rates, context)
 
@@ -978,8 +1002,13 @@ def auto_size(context, selections, candidates, criteria, rates, progress=None, m
             if best:
                 break
             raise stop_for_search(initial, result, 'Auto-sizing requires verified taut-rod tangent stiffness for every case; review the layout/neutral rods')
-        if not fast and criteria.include_serviceability and result["design"]["global_sls"]["ratio"] > 1:
-            factor = min(max(result["design"]["global_sls"]["ratio"], 1.12), 2.)
+        # Stiffen the braces for failing sway: longitudinal (full search only;
+        # the fast search uses targeted proposals above) and crane rail racking
+        # (both searches; the longitudinal stiffness screen doesn't cover it).
+        crane_ratio = (result["design"].get("crane_racking") or {}).get("ratio", 0.)
+        sway_ratio = max(crane_ratio, 0. if fast else result["design"]["global_sls"]["ratio"])
+        if criteria.include_serviceability and sway_ratio > 1:
+            factor = min(max(sway_ratio, 1.12), 2.)
             for group in groups:
                 if group != 'strut':
                     floors[group] = bounded_stiffness_floor(floors[group], candidate_stiffness(current[group]), factor, ceilings[group])

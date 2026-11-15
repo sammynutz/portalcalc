@@ -340,7 +340,8 @@ class ComponentWorkspaceTests(unittest.TestCase):
     def dialog(self, saved=None):
         from bracing_analysis_desktop import prepare_context
         from bracing_analysis_ui import BracingAnalysisDialog
-        return BracingAnalysisDialog(prepare_context(self.window), self.window.catalog, saved)
+        # Bare bracing: stressed skin off (an unsaved IL1 project now starts with it on).
+        return BracingAnalysisDialog({**prepare_context(self.window), 'stressed_skin': None}, self.window.catalog, saved)
 
     def test_grade300_apex_pair_defaults_manual_override_and_cladding_overlay(self):
         from bracing_analysis_desktop import prepare_context

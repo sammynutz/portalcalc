@@ -60,6 +60,31 @@ none. Any change to the main building itself (span, length, bay or end-wall
 stations, eave, pitch or roof shape) is handled as before: the original
 locations are kept and flagged for review.
 
+## Two-tier side-wall bays
+
+A side-wall bay is braced as two X's stacked one above the other when:
+
+- **Crane building**: every side-wall bay splits at the crane runway level
+  (`LayoutGeometry.wall_tier_z_mm`, the runway beam's mid depth). The runway beam
+  is the continuous strut between the X's, along the whole wall. It takes the
+  crane buffer and longitudinal forces to the braced bays without minor-axis
+  bending in the columns.
+- **Tall panel**, side wall or end wall: height / width > 1.73 (`WALL_TIER_ASPECT`,
+  a brace steeper than about 60°). Height is to the top chord node
+  (`tier_eave_mm`), not the cladding pitching point; an end-wall panel uses its
+  mean corner height. The panel splits at mid-height (end walls: half the mean
+  corner height, horizontal), with an SHS strut between the X's (the
+  `wall_tier_strut` design group). The analysis geometry receives the editor's
+  decisions as `tiered_panels`, so what the editor shows is what is analysed.
+
+It is still one panel ID (pin/block as before). `BracingPanel.brace_diagonals`
+gives the four installed diagonals; `diagonals` stays the full-height pair for
+cladding diaphragms. The runway level is not part of geometry equality, so a saved
+layout stays valid when the runway changes. In the 3D model the tier nodes sit on
+the columns/posts, held out of the wall's plane and vertically and free in it (a
+corner node shared by two walls is held only vertically). An end post with a tier
+node is checked for the more compressive of its parts above and below the node.
+
 ## Portal frame braces
 
 A portal frame brace is a UB moment frame in one side-wall bay: a UB column
@@ -280,7 +305,8 @@ substitutes for brace, collector/strut and post costs.
 **Installation per braced X panel** in Sections / criteria defaults to **$50**,
 is editable (including zero), and saves with the workspace/preset. Each physically
 installed roof, side-wall or end-wall X panel is charged once for its crossed
-pair. Slack diagonals remain installed; load cases do not multiply the allowance.
+pair; a two-tier side-wall bay is two X's. Slack diagonals remain installed;
+load cases do not multiply the allowance.
 Struts, posts, unselected panels and SLS diaphragm equivalents do not incur this
 charge. This is a flat installation allowance, not a complete installed quote.
 

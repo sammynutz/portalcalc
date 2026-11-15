@@ -9,10 +9,11 @@ import time
 
 import numpy as np
 
-from bracing_layout import BracingLayout, LayoutGeometry, brace_group, carry_over
+from bracing_layout import BracingLayout, LayoutGeometry, brace_group, carry_over, layout_panels
 from bracing_analysis import (AnalysisError, PortalReduction, build_braced_building,
                               solve_building_case)
 from bracing_restraint import OPTION as RESTRAINT_OPTION
+from bracing_diaphragm import default_settings as default_diaphragm_settings
 from wind import (CPI_CASE_OPTIONS, active_cpi_for_case, calculate_wind,
                   direction_bearing_degrees, area_reduction_factor,
                   leeward_wall_cpe, wind_pressure_scale)
@@ -252,6 +253,58 @@ def actual_canopies(structure, left, right, nominal):
     return result
 
 
+def crane_wall_tier_mm(window):
+    """Crane runway level (mid depth of the runway beam, mm), or None without a crane.
+
+    Crane side walls are braced as two X's split at this level, with the
+    runway beam as the continuous strut between them.
+    """
+    actions = getattr(window, 'crane_portal_actions', None)
+    if not actions or not getattr(window, 'serviceability_crane_active', False):
+        return None
+    level = actions.get('runway_mid_height_mm')
+    return round(float(level), 1) if level and level > 0 else None
+
+
+def crane_racking_setup(window, structure, geometry):
+    """The 3D crane racking set-up, or None without a crane (or interior frame).
+
+    The crane goes on the interior frame nearest the middle of the building,
+    with the 2D frame's crane actions (crane_beam.apply_crane_actions) at its
+    crane stub nodes; racking = mean rail UX against H/n (the 2D frame's
+    "Portal crane-rail racking" setting).
+    """
+    actions = getattr(window, 'crane_portal_actions', None)
+    if not actions or not getattr(window, 'serviceability_crane_active', False):
+        return None
+    node_ids = {side: (actions.get('nodes', {}).get(side) or {}).get('node_id') for side in ('left', 'right')}
+    nodes = {n.id: n for n in structure.nodes}
+    if any(node_id not in nodes for node_id in node_ids.values()):
+        return None
+    stations = list(geometry.bay_stations_mm)
+    interior = range(1, len(stations)-1)
+    if not interior:
+        return None
+    frame = min(interior, key=lambda i: (abs(stations[i]-geometry.length_mm/2), i))
+    from crane_beam import BUFFER_ULS_FACTOR
+    return {'portal_actions': copy.deepcopy(actions), 'node_ids': node_ids, 'frame_index': frame,
+            'buffer': {'force_kn': float(actions.get('buffer_kn', 0.) or 0.), 'uls_factor': BUFFER_ULS_FACTOR,
+                       'source': actions.get('buffer_source', 'rule'),
+                       'runway_level_mm': geometry.wall_tier_z_mm,
+                       'basis': ('Longitudinal buffer impact per rail (entered, else the rule 9 + 2.8 x capacity t '
+                                 '+ 1.33 x crane span m, an upper bound of supplier data) x '
+                                 f'{BUFFER_ULS_FACTOR:g} on both runways at once, at runway level; front and back '
+                                 'stops separately, with 1.2G.')},
+            'runway_area_mm2': float(actions.get('runway_area_mm2', 0.) or 0.),
+            'frame_y_mm': stations[frame],
+            'heights_mm': {side: nodes[node_id].y for side, node_id in node_ids.items()},
+            'divisor': float(window.serviceability_limit_value('crane_rail_height')),
+            'basis': ('Crane on the interior frame nearest the middle of the building, at its crane stub nodes, '
+                      'with the 2D frame crane actions. Racking = mean of the two rails\' UX, measured from the '
+                      'G-only shape (rails aligned under dead load), against H/n with H the mean rail height. '
+                      'Bare bracing network (no stressed-skin credit).')}
+
+
 def prepare_context(window, allow_unconfigured=False):
     nominal = window.current_bracing_layout_geometry()
     if window.bracing_location_layout is None and not allow_unconfigured:
@@ -284,7 +337,10 @@ def prepare_context(window, allow_unconfigured=False):
     g = LayoutGeometry.create(span, nominal.length_mm, left.y, nominal.pitch_deg, nominal.roof_shape,
                               bay_stations_mm=nominal.bay_stations_mm,
                               end_wall_stations_mm=[x*span/nominal.span_mm for x in nominal.end_wall_stations_mm],
-                              canopies=[{'side':side,'width_mm':width,'drop_mm':drop} for side,width,drop,_ in canopies])
+                              canopies=[{'side':side,'width_mm':width,'drop_mm':drop} for side,width,drop,_ in canopies],
+                              wall_tier_z_mm=crane_wall_tier_mm(window),
+                              # The editor's two-tier decisions, so the analysis braces what it shows.
+                              tiered_panels=[p.id for p in layout_panels(nominal) if p.tier == 'tall'])
     layout = BracingLayout(g, sorted(saved.all_blocked), sorted(saved.selection)) if saved.geometry == nominal else BracingLayout(g)
     # Remove legacy eave restraints in the private copy. Otherwise the 3D
     # network would inherit restraint credit from the system it is analysing.
@@ -302,8 +358,11 @@ def prepare_context(window, allow_unconfigured=False):
     spacing_limit=max_bay_spacing({'source_preset':source})
     cases = end_wind_cases(wind_inputs,source['finishes']['roof_profile'])
     from bracing_roof_loads import building_roof_cases
+    crane = crane_racking_setup(window, structure, g)
     cases, roof_load_basis = building_roof_cases(cases,portal,g,wind_inputs,source,
-                                                window.snow_loads_from_ui()['service_kpa'])
+                                                window.snow_loads_from_ui()['service_kpa'], crane=crane)
+    crane_basis = None if crane is None else {key: copy.deepcopy(value) for key, value in crane.items()
+                                              if key != 'portal_actions'}
     profile = (window.end_wall_mullion_design or {}).get("selected") or {}
     main_mullions = window.end_wall_mullion_design or {}
     governing = main_mullions.get('governing_mullion') or {}
@@ -430,6 +489,16 @@ def prepare_context(window, allow_unconfigured=False):
         'global_sls_basis':{'divisor':window.eave_deflection_divisor(),
             'importance_level':wind_inputs.importance_level,
             'source':'Main in-plane eave sway criterion; project default IL1 H/80, IL2+ H/150; main overrides retained'},
+        # Crane rail racking (3D): None without a crane. See crane_racking_setup.
+        'crane_racking_basis': crane_basis,
+        # Crane walls: the runway beam is the continuous wall strut at runway level.
+        'crane_runway_area_mm2': (float((window.crane_portal_actions or {}).get('runway_area_mm2', 0.) or 0.)
+                                  if g.wall_tier_z_mm is not None else None),
+        'crane_runway_section': ((window.crane_portal_actions or {}).get('runway_section')
+                                 if g.wall_tier_z_mm is not None else None),
+        # Tall side-wall bays: two X's with a mid-height SHS strut (its own design group).
+        **({'wall_tier_strut': default_wall_tier_strut(window)}
+           if any(panel.tier == 'tall' for panel in layout.panels.values()) else {}),
         'mullion_basis':mullion_basis,
         "front_clad": wind_inputs.front_wall_clad, "back_clad": wind_inputs.back_wall_clad,
         'face_cladding': {'left_wall': wind_inputs.left_wall_clad, 'right_wall': wind_inputs.right_wall_clad,
@@ -445,9 +514,21 @@ def prepare_context(window, allow_unconfigured=False):
         # The 2D portal's credited restraint: 3D sizing keeps at least its brace stiffness.
         'adopted_restraint': (copy.deepcopy(getattr(window, 'bracing_3d_restraint', None))
                               if window.eave_x_restraint_combo.currentText() == RESTRAINT_OPTION else None),
-        'stressed_skin': copy.deepcopy((window.bracing_3d_settings or {}).get('stressed_skin')),
+        # Saved choice wins; an unsaved project defaults by importance level (IL1 on, IL2+ off).
+        'stressed_skin': copy.deepcopy((window.bracing_3d_settings or {}).get('stressed_skin')
+                                       or default_diaphragm_settings(window.importance_combo.currentText())),
         "purlin_strut_tables": strut_table_snapshot(window.metroll_tables or {}),
     }
+
+
+def default_wall_tier_strut(window):
+    """Mid-height wall strut section: the saved workspace choice, else a light SHS."""
+    profiles = sorted(window.catalog.shs_profiles(), key=lambda p: (p.A, p.name))
+    if not profiles:
+        raise AnalysisError('No SHS sections are available for the mid-height wall struts of tall side-wall bays')
+    name = (window.bracing_3d_settings or {}).get('wall_tier_strut_section')
+    saved = next((p for p in profiles if p.name == name), None)
+    return saved or min(profiles, key=lambda p: (abs(p.A-500.), p.name))
 
 
 DEFAULT_PORTAL_BRACE_SECTIONS = {'portal_brace_column': '310 UB 40.4', 'portal_brace_beam': '250 UB 31.4'}
@@ -482,7 +563,7 @@ LIMITATIONS = [
     "Fixed pinned-panel layout; unmarked available panels are not installed braces. No automatic layout or section optimisation.",
     "First-order small-displacement elastic analysis, with tension-only rod slackening; no P-delta, buckling, prestress or connection slip.",
     "If zero-force rods are needed for the elastic tangent, equilibrium is reported with stability unverified. A positive taut-rod tangent is not a buckling or code stability check.",
-    "ULS/SLS gravity and longitudinal wind combinations include G (solar/fire/HVAC/other and actual portal self-weight), Q/snow, simultaneous end-wall pressures, external roof friction and normal roof/clad side-wall pressures. Side winds include both directions, roof alternatives, internal pressure and end-wall suction: ULS with 0.9G/1.2G and SLS as Ws and G + Ws on the bare network. Transverse SLS frame sway is reported only and does not govern 3D sizing. Crane/storage actions and wall/underside/exposed-member drag remain outside scope.",
+    "ULS/SLS gravity and longitudinal wind combinations include G (solar/fire/HVAC/other and actual portal self-weight), Q/snow, simultaneous end-wall pressures, external roof friction and normal roof/clad side-wall pressures. Side winds include both directions, roof alternatives, internal pressure and end-wall suction: ULS with 0.9G/1.2G and SLS as Ws and G + Ws on the bare network. Transverse SLS frame sway is reported only and does not govern 3D sizing. With a crane, the 2D frame's crane actions load the interior frame nearest the middle: SLS G + Crane and G + 0.7Q + Crane check crane rail racking (from the G-only shape, bare network, H/n), and ULS 1.2G + 1.5Q + Crane enters the member envelopes. Storage actions and wall/underside/exposed-member drag remain outside scope.",
     "Normal roof/side-wall loads act through full portal load condensation/recovery. Roof load tributaries use simply supported bay reactions with half tributaries at end frames; purlin continuity redistribution is excluded. Local Table 5.6 patches remain purlin bending checks only.",
     "Roof friction uses the projected external-roof portion of clause 5.5/Table 5.9, with sheeting running down-slope. For open-sided buildings this is a preliminary extension of the enclosed-building method, not a complete open-roof aerodynamic assessment.",
     "End-wall pressure uses simply supported vertical strips: half of each strip resultant goes to roof and half directly to ground. Open ends receive no cladding pressure.",
@@ -498,6 +579,57 @@ LIMITATIONS = [
 def transverse_sls(case):
     """Side-wind serviceability case: reported frame sway, not 3D acceptance."""
     return case.get('level') == 'SLS' and case.get('wind_family') == 'transverse'
+
+
+def crane_case_3d(case):
+    """A crane case: the crane loads one frame (bracing_roof_loads.crane_cases)."""
+    return case.get('wind_family') == 'crane'
+
+
+def crane_racking_summary(portal, cases, basis):
+    """Crane rail racking of the crane frame in 3D, against H/n. None without a crane.
+
+    Racking is the mean of the two crane rails' UX, measured from the
+    "SLS / G" shape (the rails are aligned under dead load), for every SLS
+    crane case. The frame-alone value solves the same crane (and 0.7Q) loads
+    on that portal without the 3D network, for comparison with 2D.
+    """
+    if not basis:
+        return None
+    frame, ids = basis['frame_index'], basis['node_ids']
+    selected = [c for c in cases if crane_case_3d(c['case']) and c['case']['level'] == 'SLS']
+    baseline = next((c for c in cases if c['case']['name'] == 'SLS / G'), None)
+    if not selected or baseline is None:
+        return None
+    structure = portal.structure
+    nodes = {n.id: n for n in structure.nodes}
+    free = portal.free
+    kff = portal.k[np.ix_(free, free)]
+
+    def rails(solved):
+        moved = {n['node']: n['ux_mm'] for n in solved['portals'][frame]['node_displacements']}
+        return moved[ids['left']], moved[ids['right']]
+
+    base = rails(baseline)
+    base_loads = np.asarray(baseline['case']['portal_loads'][frame]['loads_n'])
+    height = .5*(basis['heights_mm']['left']+basis['heights_mm']['right'])
+    limit = height/basis['divisor']
+    rows = []
+    for solved in selected:
+        ux = rails(solved)
+        left, right = ux[0]-base[0], ux[1]-base[1]
+        racking = .5*(left+right)
+        alone = np.zeros(len(base_loads))
+        alone[free] = np.linalg.solve(kff, (np.asarray(solved['case']['portal_loads'][frame]['loads_n'])-base_loads)[free])
+        alone_racking = .5*(alone[nodes[ids['left']].ux]+alone[nodes[ids['right']].ux])
+        rows.append({'case': solved['case']['name'], 'left_mm': left, 'right_mm': right, 'racking_mm': racking,
+                     'frame_alone_mm': alone_racking, 'limit_mm': limit,
+                     'ratio': abs(racking)/limit if limit > 1e-9 else float('inf')})
+    governing = max(rows, key=lambda row: row['ratio'])
+    return {'passes': governing['ratio'] <= 1., 'status': 'OK' if governing['ratio'] <= 1. else 'NOT OK',
+            'frame': frame, 'frame_y_mm': basis['frame_y_mm'], 'divisor': basis['divisor'],
+            'height_mm': height, 'limit_mm': limit, 'ratio': governing['ratio'],
+            'governing': governing, 'rows': rows, 'basis': basis['basis']}
 
 
 def portal_eave_nodes(structure):
@@ -689,7 +821,9 @@ def prepare_analysis_models(context, strut_profile, end_post_profile):
         brace_moduli=moduli,
         canopy_brace_area_mm2=(context.get("canopy_brace") or {}).get("area_mm2"),
         portal_brace_sections={'column': context.get('portal_brace_column'), 'beam': context.get('portal_brace_beam')}
-        if layout.portal_braces else None)
+        if layout.portal_braces else None,
+        wall_tier_strut_area_mm2=getattr(context.get('wall_tier_strut'), 'A', None),
+        runway_area_mm2=context.get('crane_runway_area_mm2'))
     from bracing_diaphragm import DiaphragmSettings, stressed_skin_model, align_fixed_nodes, recover_diaphragm
     diaphragm_settings = DiaphragmSettings.from_dict(context.get('stressed_skin'))
     diaphragm = {'settings': vars(diaphragm_settings), 'active':diaphragm_settings.active}
@@ -724,8 +858,8 @@ def analyse_context(context, strut_profile, end_post_profile, reuse_cases=None):
             continue
         try:
             solved = solve_building_case(model, layout, portal, portal_dofs, point_nodes, case, member_forces)
-            # Transverse SLS uses the bare network: no diaphragm sway credit.
-            if diaphragm['active'] and case['level'] == 'SLS' and not transverse_sls(case):
+            # Transverse SLS and crane racking use the bare network: no diaphragm sway credit.
+            if diaphragm['active'] and case['level'] == 'SLS' and not transverse_sls(case) and not crane_case_3d(case):
                 enhanced = solve_building_case(sls_model, layout, portal, portal_dofs, point_nodes, case, member_forces)
                 solved = recover_diaphragm(enhanced, diaphragm['panels'], len(model.members), solved)
             cases.append(solved)
@@ -743,6 +877,7 @@ def analyse_context(context, strut_profile, end_post_profile, reuse_cases=None):
     roof_nodes = {n for row in roof_grid for n in row}
     sls = [(float(np.linalg.norm(displacement)), case["case"]["name"], i, displacement)
            for case in cases if case["case"]["level"] == "SLS" and not transverse_sls(case["case"])
+           and not crane_case_3d(case["case"])
            for i, displacement in enumerate(case["displacements_mm"]) if i in roof_nodes]
     governing = max(sls, key=lambda item: item[0])
     if diaphragm['active']:
@@ -772,6 +907,15 @@ def analyse_context(context, strut_profile, end_post_profile, reuse_cases=None):
                      "end_post": {"section": end_post_profile.name, "area_mm2": end_post_profile.A},
                      **{kind: context[kind] for kind in ("roof_brace", "wall_brace", "end_brace")},
                      **({"canopy_brace": context["canopy_brace"]} if context.get("canopy_brace") else {}),
+                     **({"wall_tier_strut": {"section": context["wall_tier_strut"].name,
+                                             "area_mm2": context["wall_tier_strut"].A}}
+                        if context.get("wall_tier_strut") is not None else {}),
+                     **({"crane_runway": {"section": context.get("crane_runway_section"),
+                                          "area_mm2": context.get("crane_runway_area_mm2"),
+                                          "level_mm": layout.geometry.wall_tier_z_mm,
+                                          "basis": "Runway beam as the continuous side-wall strut at runway level; "
+                                                   "axial stiffness only, its strength is checked in the crane beam calculation."}}
+                        if layout.geometry.wall_tier_z_mm is not None else {}),
                      **({group: portal_brace_section_record(context[group]) for group in PORTAL_BRACE_GROUPS}
                         if layout.portal_braces else {})},
         **({'portal_brace_envelopes': portal_brace_envelopes} if portal_brace_envelopes else {}),
@@ -783,6 +927,8 @@ def analyse_context(context, strut_profile, end_post_profile, reuse_cases=None):
                                        "node": governing[2], "components_mm": governing[3]},
         'transverse_sls': transverse_sls_summary(portal, cases, context.get('global_sls_basis')),
         'frame_restraint': frame_restraint_summary(portal, cases),
+        'crane_racking_basis': copy.deepcopy(context.get('crane_racking_basis')),
+        'crane_racking': crane_racking_summary(portal, cases, context.get('crane_racking_basis')),
         "limitations": ([line.replace('No diaphragm or sheeting stiffness.',
                          'Enabled roof/wall diaphragm stiffness is included in SLS only.') for line in LIMITATIONS]
                         + [diaphragm['basis']] if diaphragm['active'] else list(LIMITATIONS))
@@ -875,6 +1021,19 @@ def text_report(result):
                          f"{row.get('portal_alone_mm', 0):.3f} | {'-' if k is None else f'{k:.4f}'} | "
                          f"{'-' if span is None else f'{span[0]:.4f} to {span[1]:.4f}'} | "
                          f"{frame['max_g_plus_ws_mm']:.3f} | {row.get('case', '-')}")
+        lines.append('')
+    crane = result.get('crane_racking')
+    if crane:
+        governing = crane['governing']
+        lines += ['CRANE RAIL RACKING (3D)', crane['basis'],
+                  f"Crane frame {crane['frame']+1} (Y {crane['frame_y_mm']/1000:g} m); mean rail height "
+                  f"{crane['height_mm']:.0f} mm; limit H/{crane['divisor']:g} = {crane['limit_mm']:.2f} mm.",
+                  f"Governing: {abs(governing['racking_mm']):.3f} mm, ratio {crane['ratio']:.3f} {crane['status']} "
+                  f"({governing['case']}); the frame alone: {abs(governing['frame_alone_mm']):.3f} mm.",
+                  'Case | left rail mm | right rail mm | racking mm | frame alone mm | ratio']
+        for row in crane['rows']:
+            lines.append(f"{row['case']} | {row['left_mm']:.3f} | {row['right_mm']:.3f} | {row['racking_mm']:.3f} | "
+                         f"{row['frame_alone_mm']:.3f} | {row['ratio']:.3f}")
         lines.append('')
     restraint = result.get('frame_restraint')
     if restraint:

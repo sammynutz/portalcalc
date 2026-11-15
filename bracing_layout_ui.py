@@ -180,7 +180,11 @@ class BracingLayoutCanvas(QWidget):
             if active and (blocked or pinned) and (self.result is None or self.result_mode == "layout"):
                 painter.setPen(QPen(QColor("#b63232" if blocked else "#128265"), 2.2,
                                    Qt.DashLine if blocked else Qt.SolidLine))
-                for a, b in panel.diagonals:
+                for a, b in panel.brace_diagonals:
+                    painter.drawLine(project(a)[0], project(b)[0])
+                if pinned and not blocked and panel.tier_points:
+                    # Two-tier wall bay: the tier strut (or crane runway beam).
+                    a, b = panel.tier_points
                     painter.drawLine(project(a)[0], project(b)[0])
             if panel.id == self.selected:
                 painter.setBrush(Qt.NoBrush)

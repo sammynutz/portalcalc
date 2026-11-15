@@ -201,6 +201,13 @@ class BracingAnalysisDialog(QDialog):
         self.max_braced_bay_spacing.setEnabled(not read_only)
         self.max_braced_bay_spacing.setToolTip('Project load-path rule: a complete roof-braced bay with aligned side-wall bracing in every N consecutive bays. Default 5; continuous narrow eave strips alone do not count. Find layout adds intermediate bays around blocked panels; fixed-layout checks also report this limit.')
         form.addRow('Maximum braced-bay spacing',self.max_braced_bay_spacing)
+        self.try_portal_braces = QCheckBox('Try portal frame braces in Optimise frame + bracing')
+        self.try_portal_braces.setChecked(search_settings.get('try_portal_braces') is True)
+        self.try_portal_braces.setEnabled(not read_only)
+        self.try_portal_braces.setToolTip('Off by default: portal frame braces have not been cheaper than roof bracing. '
+                                          'When on, the optimiser also tries them on a side wall whose end bays cannot take '
+                                          'X bracing. Portal braces pinned in the layout editor are always kept and checked.')
+        form.addRow('', self.try_portal_braces)
         if context.get('mullion_basis'):
             note=QLabel(f"Main mullion: {context.get('default_end_post')}. Uses the same wind envelope, properties and flybrace basis, plus bracing axial force. A checked adopted section updates main results/costing on Save and close. Main strength/deflection prerequisites apply in either bracing mode.")
             note.setWordWrap(True);inputs.addWidget(note)
@@ -240,6 +247,17 @@ class BracingAnalysisDialog(QDialog):
                              'portal columns, UB beam moment-connected across the top, pinned bases).')
             self.portal_combos[group] = combo
             form.addRow(label, combo)
+        # Tall side-wall bays (height/bay > 1.73): two X's with a mid-height SHS strut.
+        self.wall_tier_profiles = sorted(catalog.shs_profiles(), key=lambda p: (p.A, p.name))
+        self.wall_tier_combo = None
+        if context.get('wall_tier_strut') is not None:
+            self.wall_tier_combo = QComboBox()
+            self.populate(self.wall_tier_combo, self.wall_tier_profiles,
+                          saved.get('wall_tier_strut_section') or context['wall_tier_strut'].name, 500)
+            self.wall_tier_combo.setToolTip('Side-wall bays taller than 1.73 x their length (brace steeper than about 60 degrees) '
+                                            'are braced as two X\'s with an SHS strut between them at mid-height. '
+                                            'Checked for axial force plus self-weight bending, sized and costed.')
+            form.addRow('Side-wall mid-height struts (SHS)', self.wall_tier_combo)
         inputs.addLayout(form)
         group = QGroupBox("Section-check assumptions")
         grid = QGridLayout(group)
@@ -321,7 +339,8 @@ class BracingAnalysisDialog(QDialog):
         diaphragm_group = QGroupBox('SLS stressed-skin roof and wall contribution')
         diaphragm_form = QFormLayout(diaphragm_group)
         try:
-            diaphragm_saved = DiaphragmSettings.from_dict(saved.get('stressed_skin'))
+            # Unsaved workspace: the context carries the importance-level default.
+            diaphragm_saved = DiaphragmSettings.from_dict(saved.get('stressed_skin') or context.get('stressed_skin'))
         except AnalysisError:
             diaphragm_saved = DiaphragmSettings()
         self.diaphragm_calibration_mode = QComboBox()
@@ -510,7 +529,7 @@ class BracingAnalysisDialog(QDialog):
         self.component_editor.changed.connect(self.invalidate)
         self.panel_installation_input.valueChanged.connect(self.invalidate)
         self.portal_allowance_input.valueChanged.connect(self.invalidate)
-        for combo in self.portal_combos.values():
+        for combo in [*self.portal_combos.values(), *([self.wall_tier_combo] if self.wall_tier_combo else [])]:
             combo.setEnabled(not read_only)
             combo.currentIndexChanged.connect(self.invalidate)
         self.max_braced_bay_spacing.valueChanged.connect(self.invalidate)
@@ -596,13 +615,15 @@ class BracingAnalysisDialog(QDialog):
                 "end_post_section": self.post_combo.currentData(),
                 **{f"{g}_label": (c.currentData() or {}).get("label") for g, c in self.brace_combos.items()},
                 **{f"{g}_section": c.currentData() for g, c in self.portal_combos.items()},
+                **({'wall_tier_strut_section': self.wall_tier_combo.currentData()} if self.wall_tier_combo else {}),
                 'portal_brace_allowance': self.portal_allowance_input.value(),
                 "criteria": asdict(self.criteria()),
                 'installation_cost_per_panel': self.panel_installation_input.value(),
                 'layout_search': {'keep_selected': self.keep_current_panels.isChecked(),
                                   'max_trials': self.layout_trial_budget.value(),
                                   'max_braced_bay_spacing':self.max_braced_bay_spacing.value(),
-                                  'strategy': self.layout_strategy.currentData()},
+                                  'strategy': self.layout_strategy.currentData(),
+                                  'try_portal_braces': self.try_portal_braces.isChecked()},
                 'stressed_skin': asdict(DiaphragmSettings(self.stressed_skin_check.isChecked(),
                     self.diaphragm_flexibility.value(), self.diaphragm_direction.currentData(),
                     self.side_wall_check.isChecked(),self.side_wall_flexibility.value(),
@@ -622,12 +643,20 @@ class BracingAnalysisDialog(QDialog):
         return (all(c.currentData() in self.catalog.profile_by_name for c in (self.strut_combo, self.post_combo))
                 and all(c.currentData() is not None for c in self.brace_combos.values())
                 and (not self.layout_editor.model.portal_braces
-                     or all(c.currentData() in self.catalog.profile_by_name for c in self.portal_combos.values())))
+                     or all(c.currentData() in self.catalog.profile_by_name for c in self.portal_combos.values()))
+                and (self.wall_tier_combo is None or self.wall_tier_combo.currentData() in self.catalog.profile_by_name))
 
     def portal_selections(self):
         """The portal brace column/beam candidates selected in the combos."""
         by_name = {candidate.name: candidate for candidate in self.portal_profiles}
         return {g: by_name.get(c.currentData()) for g, c in self.portal_combos.items()}
+
+    def wall_tier_selection(self):
+        """{'wall_tier_strut': profile} for a building with tall side-wall bays, else {}."""
+        if self.wall_tier_combo is None:
+            return {}
+        profile = self.catalog.profile_by_name.get(self.wall_tier_combo.currentData())
+        return {'wall_tier_strut': profile} if profile is not None else {}
 
     def selections(self, context=None):
         fallback = self.catalog.profile_by_name[self.strut_combo.currentData()]
@@ -639,7 +668,8 @@ class BracingAnalysisDialog(QDialog):
         return {"strut": strut,
                 "end_post": self.catalog.profile_by_name[self.post_combo.currentData()],
                 **{g: wires.get((c.currentData() or {}).get("label"), c.currentData()) for g, c in self.brace_combos.items()},
-                **{g: c for g, c in portal.items() if c is not None}}
+                **{g: c for g, c in portal.items() if c is not None},
+                **self.wall_tier_selection()}
 
     def current_context(self, require_selected=True):
         editor = self.layout_editor
@@ -656,6 +686,7 @@ class BracingAnalysisDialog(QDialog):
                 'cost_rates': {**self.context['cost_rates'], 'braced_panel_installation': self.panel_installation_input.value(),
                                'portal_brace_allowance': self.portal_allowance_input.value()},
                 **{g: c for g, c in self.portal_selections().items() if c is not None},
+                **self.wall_tier_selection(),
                 'stressed_skin': self.snapshot()['stressed_skin'],
                 'brace_policy': self.component_editor.snapshot()['brace_policy'],
                 "source_hash": hashlib.sha256(json.dumps(source, sort_keys=True, allow_nan=False).encode()).hexdigest()}
@@ -736,8 +767,8 @@ class BracingAnalysisDialog(QDialog):
         for group, combo in self.brace_combos.items():
             with QSignalBlocker(combo):
                 combo.setCurrentIndex(combo.findText(candidate_name(chosen[group])))
-        for group, combo in self.portal_combos.items():
-            if group in chosen:
+        for group, combo in [*self.portal_combos.items(), ('wall_tier_strut', self.wall_tier_combo)]:
+            if combo is not None and group in chosen:
                 with QSignalBlocker(combo):
                     combo.setCurrentIndex(combo.findData(candidate_name(chosen[group])))
 
@@ -760,7 +791,8 @@ class BracingAnalysisDialog(QDialog):
                 if progress.wasCanceled():
                     raise LayoutSearchCancelled('Layout search cancelled; layout and sections are unchanged')
             candidates = floor_candidates({'strut': self.strut_profiles, 'end_post': self.post_profiles,
-                          **{g: self.component_editor.brace_candidates() for g in self.brace_combos}},
+                          **{g: self.component_editor.brace_candidates() for g in self.brace_combos},
+                          **({'wall_tier_strut': list(self.wall_tier_profiles)} if self.wall_tier_combo else {})},
                           context.get('adopted_restraint'))
             required = set(context['layout'].pinned) if self.keep_current_panels.isChecked() else set()
             result, chosen, selected = find_layout(context, self.selections(context), candidates,
@@ -814,7 +846,8 @@ class BracingAnalysisDialog(QDialog):
                         raise AnalysisError("Sizing cancelled; sections are unchanged")
                 # Keep at least the brace stiffness the 2D portal was credited with.
                 candidates = floor_candidates({"strut": self.strut_profiles, "end_post": self.post_profiles,
-                              **{g: self.component_editor.brace_candidates() for g in self.brace_combos}},
+                              **{g: self.component_editor.brace_candidates() for g in self.brace_combos},
+                          **({'wall_tier_strut': list(self.wall_tier_profiles)} if self.wall_tier_combo else {})},
                               context.get('adopted_restraint'))
                 result, chosen = auto_size(context, self.selections(), candidates, self.criteria(), context["cost_rates"], update, fast=True)
                 self.adopt_sections(chosen)

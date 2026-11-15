@@ -38,12 +38,26 @@ class LoadCombination:
         return not self.is_serviceability
 
 
+# Crane cases: "<crab side>:<lateral direction>". The crab side's column takes
+# the Pmax wheel reaction and the other the Pmin reaction; the lateral wheel
+# forces act the same way on both columns (main.py apply_crane_load).
+CRANE_CASES = (
+    ("Crane Left, H +X", "left:+x"),
+    ("Crane Left, H -X", "left:-x"),
+    ("Crane Right, H +X", "right:+x"),
+    ("Crane Right, H -X", "right:-x"),
+)
+
+
+from crane_beam import crane_case  # noqa: E402  (shared with the 3D bracing model)
+
+
 def build_load_combinations(cpe_cases, cpi_cases) -> List[LoadCombination]:
     """Return strength and serviceability combinations."""
     combinations = [
         LoadCombination("1.2G + 1.5Q", g_factor=1.2, q_factor=1.5),
-        LoadCombination("1.2G + 1.5Q + Crane Left", g_factor=1.2, q_factor=1.5, crane_position="left"),
-        LoadCombination("1.2G + 1.5Q + Crane Right", g_factor=1.2, q_factor=1.5, crane_position="right"),
+        *[LoadCombination(f"1.2G + 1.5Q + {label}", g_factor=1.2, q_factor=1.5, crane_position=position)
+          for label, position in CRANE_CASES],
         LoadCombination("1.35G", g_factor=1.35),
     ]
     for prefix, g_factor in [("1.2G + Wu", 1.2), ("0.9G + Wu", 0.9)]:
@@ -64,8 +78,13 @@ def build_load_combinations(cpe_cases, cpi_cases) -> List[LoadCombination]:
             LoadCombination("SLS: G", g_factor=1.0, serviceability_component="G"),
             LoadCombination("SLS: Q", g_factor=0.0, q_factor=1.0, serviceability_component="Q"),
             LoadCombination("SLS: G + Q", g_factor=1.0, q_factor=1.0),
-            LoadCombination("SLS: G + Q + Crane Left", g_factor=1.0, q_factor=1.0, crane_position="left"),
-            LoadCombination("SLS: G + Q + Crane Right", g_factor=1.0, q_factor=1.0, crane_position="right"),
+            # Crane rail movement (gauge change, racking) is measured from the
+            # rails as aligned under dead load: crane live loads only, alone and
+            # with 0.7 of the roof live load. No G (roof, self weight, runway).
+            *[LoadCombination(f"SLS: {label}", g_factor=0.0, q_factor=0.0, crane_position=position)
+              for label, position in CRANE_CASES],
+            *[LoadCombination(f"SLS: 0.7Q + {label}", g_factor=0.0, q_factor=0.7, crane_position=position)
+              for label, position in CRANE_CASES],
         ]
     )
     for cpe_case in cpe_cases:

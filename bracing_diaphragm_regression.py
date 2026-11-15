@@ -539,6 +539,16 @@ class DiaphragmWorkspaceTests(unittest.TestCase):
             try:
                 w.bracing_location_layout=fixed_layout(w.current_bracing_layout_geometry()).to_dict()
                 w.generate_and_solve();context=prepare_context(w)
+                # Factory project is IL1: unsaved, stressed skin starts on (roof and walls).
+                self.assertEqual(w.importance_combo.currentText(),'1')
+                self.assertTrue(context['stressed_skin']['enabled'] and context['stressed_skin']['side_walls_enabled'])
+                fresh=BracingAnalysisDialog(context,w.catalog,{'mixed_struts':False})
+                try:self.assertTrue(fresh.stressed_skin_check.isChecked() and fresh.side_wall_check.isChecked())
+                finally:fresh.reject()
+                w.importance_combo.setCurrentText('2')
+                try:self.assertFalse(prepare_context(w)['stressed_skin']['enabled'])
+                finally:w.importance_combo.setCurrentText('1')
+                context={**context,'stressed_skin':None}    # this test starts from stressed skin off
                 d=BracingAnalysisDialog(context,w.catalog,{'mixed_struts':False})
                 try:
                     self.assertFalse(d.side_wall_check.isChecked());self.assertFalse(d.end_wall_check.isChecked())
@@ -597,7 +607,7 @@ class DiaphragmWorkspaceTests(unittest.TestCase):
             w=MainWindow();w.confirm_on_close=False
             try:
                 w.bracing_location_layout=fixed_layout(w.current_bracing_layout_geometry()).to_dict()
-                w.generate_and_solve();context=prepare_context(w)
+                w.generate_and_solve();context={**prepare_context(w),'stressed_skin':None}   # start from off
                 d=BracingAnalysisDialog(context,w.catalog,{'mixed_struts':False})
                 try:
                     self.assertFalse(d.stressed_skin_check.isChecked())

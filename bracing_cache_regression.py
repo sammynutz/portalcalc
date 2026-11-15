@@ -35,7 +35,8 @@ class SavedCalculationTests(unittest.TestCase):
         w=self.window
         w.apply_preset_data(copy.deepcopy(self.defaults))
         w.bracing_location_layout=fixed_layout(w.current_bracing_layout_geometry()).to_dict()
-        w.bracing_3d_settings={'mixed_struts':False}
+        # Saved with stressed skin off (an unsaved IL1 project now starts with it on).
+        w.bracing_3d_settings={'mixed_struts':False,'stressed_skin':{'enabled':False,'calibration_mode':'rev_b_geometry'}}
         w.generate_and_solve()
 
     def dialog(self,settings=None,cache=None,context=None):

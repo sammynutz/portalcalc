@@ -1080,10 +1080,14 @@ def build_screen_from_portalcalc(app) -> tuple[ReducedElasticScreen, dict, dict]
         height = float(item.get("height_mm") or app.serviceability_height_mm or 0.0)
         add(f"{group} top sway", item, node_response(item.get("node"), "ux"), height / divisor)
 
-    item = envelope.get("sls_crane_rail_deflection") or {}
-    height = float(item.get("height_mm") or 0.0)
-    divisor = float(app.serviceability_limit_value("crane_rail_height"))
-    add("Crane rail sway", item, node_response(item.get("node"), "ux"), height / divisor)
+    # Crane rails: racking is a 3D check (report only in 2D); the change in
+    # rail gauge (right minus left rail UX) is a 2D constraint.
+    item = envelope.get("sls_crane_gauge_change") or {}
+    rail_nodes = str(item.get("node") or "").split("/")
+    if len(rail_nodes) == 2:
+        left_rail, right_rail = node_response(rail_nodes[0], "ux"), node_response(rail_nodes[1], "ux")
+        if left_rail is not None and right_rail is not None:
+            add("Crane rail gauge change", item, right_rail - left_rail, float(item.get("limit_mm") or 0.0))
 
     divisor = float(app.column_deflection_divisor())
     for group, item in (envelope.get("sls_column_midspan_ws_deflections") or {}).items():

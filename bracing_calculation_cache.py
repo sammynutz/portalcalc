@@ -22,7 +22,7 @@ def encoded(value):
 def engine_revision():
     # Source builds can change without a release/version increment. In packaged
     # builds the explicit revision also invalidates caches when the engine changes.
-    digest = hashlib.sha256(b'bracing-cache-engine-2026-11-03-v24-transverse-sls')
+    digest = hashlib.sha256(b'bracing-cache-engine-2026-11-14-v27-end-wall-tiers')
     digest.update(APP_VERSION.encode())
     digest.update(np.__version__.encode())
     folder = Path(__file__).parent
@@ -31,7 +31,8 @@ def engine_revision():
              'bracing_schedule.py','bracing_layout.py','bracing_layout_search.py','bracing_calculation_cache.py','bracing_diaphragm.py',
              'purlin_combined.py','purlin_beam.py','purlin_beam_design.py',
              'purlin_shared_design.py','purlin_strut_tables.py','purlin_end_local.py','member_checks.py',
-             'bracing_sizing_diagnostics.py','bracing_mullion_design.py','end_wall.py','costing.py','loads.py','wind.py','main.py')
+             'bracing_sizing_diagnostics.py','bracing_mullion_design.py','end_wall.py','costing.py','loads.py','wind.py','main.py',
+             'crane_beam.py')
     for name in names:
         path = folder/name
         if path.is_file():
@@ -60,6 +61,9 @@ def fingerprint(context, settings, selections, criteria):
             'installed_purlins':context.get('installed_purlins'),
             'mullion_basis':context.get('mullion_basis'),
             'global_sls_basis':context.get('global_sls_basis'),
+            # Display overrides are dropped above, so the crane H/n must be captured here.
+            'crane_racking_basis':context.get('crane_racking_basis'),
+            'crane_runway_area_mm2':context.get('crane_runway_area_mm2'),
             'stressed_skin':context.get('stressed_skin'),
             'max_braced_bay_spacing':max_bay_spacing(context),
             'table_sha256':context.get('purlin_strut_tables',{}).get('sha256'),

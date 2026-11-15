@@ -4,8 +4,13 @@ No stiffness or capacity is inferred here. BOLT can supply the same versioned
 payload as the desktop editor. Available locations are the complement of the
 blocked set; pinned braces are additional user requirements, not design checks.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
+
+# Side-wall bays taller than this height/bay ratio (brace steeper than about
+# 60 degrees) get two X's stacked with a mid-height wall strut.
+WALL_TIER_ASPECT = 1.73
+TIER_NOTES = {"crane": ", two X's split at the crane runway", "tall": ", two X's with a mid-height strut"}
 
 
 SCHEMA = "portalcalc.bracing-layout.v1"
@@ -119,10 +124,23 @@ class LayoutGeometry:
     bay_stations_mm: tuple
     end_wall_stations_mm: tuple
     canopies: tuple = ()
+    # Crane buildings: crane-runway level on both side walls (mm). Side-wall
+    # bracing is two X's split at this level, with the runway beam as the
+    # continuous strut. Not part of equality: a saved layout stays valid when
+    # the runway level changes.
+    wall_tier_z_mm: object = field(default=None, compare=False)
+    # Tall-panel rule basis: the top chord node height at the eave (mm) when it
+    # differs from ``eave_mm`` (the editor's eave is the cladding pitching
+    # point; the braces run to the node). None uses ``eave_mm``.
+    tier_eave_mm: object = field(default=None, compare=False)
+    # Explicit set of two-tier ('tall') panel IDs, overriding the rule. The
+    # analysis copies the editor's decisions so both show the same bracing.
+    tiered_panels: object = field(default=None, compare=False)
 
     @classmethod
     def create(cls, span_mm, length_mm, eave_mm, pitch_deg, roof_shape,
-               bay_mm=8000, bay_stations_mm=None, end_wall_stations_mm=None, canopies=None):
+               bay_mm=8000, bay_stations_mm=None, end_wall_stations_mm=None, canopies=None,
+               wall_tier_z_mm=None, tier_eave_mm=None, tiered_panels=None):
         span = _positive(span_mm, "Span")
         length = _positive(length_mm, "Building length")
         eave = _positive(eave_mm, "Eave height")
@@ -154,12 +172,55 @@ class LayoutGeometry:
             raise ValueError("The layout grid is too large; use fewer bays or end-wall panels")
         if canopy and roof_shape != "Gable":
             raise ValueError("Open canopies are supported on gable roofs only")
-        geometry = cls(span, length, eave, pitch, roof_shape, bays, ends, canopy)
+        tier = None if wall_tier_z_mm is None else _positive(wall_tier_z_mm, "Crane runway level")
+        tier_eave = None if tier_eave_mm is None else _positive(tier_eave_mm, "Top chord node height")
+        if tiered_panels is not None:
+            if isinstance(tiered_panels, str) or not all(isinstance(p, str) for p in tiered_panels):
+                raise ValueError("Two-tier panels must be a list of panel IDs")
+            tiered_panels = frozenset(tiered_panels)
+        geometry = cls(span, length, eave, pitch, roof_shape, bays, ends, canopy, tier, tier_eave, tiered_panels)
         heights = (geometry.roof_z(0), geometry.roof_z(span / 2), geometry.roof_z(span))
         heights += tuple(geometry.canopy_tip(side)[1] for side, _, _ in canopy)
         if any(not math.isfinite(z) or z <= 0 for z in heights):
             raise ValueError("The roof must remain above ground at every station")
+        if tier is not None and tier >= min(geometry.roof_z(0), geometry.roof_z(span)) - 1e-6:
+            raise ValueError("The crane runway level must be below the eave on both side walls")
         return geometry
+
+    def is_tall(self, identifier, heights_mm, width_mm):
+        """True for a two-tier ('tall') wall panel: mean height / width > WALL_TIER_ASPECT.
+
+        Heights are measured to the top chord node (``tier_eave_mm``) when
+        given; ``tiered_panels`` overrides the rule with the editor's decisions.
+        """
+        if self.tiered_panels is not None:
+            return identifier in self.tiered_panels
+        offset = 0. if self.tier_eave_mm is None else self.tier_eave_mm-self.eave_mm
+        return (sum(heights_mm)/len(heights_mm)+offset) / width_mm > WALL_TIER_ASPECT
+
+    def wall_tier(self, face, x, bay, bay_mm):
+        """(tier level mm, 'crane' | 'tall') of side-wall bay ``bay`` at ``x``, or (None, None).
+
+        Crane walls split at the runway level; otherwise a bay taller than
+        WALL_TIER_ASPECT x its length splits at mid-height.
+        """
+        height = self.roof_z(x)
+        if self.wall_tier_z_mm is not None:
+            return self.wall_tier_z_mm, "crane"
+        if self.is_tall(f"{face}/bay/{bay}", (height,), bay_mm):
+            return height / 2, "tall"
+        return None, None
+
+    def end_tier(self, identifier, x0, x1):
+        """(tier level mm, 'tall') of an end-wall panel between x0 and x1, or (None, None).
+
+        A tall end panel splits at half its mean corner height (horizontal strut).
+        """
+        heights = (self.roof_z(x0), self.roof_z(x1))
+        level = sum(heights) / 4
+        if level < min(heights) - 1e-6 and self.is_tall(identifier, heights, x1 - x0):
+            return level, "tall"
+        return None, None
 
     def canopy(self, side):
         """(plan width, tip drop) in mm of the open canopy on ``side``, or None."""
@@ -207,6 +268,12 @@ class LayoutGeometry:
                 "end_wall_stations_mm": list(self.end_wall_stations_mm)}
         if self.canopies:
             data["canopies"] = [{"side": side, "width_mm": width, "drop_mm": drop} for side, width, drop in self.canopies]
+        if self.wall_tier_z_mm is not None:
+            data["wall_tier_z_mm"] = self.wall_tier_z_mm
+        if self.tier_eave_mm is not None:
+            data["tier_eave_mm"] = self.tier_eave_mm
+        if self.tiered_panels is not None:
+            data["tiered_panels"] = sorted(self.tiered_panels)
         return data
 
     @classmethod
@@ -216,14 +283,17 @@ class LayoutGeometry:
         try:
             return cls.create(**{key: value[key] for key in (
                 "span_mm", "length_mm", "eave_mm", "pitch_deg", "roof_shape",
-                "bay_stations_mm", "end_wall_stations_mm")}, canopies=value.get("canopies"))
+                "bay_stations_mm", "end_wall_stations_mm")}, canopies=value.get("canopies"),
+                wall_tier_z_mm=value.get("wall_tier_z_mm"), tier_eave_mm=value.get("tier_eave_mm"),
+                tiered_panels=value.get("tiered_panels"))
         except KeyError as error:
             raise ValueError(f"Missing layout geometry field: {error.args[0]}") from None
 
     def main_geometry(self):
         """The same building without canopies (the main frame grid)."""
         return LayoutGeometry(self.span_mm, self.length_mm, self.eave_mm, self.pitch_deg, self.roof_shape,
-                              self.bay_stations_mm, self.end_wall_stations_mm, ())
+                              self.bay_stations_mm, self.end_wall_stations_mm, (), self.wall_tier_z_mm,
+                              self.tier_eave_mm, self.tiered_panels)
 
 
 @dataclass(frozen=True)
@@ -233,6 +303,32 @@ class BracingPanel:
     label: str
     vertices: tuple
     diagonals: tuple
+    # Two-tier side-wall bay: level of the split (mm) and why ('crane' runway
+    # level or 'tall' bay). ``diagonals`` stay full height (cladding
+    # diaphragms); installed braces use ``brace_diagonals``.
+    tier_z_mm: object = None
+    tier: object = None
+
+    @property
+    def tier_points(self):
+        """Points of the tier level on the panel's two columns/posts (above vertices 0 and 1)."""
+        if self.tier_z_mm is None:
+            return ()
+        v0, v1 = self.vertices[0], self.vertices[1]
+        return (v0[0], v0[1], self.tier_z_mm), (v1[0], v1[1], self.tier_z_mm)
+
+    @property
+    def brace_diagonals(self):
+        """Installed brace diagonals: one X, or two X's stacked at the tier level.
+
+        The tops are the physical corners above vertex 1 (vertex 2) and above
+        vertex 0 (the last vertex), as for ``diagonals``.
+        """
+        if self.tier_z_mm is None:
+            return self.diagonals
+        v0, v1, top1, top0 = self.vertices[0], self.vertices[1], self.vertices[2], self.vertices[-1]
+        m0, m1 = self.tier_points
+        return ((v0, m1), (v1, m0), (m0, top1), (m1, top0))
 
 
 def layout_panels(geometry):
@@ -240,17 +336,19 @@ def layout_panels(geometry):
     panels = []
     g = geometry
 
-    def add(identifier, face, label, vertices):
+    def add(identifier, face, label, vertices, tier=(None, None)):
         # End-wall polygons can have a fifth point at the roof ridge. Brace
         # endpoints remain the actual end-wall panel corner/mullion points.
         diagonals = ((vertices[0], vertices[2]), (vertices[1], vertices[-1]))
-        panels.append(BracingPanel(identifier, face, label, tuple(vertices), diagonals))
+        panels.append(BracingPanel(identifier, face, label, tuple(vertices), diagonals, *tier))
 
     for bay, (y0, y1) in enumerate(zip(g.bay_stations_mm, g.bay_stations_mm[1:])):
         suffix = f"Bay {bay + 1} ({y0 / 1000:g}-{y1 / 1000:g} m from front)"
         for face, x in (("left_wall", 0), ("right_wall", g.span_mm)):
-            add(f"{face}/bay/{bay}", face, f"{FACE_LABELS[face]} / {suffix}",
-                [(x, y0, 0), (x, y1, 0), (x, y1, g.roof_z(x)), (x, y0, g.roof_z(x))])
+            tier = g.wall_tier(face, x, bay, y1 - y0)
+            note = TIER_NOTES.get(tier[1], "")
+            add(f"{face}/bay/{bay}", face, f"{FACE_LABELS[face]} / {suffix}{note}",
+                [(x, y0, 0), (x, y1, 0), (x, y1, g.roof_z(x)), (x, y0, g.roof_z(x))], tier)
         stations = g.roof_stations
         for strip, (x0, x1) in enumerate(zip(stations, stations[1:])):
             face = "roof" if g.roof_shape == "Skillion" else "roof_left" if x1 <= g.span_mm / 2 + 1e-6 else "roof_right"
@@ -271,8 +369,11 @@ def layout_panels(geometry):
             if g.roof_shape == "Gable" and x0 < g.span_mm / 2 < x1:
                 vertices.append((g.span_mm / 2, y, g.roof_z(g.span_mm / 2)))
             vertices.append((x0, y, g.roof_z(x0)))
-            add(f"{face}/panel/{index}", face,
-                f"{FACE_LABELS[face]} / panel {index + 1} (x={x0 / 1000:g}-{x1 / 1000:g} m)", vertices)
+            identifier = f"{face}/panel/{index}"
+            tier = g.end_tier(identifier, x0, x1)
+            add(identifier, face,
+                f"{FACE_LABELS[face]} / panel {index + 1} (x={x0 / 1000:g}-{x1 / 1000:g} m){TIER_NOTES.get(tier[1], '')}",
+                vertices, tier)
     return tuple(panels)
 
 

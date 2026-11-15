@@ -34,6 +34,9 @@ BASELINE_INPUT_DIGEST = "d27bc5545310f2dfaa95b316d3e595b28291d737fd535297412eda9
 # autoSize re-baselined 2026-11-13 again: the legacy local-search optimiser was
 # removed; autoSize is Optimise (stiffness screen + exact refinement + depth
 # sweep): 1100 mm, 310UB32 columns, $35,445 (legacy 1000 mm 250UB31.4, $35,404).
+# autoSize re-baselined 2026-11-14: matched columns on symmetric buildings, the
+# paired column sway repair and a per-depth column step-down in the depth sweep:
+# $35,036 at 1250 mm (250UB25.7 columns, 75x4 SHS chords, 50x2.5 SHS webs), ~50 s.
 BASELINE = {
     "checkSpecified": {
         "verified": False,
@@ -50,15 +53,15 @@ BASELINE = {
     },
     "autoSize": {
         "verified": True,
-        "ratio": 0.9747871848817715,
-        "group": "WEB",
-        "check": "Compression",
+        "ratio": 0.9785580786202903,
+        "group": "TOP",
+        "check": "Combined",
         "sections": {
-            "left_column": "310 UB 32.0 (32.0 kg/m)",
-            "right_column": "310 UB 32.0 (32.0 kg/m)",
-            "top_chord": "75*3 SHS (6.6 kg/m)",
-            "bottom_chord": "75*3 SHS (6.6 kg/m)",
-            "webs_posts": "50*2 SHS (2.9 kg/m)",
+            "left_column": "250 UB 25.7 (25.7 kg/m)",
+            "right_column": "250 UB 25.7 (25.7 kg/m)",
+            "top_chord": "75*4 SHS (8.5 kg/m)",
+            "bottom_chord": "75*4 SHS (8.5 kg/m)",
+            "webs_posts": "50*2.5 SHS (3.6 kg/m)",
         },
     },
 }

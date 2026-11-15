@@ -144,6 +144,16 @@ class DiaphragmSettings:
             raise AnalysisError('Unsupported stressed-skin settings') from None
 
 
+def default_settings(importance_level):
+    """Unsaved projects: Rev B roof + clad walls for IL1, no stressed-skin credit for IL2 and above."""
+    try:
+        level = int(importance_level)
+    except (TypeError, ValueError):
+        level = 2
+    on = level <= 1
+    return asdict(DiaphragmSettings(enabled=on, side_walls_enabled=on, end_walls_enabled=on))
+
+
 def equivalent_diagonal(s_mm, n_mm, flexibility_mm_per_kn, modulus_mpa=200000.):
     s = positive(s_mm, 'Panel shear-direction dimension')
     n = positive(n_mm, 'Panel perpendicular dimension')

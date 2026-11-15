@@ -146,8 +146,8 @@ from portalcalc_service import (
     prepare_request as prepare_calculation_request,
 )
 from loads import BasicLoadCase, BasicRoofLoads, RoofLoadPlacement, WallLoads, apply_roof_vertical_loads, apply_structure_self_weight, build_load_combinations
-from loads import apply_roof_vertical_loads_in_zones, apply_wall_horizontal_loads
-from crane_beam import CraneBeamInputs, calculate_crane_beam
+from loads import apply_roof_vertical_loads_in_zones, apply_wall_horizontal_loads, crane_case
+from crane_beam import CRANE_GAUGE_CHANGE_LIMIT_MM, CraneBeamInputs, calculate_crane_beam
 from storage_loads import StorageLoadInputs, StoragePanelDesignInputs, apply_storage_loads_to_columns, calculate_storage_loads, design_storage_panel, is_centre_stub_storage_mode, is_continuous_stub_panel_mode, storage_factor_for_combination, storage_summary_lines
 from member_checks import E_STEEL_MPA, MemberActions, SectionCheckProperties, check_member
 from end_wall import design_end_wall_mullions, mullion_layout, roof_height_mm
@@ -3763,7 +3763,7 @@ class MainWindow(QMainWindow):
             ("column_il1", "Column lateral, IL1 H/"),
             ("column_standard", "Column lateral, IL2+ H/"),
             ("storage_eave", "Storage eave lateral H/"),
-            ("crane_rail_height", "Portal crane-rail height H/"),
+            ("crane_rail_height", "Portal crane-rail racking H/"),
             ("truss_combined_il1", "Truss G+Q reference, IL1 Span/"),
             ("truss_combined_standard", "Truss G+Q reference, IL2+ Span/"),
             ("truss_g_il1", "Truss G precamber advisory, IL1 Span/"),
@@ -4883,6 +4883,12 @@ class MainWindow(QMainWindow):
         sections_layout.addRow(self.future_canopy_optimise_button)
         self.left_column_profile_combo = QComboBox()
         self.right_column_profile_combo = QComboBox()
+        # Optimise on a symmetric building: the right column follows the left
+        # (see columns_should_match / auto_size_group_specs).
+        self._matched_columns = False
+        self.left_column_profile_combo.currentIndexChanged.connect(self._sync_matched_columns)
+        self.right_column_profile_combo.currentIndexChanged.connect(
+            lambda *_: self._sync_matched_columns(source=self.right_column_profile_combo))
         self.top_profile_combo = QComboBox()
         self.bottom_profile_combo = self.top_profile_combo
         self.purlin_span_type_combo = QComboBox()
@@ -5555,6 +5561,10 @@ class MainWindow(QMainWindow):
         self.crane_beam_phb21_input = QLineEdit("6.7")
         self.crane_beam_phb22_input = QLineEdit("-6.7")
         self.crane_beam_phi2_input = QLineEdit("4.6")
+        # Long-travel buffer force per rail (kN). Blank = the project rule from
+        # capacity and crane span (crane_beam.buffer_force_rule_kn).
+        self.crane_beam_buffer_input = QLineEdit("")
+        self.crane_beam_buffer_input.setPlaceholderText("auto from capacity and span")
         self.crane_beam_ix_input = QLineEdit("323.5")
         self.crane_beam_iy_top_input = QLineEdit("78.5")
         self.crane_beam_iy_oblique_input = QLineEdit("78.5")
@@ -5595,6 +5605,7 @@ class MainWindow(QMainWindow):
             ("Phb.21 lateral inertia (kN)", self.crane_beam_phb21_input),
             ("Phb.22 lateral inertia (kN)", self.crane_beam_phb22_input),
             ("Phi.2 oblique (kN)", self.crane_beam_phi2_input),
+            ("Buffer force per rail (kN)", self.crane_beam_buffer_input),
             ("Ix stiffness (x10^6 mm^4)", self.crane_beam_ix_input),
             ("Iy top stiffness (x10^6 mm^4)", self.crane_beam_iy_top_input),
             ("Iy oblique stiffness (x10^6 mm^4)", self.crane_beam_iy_oblique_input),
@@ -5950,6 +5961,10 @@ class MainWindow(QMainWindow):
             "crane_beam_rail_profile_combo": "Crane rail size used for self weight and load eccentricity geometry.",
             "crane_beam_span_input": "Runway-beam span in metres; normally linked to the portal bay size.",
             "crane_beam_wheelbase_input": "Longitudinal crane wheel spacing in metres.",
+            "crane_beam_buffer_input": ("Maximum long-travel buffer force per rail, kN (crane supplier's data sheet). "
+                                        "Blank uses the project rule 9 + 2.8 x capacity (t) + 1.33 x crane span (m), "
+                                        "fitted to supplier data sheets. Applied at ULS x 1.5 on both rails at the runway "
+                                        "end stops, into the side-wall bracing at rail level."),
             "crane_beam_load_height_input": "Vertical offset from beam reference level to applied horizontal crane load, in metres.",
             "crane_beam_include_sw_deflection_checkbox": "Includes beam, cap and rail self weight in the runway vertical-deflection check.",
         }
@@ -7891,6 +7906,7 @@ class MainWindow(QMainWindow):
                 "phb_21_kn": self.crane_beam_phb21_input.text(),
                 "phb_22_kn": self.crane_beam_phb22_input.text(),
                 "phi_2_kn": self.crane_beam_phi2_input.text(),
+                "buffer_force_kn": self.crane_beam_buffer_input.text().strip(),
                 "ix_x10_6_mm4": self.crane_beam_ix_input.text(),
                 "iy_top_x10_6_mm4": self.crane_beam_iy_top_input.text(),
                 "iy_oblique_x10_6_mm4": self.crane_beam_iy_oblique_input.text(),
@@ -8345,6 +8361,7 @@ class MainWindow(QMainWindow):
         self.crane_beam_phb21_input.setText(str(crane_beam.get("phb_21_kn", self.crane_beam_phb21_input.text())))
         self.crane_beam_phb22_input.setText(str(crane_beam.get("phb_22_kn", self.crane_beam_phb22_input.text())))
         self.crane_beam_phi2_input.setText(str(crane_beam.get("phi_2_kn", self.crane_beam_phi2_input.text())))
+        self.crane_beam_buffer_input.setText(str(crane_beam.get("buffer_force_kn") or ""))
         self.crane_beam_ix_input.setText(str(crane_beam.get("ix_x10_6_mm4", self.crane_beam_ix_input.text())))
         self.crane_beam_iy_top_input.setText(str(crane_beam.get("iy_top_x10_6_mm4", self.crane_beam_iy_top_input.text())))
         self.crane_beam_iy_oblique_input.setText(str(crane_beam.get("iy_oblique_x10_6_mm4", self.crane_beam_iy_oblique_input.text())))
@@ -10029,7 +10046,18 @@ class MainWindow(QMainWindow):
             values = geometry.to_dict()
             values["canopies"] = canopies
             geometry = LayoutGeometry.from_dict(values)
-        return geometry
+        from bracing_analysis_desktop import crane_wall_tier_mm
+        values = geometry.to_dict()
+        tier = crane_wall_tier_mm(self)
+        if tier is not None and tier < min(geometry.roof_z(0), geometry.roof_z(geometry.span_mm)):
+            # Crane side walls: two X's split at the runway level.
+            values["wall_tier_z_mm"] = tier
+        node = (getattr(self, "eave_node_basis_record", None) or {}).get("node_mm")
+        if node and node > 0:
+            # Tall-panel rule (two X's when height / width > 1.73) on the brace
+            # height: to the top chord node, not the cladding pitching point.
+            values["tier_eave_mm"] = round(float(node), 1)
+        return LayoutGeometry.from_dict(values)
 
     def bracing_layout_canopies(self):
         """Nominal open canopies for the 3D bracing layout: plan width and fall."""
@@ -12034,16 +12062,59 @@ class MainWindow(QMainWindow):
             node_id += 1
             internal_column_bases.append(base)
 
-        crane_load_y = left_column_bottom_chord_node.y - 2500.0
+        # Crane: actions from the runway beam calculation (crane_beam.portal_crane_reactions).
+        # Each column's node is at the mid height of its crane stub: the top of
+        # the runway beam is CRANE_RAIL_CLEARANCE_MM below the bottom chord node,
+        # the stub sits under the beam and is the column section (depth D).
         left_crane_node = None
         right_crane_node = None
-        if crane_rating_t > 0.0 and crane_load_y > 1e-6:
-            left_crane_node = Node(node_id, left_column_bottom_chord_node.x, crane_load_y)
-            structure.add_node(left_crane_node)
-            node_id += 1
-            right_crane_node = Node(node_id, right_column_bottom_chord_node.x, crane_load_y)
-            structure.add_node(right_crane_node)
-            node_id += 1
+        crane_portal = None
+        self.crane_portal_actions = None
+        if crane_rating_t > 0.0:
+            from crane_beam import (CRANE_BEAM_FACE_OFFSET_MM, CRANE_RAIL_CLEARANCE_MM,
+                                    portal_crane_reactions)
+            crane_portal = portal_crane_reactions(self.crane_beam_inputs_from_ui())
+            crane_nodes = {}
+            for side, chord_node, profile in (("left", left_column_bottom_chord_node, left_column_profile),
+                                              ("right", right_column_bottom_chord_node, right_column_profile)):
+                column_depth = 2.0 * self.column_half_width_for_span_offset(profile)
+                drop = CRANE_RAIL_CLEARANCE_MM + crane_portal["runway_depth_mm"] + column_depth / 2.0
+                crane_nodes[side] = (chord_node.x, chord_node.y - drop, column_depth, drop)
+            crane_portal["nodes"] = {side: {"y_mm": y, "column_depth_mm": d, "below_chord_mm": drop,
+                                            "eccentricity_mm": d / 2.0 + CRANE_BEAM_FACE_OFFSET_MM}
+                                     for side, (_, y, d, drop) in crane_nodes.items()}
+            # Runway beam mid depth: the side-wall bracing tier level (two X's with
+            # the runway beam between them) and where the buffer force enters.
+            crane_portal["runway_mid_height_mm"] = sum(
+                chord.y - CRANE_RAIL_CLEARANCE_MM - crane_portal["runway_depth_mm"] / 2.0
+                for chord in (left_column_bottom_chord_node, right_column_bottom_chord_node)) / 2.0
+            crane_portal["runway_section"] = self.crane_beam_profile_combo.currentText()
+            if crane_portal.get("runway_area_mm2", 0.0) <= 0.0:
+                runway_profile = self.catalog.get(self.crane_beam_profile_combo.currentText())
+                crane_portal["runway_area_mm2"] = float(getattr(runway_profile, "A", 0.0) or 0.0)
+            # Crane span = rail centres (column centrelines less the runway offsets).
+            crane_portal["crane_span_mm"] = (right_column_bottom_chord_node.x - left_column_bottom_chord_node.x
+                                             - sum(n["eccentricity_mm"] for n in crane_portal["nodes"].values()))
+            from crane_beam import buffer_force_rule_kn
+            entered = self.crane_beam_buffer_input.text().strip()
+            try:
+                buffer_kn = float(entered) if entered else None
+            except ValueError:
+                buffer_kn = None
+            crane_portal["buffer_source"] = "entered" if buffer_kn is not None else "rule"
+            crane_portal["buffer_kn"] = (buffer_kn if buffer_kn is not None
+                                         else buffer_force_rule_kn(crane_rating_t, crane_portal["crane_span_mm"]))
+            if min(y for _, y, _, _ in crane_nodes.values()) > 1e-6:
+                left_crane_node = Node(node_id, crane_nodes["left"][0], crane_nodes["left"][1])
+                structure.add_node(left_crane_node)
+                node_id += 1
+                right_crane_node = Node(node_id, crane_nodes["right"][0], crane_nodes["right"][1])
+                structure.add_node(right_crane_node)
+                node_id += 1
+                # Node ids let the 3D bracing model find the crane nodes in its portal copy.
+                for side, node in (("left", left_crane_node), ("right", right_crane_node)):
+                    crane_portal["nodes"][side].update(node_id=node.id, x_mm=node.x)
+            self.crane_portal_actions = crane_portal
 
         left_storage_nodes = []
         right_storage_nodes = []
@@ -13535,58 +13606,49 @@ class MainWindow(QMainWindow):
 
             return LoadOnlyStructure()
 
-        def apply_crane_load(target_structure, q_factor, crane_position="both"):
-            if (
-                crane_rating_t <= 0.0
-                or q_factor <= 0.0
-                or crane_position not in {"both", "left", "right"}
-                or left_crane_node is None
-                or right_crane_node is None
-            ):
-                return []
-            load_kn = 17.0 * crane_rating_t * q_factor
-            load_n = load_kn * 1000.0
-            horizontal_kn = 1.25 * crane_rating_t * q_factor
-            horizontal_n = horizontal_kn * 1000.0
-            arrows = []
-            crane_targets = []
-            if crane_position in {"both", "left"}:
-                crane_targets.append((left_crane_node, 300.0, -horizontal_n))
-            if crane_position in {"both", "right"}:
-                crane_targets.append((right_crane_node, -300.0, horizontal_n))
-            for node, eccentricity_mm, horizontal_load_n in crane_targets:
-                target_structure.add_load(node.uy, -load_n)
-                target_structure.add_load(node.rz, eccentricity_mm * -load_n)
-                target_structure.add_load(node.ux, horizontal_load_n)
-                arrows.append((node.x + eccentricity_mm, node.y, 0.0, -load_n))
-                arrows.append((node.x, node.y, horizontal_load_n, 0.0))
-            return arrows
+        def crane_column_actions(crane_position, serviceability, g_factor):
+            """Crane column actions for one combination (crane_beam.crane_column_actions)."""
+            if crane_portal is None or left_crane_node is None or right_crane_node is None:
+                return None, ""
+            from crane_beam import crane_column_actions as shared_crane_column_actions
+            return shared_crane_column_actions(crane_portal, crane_position, serviceability, g_factor)
 
-        def crane_summary_lines(q_factor, crane_position="both"):
-            if crane_rating_t <= 0.0 or q_factor <= 0.0 or crane_position not in {"both", "left", "right"}:
+        def apply_crane_load(target_structure, crane_position="none", serviceability=False, g_factor=1.0):
+            # Shared with the 3D bracing model (crane_beam.apply_crane_actions).
+            if crane_portal is None or left_crane_node is None or right_crane_node is None:
                 return []
-            lines = ["", "CRANE LOAD"]
-            if left_crane_node is None or right_crane_node is None:
-                lines.append("Crane load not applied: bottom chord is less than 2500 mm above the base.")
+            from crane_beam import apply_crane_actions
+            return apply_crane_actions(target_structure, {"left": left_crane_node, "right": right_crane_node},
+                                       crane_portal, crane_position, serviceability, g_factor)
+
+        def crane_summary_lines(crane_position="none", serviceability=False, g_factor=1.0):
+            if crane_rating_t <= 0.0:
+                return []
+            lines = ["", "CRANE LOAD (from the crane beam calculation)"]
+            if crane_portal is None or left_crane_node is None or right_crane_node is None:
+                lines.append("Crane load not applied: the crane stub is below the column base.")
                 return lines
-            load_kn = 17.0 * crane_rating_t * q_factor
-            horizontal_kn = 1.25 * crane_rating_t * q_factor
-            if crane_position == "left":
-                target_text = "left column only"
-                direction_text = "left column -X from inside face"
-            elif crane_position == "right":
-                target_text = "right column only"
-                direction_text = "right column +X from inside face"
-            else:
-                target_text = "both main columns"
-                direction_text = "left column -X, right column +X from inside faces"
+            actions, description = crane_column_actions(crane_position, serviceability, g_factor)
+            p = crane_portal
             lines.append(f"{'Rating':<13}: {crane_rating_t:>8.3f} t")
-            lines.append(f"{'Q factor':<13}: {q_factor:>8.3f}")
-            lines.append(f"{'Position':<13}: {target_text}")
-            lines.append(f"{'Column load':<13}: {load_kn:>8.3f} kN vertical per loaded column")
-            lines.append(f"{'Horiz load':<13}: {horizontal_kn:>8.3f} kN per loaded column ({direction_text})")
-            lines.append(f"{'Load height':<13}: {left_crane_node.y:>8.0f} mm above base, 2500 mm below bottom chord")
-            lines.append(f"{'Eccentricity':<13}: {300.0:>8.0f} mm inward to portal")
+            lines.append(f"{'Case':<13}: {description}")
+            lines.append(f"{'Runway span':<13}: {p['span_mm']:>8.0f} mm, wheelbase {p['wheelbase_mm']:.0f} mm "
+                         "(R = P1 + P2 (L - a) / L, one wheel over the frame)")
+            lines.append(f"{'ULS vertical':<13}: {p['uls_vertical_max_kn']:>8.2f} kN max / {p['uls_vertical_min_kn']:.2f} kN min "
+                         f"(dynamic x {p['hoisted_factor']:.2f})")
+            lines.append(f"{'SLS vertical':<13}: {p['sls_vertical_max_kn']:>8.2f} kN max / {p['sls_vertical_min_kn']:.2f} kN min (static)")
+            lines.append(f"{'Lateral':<13}: {p['uls_lateral_kn']:>8.2f} kN ULS (x {p['inertial_factor']:.2f}) / "
+                         f"{p['sls_lateral_kn']:.2f} kN SLS, same direction on both columns")
+            lines.append(f"{'Runway G':<13}: {p['permanent_kn']:>8.2f} kN per column (beam + rail self weight)")
+            lines.append(f"{'Buffer':<13}: {p['buffer_kn']:>8.2f} kN per rail ({'entered' if p['buffer_source'] == 'entered' else 'rule from capacity and crane span'}; "
+                         f"crane span {p['crane_span_mm']/1000:.2f} m); longitudinal, checked in the 3D bracing model")
+            for side in ("left", "right"):
+                node = p["nodes"][side]
+                vertical, lateral = actions[side]
+                lines.append(
+                    f"{side.title() + ' column':<13}: {vertical:>8.2f} kN down, {lateral:+.2f} kN lateral | stub mid height "
+                    f"{node['y_mm']:.0f} mm ({node['below_chord_mm']:.0f} below bottom chord) | eccentricity "
+                    f"{node['eccentricity_mm']:.0f} mm")
             return lines
 
         def wind_case_for_single_label(label):
@@ -13661,12 +13723,12 @@ class MainWindow(QMainWindow):
             if storage_results.inputs.left_wall and storage_results.inputs.right_wall:
                 add_storage_case("Storage Q both walls", True, True)
 
-            for crane_label, crane_position in [
-                ("Crane Q both", "both"),
-                ("Crane Q left", "left"),
-                ("Crane Q right", "right"),
+            for crane_label, crane_position, g_factor in [
+                ("Crane G runway", "none", 1.0),
+                ("Crane Q crab left, H +X", "left:+x", 0.0),
+                ("Crane Q crab right, H -X", "right:-x", 0.0),
             ]:
-                crane_arrows = apply_crane_load(arrow_collector(), 1.0, crane_position)
+                crane_arrows = apply_crane_load(arrow_collector(), crane_position, True, g_factor)
                 if crane_arrows:
                     cases[crane_label] = crane_arrows
 
@@ -13823,7 +13885,8 @@ class MainWindow(QMainWindow):
                     combination.g_factor,
                 )
                 arrows.extend(self_weight_application.arrows)
-            arrows.extend(apply_crane_load(load_structure, combination.q_factor, combination.crane_position))
+            arrows.extend(apply_crane_load(load_structure, combination.crane_position,
+                                           combination.is_serviceability, combination.g_factor))
             storage_factor = storage_factor_for_combination(storage_inputs, combination)
             applied_storage_results = storage_results
             if storage_case is not None:
@@ -13868,7 +13931,8 @@ class MainWindow(QMainWindow):
                     summary_lines.append(f"{'LLsn serv':<13}: {snow_loads['service_kpa']:>8.3f} kPa")
                     summary_lines.append(f"{'Entered Q':<13}: {entered_q_kpa:>8.3f} kPa")
                     summary_lines.append(f"{'Q used':<13}: {effective_q_kpa:>8.3f} kPa ({q_source})")
-                summary_lines.extend(crane_summary_lines(combination.q_factor, combination.crane_position))
+                summary_lines.extend(crane_summary_lines(combination.crane_position,
+                                                         combination.is_serviceability, combination.g_factor))
                 summary_lines.extend(storage_summary_lines(applied_storage_results, factor=storage_factor))
                 for side_label, side_length, side_canopy_loads in [
                     ("LEFT CANOPY LOAD INPUTS", left_canopy_length, left_canopy_loads),
@@ -14027,6 +14091,12 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.results_box.setText(f"Building load error: {exc}")
                 return
+        if crane_portal is None or left_crane_node is None:
+            # Without a crane the crane cases repeat G + Q: don't check them.
+            check_combinations = [c for c in check_combinations if crane_case(c.crane_position) is None]
+            if all_building_combinations is not None:
+                all_building_combinations = check_combinations
+        if getattr(self, "building_load_mode", None):
             # Phase 5 active-set screening: optimiser solves check only the
             # combinations that govern (plus all gravity); the full set is the
             # acceptance gate (auto_size_current_preset).
@@ -14322,7 +14392,8 @@ class MainWindow(QMainWindow):
             }
 
         sls_column_top_deflections = new_column_top_deflections()
-        sls_crane_rail_deflection = {"value": -1.0, "combo": "-", "node": "-", "height_mm": 0.0, "label": "Crane rail deflection SLS"}
+        sls_crane_rail_deflection = {"value": -1.0, "combo": "-", "node": "-", "height_mm": 0.0, "label": "Crane rail racking SLS"}
+        sls_crane_gauge_change = {"value": -1.0, "combo": "-", "node": "-", "height_mm": 0.0, "label": "Crane rail gauge change SLS"}
         sls_column_midspan_ws_deflection = {"value": -1.0, "combo": "-", "member": "-", "group": "-", "height_mm": 0.0}
         column_deflection_groups = ["LEFT_COLUMN", "RIGHT_COLUMN", "INTERNAL_COLUMN", "LEFT_LEAN_COLUMN", "RIGHT_LEAN_COLUMN"]
         def new_column_midspan_ws_deflections():
@@ -14555,7 +14626,7 @@ class MainWindow(QMainWindow):
                 column_cases[group].append(case)
             if result.get("computation_case") is not None:
                 computation_cases.append(result["computation_case"])
-            nonlocal sls_column_top_deflection, sls_column_top_deflections, sls_crane_rail_deflection, sls_column_midspan_ws_deflection, sls_column_midspan_ws_deflections, sls_truss_midspan_deflections, sls_side_midspan_deflections, sls_canopy_tip_deflections, uls_count, sls_count
+            nonlocal sls_column_top_deflection, sls_column_top_deflections, sls_crane_rail_deflection, sls_crane_gauge_change, sls_column_midspan_ws_deflection, sls_column_midspan_ws_deflections, sls_truss_midspan_deflections, sls_side_midspan_deflections, sls_canopy_tip_deflections, uls_count, sls_count
             uls_count += result["uls_count"]
             sls_count += result["sls_count"]
             for group, envelope in result["column_envelopes"].items():
@@ -14573,6 +14644,8 @@ class MainWindow(QMainWindow):
                     sls_column_top_deflections[group] = item
             if result["sls_crane_rail_deflection"]["value"] > sls_crane_rail_deflection["value"]:
                 sls_crane_rail_deflection = result["sls_crane_rail_deflection"]
+            if result["sls_crane_gauge_change"]["value"] > sls_crane_gauge_change["value"]:
+                sls_crane_gauge_change = result["sls_crane_gauge_change"]
             if result["sls_column_midspan_ws_deflection"]["value"] > sls_column_midspan_ws_deflection["value"]:
                 sls_column_midspan_ws_deflection = result["sls_column_midspan_ws_deflection"]
             for group, item in result["sls_column_midspan_ws_deflections"].items():
@@ -14634,7 +14707,8 @@ class MainWindow(QMainWindow):
             local_foundation_reactions = new_foundation_reactions()
             local_sls_column_top_deflection = {"value": -1.0, "combo": "-", "node": "-", "height_mm": 0.0, "label": "Column top deflection SLS"}
             local_sls_column_top_deflections = new_column_top_deflections()
-            local_sls_crane_rail_deflection = {"value": -1.0, "combo": "-", "node": "-", "height_mm": 0.0, "label": "Crane rail deflection SLS"}
+            local_sls_crane_rail_deflection = {"value": -1.0, "combo": "-", "node": "-", "height_mm": 0.0, "label": "Crane rail racking SLS"}
+            local_sls_crane_gauge_change = {"value": -1.0, "combo": "-", "node": "-", "height_mm": 0.0, "label": "Crane rail gauge change SLS"}
             local_sls_column_midspan_ws_deflection = {"value": -1.0, "combo": "-", "member": "-", "group": "-", "height_mm": 0.0}
             local_sls_column_midspan_ws_deflections = new_column_midspan_ws_deflections()
             local_sls_truss_midspan_deflections = new_truss_midspan_deflections()
@@ -15134,21 +15208,25 @@ class MainWindow(QMainWindow):
             if combination.is_serviceability:
                 local_sls_count += 1
                 ws_only_serviceability = getattr(combination, "serviceability_component", None) == "Ws"
-                gq_only_serviceability = (getattr(combination, "base_name", "") or combination.name) == "SLS: G + Q"
-                if crane_deflection_nodes and (ws_only_serviceability or gq_only_serviceability):
-                    for node in crane_deflection_nodes:
-                        signed_ux = d[node.ux]
-                        ux = abs(signed_ux)
-                        if ux > local_sls_crane_rail_deflection["value"]:
-                            local_sls_crane_rail_deflection = {
-                                "value": ux,
-                                "signed_value": signed_ux,
-                                "displacements": d.copy(),
-                                "combo": display_combination.name,
-                                "node": node.id,
-                                "height_mm": node.y,
-                                "label": "Crane rail deflection SLS",
-                            }
+                # Crane rails, under the crane-in-service cases: racking (the
+                # frame's sway, the mean of the two rails) against H/n, and the
+                # change in rail gauge (right minus left) against a fixed limit.
+                if len(crane_deflection_nodes) == 2 and crane_case(getattr(combination, "crane_position", None)):
+                    left_rail, right_rail = crane_deflection_nodes
+                    u_left, u_right = d[left_rail.ux], d[right_rail.ux]
+                    racking = 0.5 * (u_left + u_right)
+                    gauge = u_right - u_left
+                    common = {"displacements": d.copy(), "combo": display_combination.name,
+                              "node": f"{left_rail.id}/{right_rail.id}",
+                              "height_mm": 0.5 * (left_rail.y + right_rail.y),
+                              "left_mm": u_left, "right_mm": u_right}
+                    if abs(racking) > local_sls_crane_rail_deflection["value"]:
+                        local_sls_crane_rail_deflection = {**common, "value": abs(racking), "signed_value": racking,
+                                                           "label": "Crane rail racking SLS"}
+                    if abs(gauge) > local_sls_crane_gauge_change["value"]:
+                        local_sls_crane_gauge_change = {**common, "value": abs(gauge), "signed_value": gauge,
+                                                        "limit_mm": CRANE_GAUGE_CHANGE_LIMIT_MM,
+                                                        "label": "Crane rail gauge change SLS"}
                 if ws_only_serviceability:
                     for node, group in [(top_nodes[0], "LEFT_COLUMN"), (top_nodes[-1], "RIGHT_COLUMN")]:
                         signed_ux = d[node.ux]
@@ -15264,6 +15342,7 @@ class MainWindow(QMainWindow):
                 "sls_column_top_deflection": local_sls_column_top_deflection,
                 "sls_column_top_deflections": local_sls_column_top_deflections,
                 "sls_crane_rail_deflection": local_sls_crane_rail_deflection,
+                "sls_crane_gauge_change": local_sls_crane_gauge_change,
                 "sls_column_midspan_ws_deflection": local_sls_column_midspan_ws_deflection,
                 "sls_column_midspan_ws_deflections": local_sls_column_midspan_ws_deflections,
                 "sls_truss_midspan_deflections": local_sls_truss_midspan_deflections,
@@ -15546,11 +15625,13 @@ class MainWindow(QMainWindow):
             f"{sls_column_top_deflection.get('label', 'Column max UX'):<18}: {sls_column_top_deflection['value']:>8.3f} mm  | "
             f"Node {sls_column_top_deflection['node']:<7} | {sls_column_top_deflection['combo']}"
         )
-        if sls_crane_rail_deflection["value"] >= 0.0:
-            lines.append(
-                f"{sls_crane_rail_deflection.get('label', 'Crane rail UX'):<18}: {sls_crane_rail_deflection['value']:>8.3f} mm  | "
-                f"Node {sls_crane_rail_deflection['node']:<7} | {sls_crane_rail_deflection['combo']}"
-            )
+        for crane_item, crane_label in ((sls_crane_rail_deflection, "Crane rail racking"),
+                                        (sls_crane_gauge_change, "Crane gauge change")):
+            if crane_item["value"] >= 0.0:
+                lines.append(
+                    f"{crane_label:<18}: {crane_item['value']:>8.3f} mm  | "
+                    f"Nodes {crane_item['node']:<7} | {crane_item['combo']}"
+                )
         if sls_column_midspan_ws_deflection.get("value", -1.0) >= 0.0:
             lines.append(
                 f"{'Column mid UX Ws':<18}: {sls_column_midspan_ws_deflection['value']:>8.3f} mm  | "
@@ -15645,6 +15726,7 @@ class MainWindow(QMainWindow):
             "sls_column_top_deflection": sls_column_top_deflection,
             "sls_column_top_deflections": sls_column_top_deflections,
             "sls_crane_rail_deflection": sls_crane_rail_deflection,
+            "sls_crane_gauge_change": sls_crane_gauge_change,
             "sls_column_midspan_ws_deflection": sls_column_midspan_ws_deflection,
             "sls_column_midspan_ws_deflections": sls_column_midspan_ws_deflections,
             "sls_truss_midspan_deflections": sls_truss_midspan_deflections,
@@ -16654,14 +16736,13 @@ class MainWindow(QMainWindow):
             limit = height / divisor
             demand = max(item.get("value", -1.0), 0.0)
             ratios.append((demand / limit if limit > 1e-12 else float("inf"), item.get("label", "Column deflection"), f"H/{divisor:.0f}"))
-        if "sls_crane_rail_deflection" in envelopes:
-            item = envelopes["sls_crane_rail_deflection"]
-            height = item.get("height_mm") or 0.0
-            if height > 0.0 and item.get("value", -1.0) >= 0.0:
-                divisor = self.serviceability_limit_value("crane_rail_height")
-                limit = height / divisor
-                demand = max(item.get("value", -1.0), 0.0)
-                ratios.append((demand / limit if limit > 1e-12 else float("inf"), item.get("label", "Crane rail deflection"), f"H/{divisor:.0f}"))
+        # Crane rail racking is not a 2D acceptance check: the frame alone has no
+        # help from its neighbours, which share a crane load through the roof
+        # bracing. It is reported (greyed) and belongs to the 3D model.
+        gauge_item = envelopes.get("sls_crane_gauge_change") or {}
+        if gauge_item.get("value", -1.0) >= 0.0:
+            limit = gauge_item.get("limit_mm") or CRANE_GAUGE_CHANGE_LIMIT_MM
+            ratios.append((gauge_item["value"] / limit, gauge_item.get("label", "Crane rail gauge change"), f"{limit:.0f} mm"))
         if "sls_column_midspan_ws_deflection" in envelopes:
             item = envelopes["sls_column_midspan_ws_deflection"]
             if item.get("value", -1.0) >= 0.0:
@@ -16897,11 +16978,11 @@ class MainWindow(QMainWindow):
         envelopes = self.design_envelope_actions or {}
         ratios = []
         if group in {"LEFT_COLUMN", "RIGHT_COLUMN"}:
-            crane_item = envelopes.get("sls_crane_rail_deflection", {})
-            crane_height = crane_item.get("height_mm") or 0.0
-            if crane_height > 0.0 and crane_item.get("value", -1.0) >= 0.0:
-                divisor = self.serviceability_limit_value("crane_rail_height")
-                ratios.append((crane_item["value"] / (crane_height / divisor), "Crane rail deflection", f"H/{divisor:.0f}"))
+            # Crane rail racking is report-only in 2D (see auto_size_serviceability_ratio).
+            gauge_item = envelopes.get("sls_crane_gauge_change") or {}
+            if gauge_item.get("value", -1.0) >= 0.0:
+                limit = gauge_item.get("limit_mm") or CRANE_GAUGE_CHANGE_LIMIT_MM
+                ratios.append((gauge_item["value"] / limit, "Crane rail gauge change", f"{limit:.0f} mm"))
         top_item = envelopes.get("sls_column_top_deflections", {}).get(group, {})
         top_height = top_item.get("height_mm") or 0.0
         if top_height > 0.0 and top_item.get("value", -1.0) >= 0.0:
@@ -16914,13 +16995,95 @@ class MainWindow(QMainWindow):
             ratios.append((mid_item["value"] / (mid_height / divisor), "Midspan Ws deflection", f"H/{divisor:.0f}"))
         return max(ratios, default=(0.0, "-", "-"), key=lambda item: item[0])
 
+    def auto_size_repair_column_pair(self, column_specs, max_trials=6):
+        """Shared column sway: stiffen the two main columns together.
+
+        When both columns fail sway, each is scaled by the shortfall: the
+        cheapest section with I >= its current I x ratio x 1.05, then
+        re-estimated from the exact result. Stiffening one column alone does
+        not work: on PortalTest2 (stripped to 460UB67.1 / 410UB53.7, sway 1.955)
+        the cheapest pair by combined I was 1200WB317 / 410UB53.7, still 1.341,
+        and the old one-column repair went to 1000WB215 and then 1200WB423.
+        Neither column gets lighter. Matched columns are one decision and use
+        the single-column repair. Returns (report lines, exact solves).
+        """
+        by_group = {group: (label, combo) for label, combo, group in column_specs
+                    if group in ("LEFT_COLUMN", "RIGHT_COLUMN")}
+        if len(by_group) < 2 or by_group["LEFT_COLUMN"][1] is by_group["RIGHT_COLUMN"][1]:
+            return [], 0
+        ratios = {group: self.column_group_deflection_ratio(group)[0] for group in by_group}
+        if min(ratios.values()) <= 1.0:
+            return [], 0          # not a shared sway failure
+        lengths = self.auto_size_group_lengths_m()
+        options, original = {}, {}
+        for group, (_, combo) in by_group.items():
+            current = self.selected_profile(combo)
+            if current is None:
+                return [], 0
+            original[group] = (combo.currentIndex(), current)
+            envelope = (self.design_envelope_actions or {}).get(group)
+            current_metric = self.auto_size_profile_metric(current, group)
+            rows = []
+            for index in self.auto_size_candidate_indices(combo, group, min_metric_step=0.0):
+                profile = self.catalog.get(combo.itemText(index))
+                if profile is None:
+                    continue
+                metric = self.auto_size_profile_metric(profile, group)
+                if metric < current_metric * 0.999:
+                    continue
+                if index != combo.currentIndex() and self.member_and_connection_ratio(profile, envelope, group)[0] > 1.0:
+                    continue
+                rows.append((index, profile, metric,
+                             self.auto_size_profile_cost_key(profile) * max(lengths.get(group, 1.0), 1e-6)))
+            options[group] = rows
+        if not options["LEFT_COLUMN"] or not options["RIGHT_COLUMN"]:
+            return [], 0
+        factor = max(max(ratios.values()) * 1.05, 1.05)
+        basis = {g: self.auto_size_profile_metric(original[g][1], g) for g in by_group}
+        tried, best, solves = set(), None, 0
+        start_names = f"{original['LEFT_COLUMN'][1].name} / {original['RIGHT_COLUMN'][1].name}"
+        for _ in range(max_trials):
+            chosen = {}
+            for group, rows in options.items():
+                enough = [row for row in rows if row[2] >= basis[group] * factor]
+                chosen[group] = (min(enough, key=lambda row: (row[3], row[2])) if enough
+                                 else max(rows, key=lambda row: (row[2], -row[3])))
+            left, right = chosen["LEFT_COLUMN"], chosen["RIGHT_COLUMN"]
+            if (left[0], right[0]) in tried:
+                break
+            tried.add((left[0], right[0]))
+            by_group["LEFT_COLUMN"][1].setCurrentIndex(left[0])
+            by_group["RIGHT_COLUMN"][1].setCurrentIndex(right[0])
+            self.generate_and_solve()
+            QApplication.processEvents()
+            solves += 1
+            ratio = max(self.column_group_deflection_ratio(g)[0] for g in by_group)
+            strength = max(self.member_and_connection_ratio(
+                self.selected_profile(by_group[g][1]), (self.design_envelope_actions or {}).get(g), g)[0] for g in by_group)
+            if best is None or ratio < best[0]:
+                best = (ratio, left, right)
+            if ratio <= 1.0 and strength <= 1.0:
+                return [f"{'Columns (pair)':<31}: {start_names} -> {left[1].name} / {right[1].name} | "
+                        f"deflection {ratio:.3f} | strength {strength:.3f} | OK"], solves
+            # Re-estimate from this exact result: both columns scale again.
+            basis = {g: chosen[g][2] for g in by_group}
+            factor = max(ratio * 1.05, 1.05)
+        # Unresolved: keep the closest pair tried for the single-column repair to continue from.
+        if best is not None:
+            by_group["LEFT_COLUMN"][1].setCurrentIndex(best[1][0])
+            by_group["RIGHT_COLUMN"][1].setCurrentIndex(best[2][0])
+            self.generate_and_solve()
+            solves += 1
+            return [f"{'Columns (pair)':<31}: {start_names} -> {best[1][1].name} / {best[2][1].name} | "
+                    f"closest deflection {best[0]:.3f} | NOT OK"], solves
+        return [], solves
+
     def auto_size_repair_column_deflections(self, active_specs):
         column_specs = [
             spec for spec in active_specs
             if spec[2] in {"LEFT_COLUMN", "RIGHT_COLUMN", "INTERNAL_COLUMN", "LEFT_LEAN_COLUMN", "RIGHT_LEAN_COLUMN"}
         ]
-        reports = []
-        exact_solves = 0
+        reports, exact_solves = self.auto_size_repair_column_pair(column_specs)
         unresolved_groups = set()
         for _ in range(max(len(column_specs) * 2, 1)):
             failing = [
@@ -17262,10 +17425,59 @@ class MainWindow(QMainWindow):
                 changes.append(f"{decision['combo'].currentText()} | cleared web split for joint-zone repair")
         return changes
 
+    def _sync_matched_columns(self, *_args, source=None):
+        """Matched columns: whichever column combo changed, the other follows."""
+        if not self._matched_columns:
+            return
+        source = source if source is not None else self.left_column_profile_combo
+        target = (self.right_column_profile_combo if source is self.left_column_profile_combo
+                  else self.left_column_profile_combo)
+        index = target.findText(source.currentText())
+        if index >= 0 and index != target.currentIndex():
+            target.setCurrentIndex(index)
+
+    def columns_should_match(self):
+        """True for a symmetric building, where Optimise keeps the two main columns the same.
+
+        Symmetric: gable roof, same supports and column length adjustments,
+        the same canopy/lean-to on each side (type, size, frame and loads), and
+        internal columns mirrored about the mid-span. Wind, cladding and
+        openings may differ: matching columns is a design choice for a building
+        that is the same both sides.
+        """
+        data = self.collect_preset_data()
+        geometry, canopies = data.get("geometry", {}), data.get("canopies", {})
+        if geometry.get("roof_shape") != "Gable":
+            return False
+        for left, right in (("left_support", "right_support"),
+                            ("left_column_length_adjust_mm", "right_column_length_adjust_mm")):
+            if str(geometry.get(left, "")).strip() != str(geometry.get(right, "")).strip():
+                return False
+        if not (str(canopies.get("left_type", "None")) == str(canopies.get("right_type", "None")) == "None"):
+            for key in ("type", "length_mm", "depth_mm", "eave_height_mm", "pitch_deg", "frame_system",
+                        "g_kpa", "q_kpa", "solar_kpa"):
+                if str(canopies.get(f"left_{key}", "")).strip() != str(canopies.get(f"right_{key}", "")).strip():
+                    return False
+        structure = getattr(self, "structure", None)
+        if structure is not None:
+            def xs(group):
+                return [x for e in structure.elements if e.group == group for x in (e.start.x, e.end.x)]
+            left, right = xs("LEFT_COLUMN"), xs("RIGHT_COLUMN")
+            if left and right:
+                centre = (min(left) + max(right)) / 2.0
+                internal = sorted(set(xs("INTERNAL_COLUMN")))
+                mirrored = sorted(2 * centre - x for x in internal)
+                if any(abs(a - b) > 2.0 for a, b in zip(internal, mirrored)):
+                    return False
+        return True
+
     def auto_size_group_specs(self):
+        # Matched columns: both column groups are one decision on the left combo
+        # (as the top and bottom chords share one), which the right one follows.
+        right_combo = self.left_column_profile_combo if self._matched_columns else self.right_column_profile_combo
         return [
             ("Left column", self.left_column_profile_combo, "LEFT_COLUMN"),
-            ("Right column", self.right_column_profile_combo, "RIGHT_COLUMN"),
+            ("Right column", right_combo, "RIGHT_COLUMN"),
             ("Internal column", self.internal_column_profile_combo, "INTERNAL_COLUMN"),
             ("Top chord", self.top_profile_combo, "TOP"),
             ("Bottom chord", self.bottom_profile_combo, "BOTTOM"),
@@ -18179,7 +18391,12 @@ class MainWindow(QMainWindow):
 
         Each trial depth gets the cheapest sections its own solved envelopes
         allow (auto_size_frozen_candidate, all groups at once), then member and
-        serviceability repairs to an exact pass. Depths are tried every
+        serviceability repairs to an exact pass (the column sway repair stiffens
+        both main columns together: auto_size_repair_column_pair), then one
+        exact step lighter per column decision, kept if it passes and saves.
+        Keeping the seed's columns instead of stripping them was tried and was
+        worse or equal (harness preset $49,062 against $44,719; factory
+        defaults $35,216 against $35,036; PortalTest2 equal). Depths are tried every
         ``coarse_step`` over the permitted range, then the 50 mm neighbours of
         the cheapest, and the cheapest of all gets a short cheaper-neighbour
         descent. Only exactly verified states are compared, by full cost.
@@ -18196,6 +18413,7 @@ class MainWindow(QMainWindow):
             return None, exact_solves, []
         results = {}
         solves = [exact_solves]
+        column_groups = {"LEFT_COLUMN", "RIGHT_COLUMN", "INTERNAL_COLUMN", "LEFT_LEAN_COLUMN", "RIGHT_LEAN_COLUMN"}
 
         def solve():
             self.generate_and_solve()
@@ -18244,8 +18462,43 @@ class MainWindow(QMainWindow):
                 results[depth] = None
                 return None
             cost = float((self.costing_summary or {}).get("total_cost", float("inf")))
-            results[depth] = self.auto_size_capture_state(specs, ratio, cost)
+            results[depth] = lighten_columns(self.auto_size_capture_state(specs, ratio, cost))
             return results[depth]
+
+        def lighten_columns(state):
+            """One exact step lighter for each column decision, kept only if it passes and saves."""
+            specs = self.active_auto_size_group_specs()
+            combos = {}
+            for _, combo, group in specs:
+                if group in column_groups:
+                    combos.setdefault(id(combo), (combo, group))
+            for combo, group in combos.values():
+                current = self.selected_profile(combo)
+                if current is None:
+                    continue
+                current_cost = self.auto_size_profile_cost_key(current)
+                envelope_groups = [g for _, c, g in specs if c is combo]
+                lighter = []
+                for index in self.auto_size_candidate_indices(combo, group, min_metric_step=0.0):
+                    profile = self.catalog.get(combo.itemText(index))
+                    if profile is None or self.auto_size_profile_cost_key(profile) >= current_cost - 1e-9:
+                        continue
+                    if any(self.member_and_connection_ratio(
+                            profile, (self.design_envelope_actions or {}).get(g), g)[0] > 1.0 for g in envelope_groups):
+                        continue
+                    lighter.append((self.auto_size_profile_cost_key(profile), profile.I_analysis, index))
+                if not lighter:
+                    continue
+                combo.setCurrentIndex(max(lighter)[2])      # the next step down
+                solve()
+                ratio, _, _ = self.auto_size_overall_ratio(specs)
+                cost = float((self.costing_summary or {}).get("total_cost", float("inf")))
+                if self.auto_size_design_acceptable(specs, ratio) and cost < state["cost"] - 1e-6:
+                    state = self.auto_size_capture_state(specs, ratio, cost)
+                else:
+                    self.auto_size_restore_state(state)
+                    solve()
+            return state
 
         depths = []
         depth = minimum
@@ -18296,6 +18549,25 @@ class MainWindow(QMainWindow):
                 solve()
         return best, solves[0], lines
 
+    def truss_depth_outside_range_note(self):
+        """A warning when the entered truss depth is outside Optimise's permitted range, else ""."""
+        if self.frame_system_combo.currentText() != "Truss":
+            return ""
+        try:
+            current = float(self.depth_input.text())
+            minimum = self.truss_depth_from_span(MAIN_TRUSS_DEPTH_MIN_RATIO)
+            maximum = math.floor(self.max_main_truss_depth_mm() / 50.0) * 50.0
+        except (TypeError, ValueError):
+            return ""
+        if minimum - 1e-9 <= self.round_up_to_increment(current, 50.0) <= maximum + 1e-9:
+            return ""
+        used = min(max(self.round_up_to_increment(current, 50.0), minimum), maximum)
+        reason = "the Max truss depth" if current > maximum else "the minimum (3% of span)"
+        return (f"WARNING: the entered truss depth ({current:.0f} mm) is outside the permitted range "
+                f"{minimum:.0f}-{maximum:.0f} mm, set by {reason}. Optimise started from {used:.0f} mm and "
+                "searched only that range, so the starting design shown is at that depth. "
+                "Change Max truss depth to let it search deeper.")
+
     def run_physics_structure_optimisation(self, show_completion=True):
         """Optimise: the stiffness-first search with exact verification.
 
@@ -18317,6 +18589,8 @@ class MainWindow(QMainWindow):
         exact_solves = 0
         starting_state = None
         adopted = False
+        depth_clamp_note = ""
+        starting_state_for_failure = None   # the user's own columns, when Optimise matched them
         try:
             self.auto_web_profile_assignments = {}
             self.auto_web_assignment_basis = {}
@@ -18338,6 +18612,8 @@ class MainWindow(QMainWindow):
                     current_depth = float(self.depth_input.text())
                     bounded_depth = self.round_up_to_increment(current_depth, 50.0)
                     bounded_depth = min(max(bounded_depth, minimum_depth), maximum_depth)
+                    # Outside the permitted range (not just rounding): say so at the end.
+                    depth_clamp_note = self.truss_depth_outside_range_note()
                     if abs(bounded_depth - current_depth) > 1e-9:
                         self.depth_input.setText(f"{bounded_depth:.0f}")
                 except ValueError:
@@ -18345,6 +18621,24 @@ class MainWindow(QMainWindow):
             self.generate_and_solve()
             if self.structure is None or not self.design_envelope_actions:
                 raise ValueError("The current frame could not be generated and solved.")
+            matched_note = ""
+            if self.columns_should_match():
+                # Symmetric building: one column section both sides. An unequal
+                # start takes the stiffer of the two on both (sway can't get worse).
+                original_state = self.auto_size_capture_state(self.active_auto_size_group_specs())
+                left, right = (self.selected_profile(c) for c in (self.left_column_profile_combo,
+                                                                   self.right_column_profile_combo))
+                self._matched_columns = True
+                matched_note = "Columns matched left and right (symmetric building)."
+                if left is not None and right is not None and left.name != right.name:
+                    stiffer = max((left, right), key=lambda p: (p.I_analysis, p.A))
+                    if stiffer is right:
+                        self.left_column_profile_combo.setCurrentIndex(
+                            self.left_column_profile_combo.findText(self.right_column_profile_combo.currentText()))
+                    self._sync_matched_columns()
+                    matched_note += f" The start's {left.name} / {right.name} became {stiffer.name} both sides."
+                    self.generate_and_solve()
+                starting_state_for_failure = original_state
             active_specs = self.active_auto_size_group_specs()
             start_ratio, start_group, start_check = self.auto_size_overall_ratio(active_specs)
             start_cost = float((self.costing_summary or {}).get("total_cost", float("inf")))
@@ -18578,6 +18872,7 @@ class MainWindow(QMainWindow):
                     failure_report.extend(["", "Exact basin repair", *repair_lines])
                 failure_report.extend([
                     "",
+                    *([depth_clamp_note] if depth_clamp_note else []),
                     "No reduced candidate reached a verified detailed design; the starting design was restored.",
                 ])
                 self.auto_size_report_text = "\n".join(failure_report)
@@ -18782,6 +19077,8 @@ class MainWindow(QMainWindow):
                 report.extend(["", "Detailed web refinement", *[f"  {line}" for line in web_lines]])
             report.extend([
                 "",
+                *([depth_clamp_note] if depth_clamp_note else []),
+                *([matched_note] if matched_note else []),
                 f"Starting design: ${start_cost:,.0f}, {start_group} {start_check} {start_ratio:.3f}",
                 f"Final design: ${final_cost:,.0f}, {final_group} {final_check} {final_ratio:.3f}",
                 (
@@ -18831,15 +19128,19 @@ class MainWindow(QMainWindow):
                 "screen_seconds": screen_seconds,
                 "elapsed_seconds": elapsed,
                 "report": self.auto_size_report_text,
+                **({"depth_clamp_note": depth_clamp_note} if depth_clamp_note else {}),
             }
         except Exception as error:
             if starting_state is not None and not adopted:
-                self.auto_size_restore_state(starting_state)
+                # With matched columns, put back the user's own (possibly unequal) columns.
+                self._matched_columns = False
+                self.auto_size_restore_state(starting_state_for_failure or starting_state)
                 self.generate_and_solve()
             if show_completion:
                 QMessageBox.critical(self, "Optimise failed", str(error))
             return {"verified": False, "error": str(error), "exact_solves": exact_solves}
         finally:
+            self._matched_columns = False
             if button is not None:
                 button.setText(button_text)
                 button.setEnabled(True)
@@ -19260,6 +19561,13 @@ class MainWindow(QMainWindow):
             status = "OK" if ratio <= 1.0 else "NOT OK"
             return demand, limit, ratio, status, divisor, item
 
+        def crane_gauge_change_check():
+            item = self.design_envelope_actions.get("sls_crane_gauge_change", {})
+            limit = item.get("limit_mm") or CRANE_GAUGE_CHANGE_LIMIT_MM
+            demand = max(item.get("value", -1.0), 0.0)
+            ratio = demand / limit if limit > 1e-12 else float("inf")
+            return demand, limit, ratio, "OK" if ratio <= 1.0 else "NOT OK", item
+
         def column_midspan_ws_deflection_check(group=None):
             if group is None:
                 item = self.design_envelope_actions.get("sls_column_midspan_ws_deflection", {})
@@ -19529,10 +19837,19 @@ class MainWindow(QMainWindow):
         column_deflection_parts = [
             f"Top {deflection_status} {deflection_ratio:.3f} (H/{deflection_divisor:.0f})",
         ]
+        # Report only (greyed, not in the pass/fail): the frame alone gets no
+        # help from its neighbours; crane rail racking is a 3D check.
+        crane_racking_note = ""
         if crane_deflection_item.get("value", -1.0) >= 0.0:
-            column_deflection_statuses.append(crane_deflection_status)
+            crane_racking_note = (
+                f"crane racking, frame alone {crane_deflection_demand:.2f}/{crane_deflection_limit:.2f} mm = "
+                f"{crane_deflection_ratio:.3f} (H/{crane_deflection_divisor:.0f}) - report only, checked in 3D"
+            )
+        gauge_demand, gauge_limit, gauge_ratio, gauge_status, gauge_item = crane_gauge_change_check()
+        if gauge_item.get("value", -1.0) >= 0.0:
+            column_deflection_statuses.append(gauge_status)
             column_deflection_parts.append(
-                f"crane rail {crane_deflection_status} {crane_deflection_demand:.2f}/{crane_deflection_limit:.2f} mm = {crane_deflection_ratio:.3f} (H/{crane_deflection_divisor:.0f})"
+                f"crane gauge {gauge_status} {gauge_demand:.2f}/{gauge_limit:.0f} mm = {gauge_ratio:.3f}"
             )
         if mid_column_item.get("value", -1.0) >= 0.0:
             column_deflection_statuses.append(mid_column_status)
@@ -19581,14 +19898,6 @@ class MainWindow(QMainWindow):
                 deflection_ratio, deflection_status, deflection_divisor,
             )
         ]
-        if crane_deflection_item.get("value", -1.0) >= 0.0:
-            deflection_candidates.append(
-                deflection_overlay_candidate(
-                    "Crane rail sway", crane_deflection_item, crane_deflection_demand,
-                    crane_deflection_limit, crane_deflection_ratio, crane_deflection_status,
-                    crane_deflection_divisor,
-                )
-            )
         if mid_column_item.get("value", -1.0) >= 0.0:
             deflection_candidates.append(
                 deflection_overlay_candidate(
@@ -19620,10 +19929,17 @@ class MainWindow(QMainWindow):
             "Keep hovering to preview the exaggerated governing shape on the Geometry view.",
         ]))
         self.column_deflection_check_label.setToolTipDuration(30000)
-        self.column_deflection_check_label.setText(
-            "; ".join(column_deflection_parts)
-        )
-        self.column_deflection_check_label.setStyleSheet(f"font-weight: bold; color: {'#b42318' if 'NOT OK' in column_deflection_statuses else '#1b7f3a'};")
+        status_colour = '#b42318' if 'NOT OK' in column_deflection_statuses else '#1b7f3a'
+        if crane_racking_note:
+            self.column_deflection_check_label.setTextFormat(Qt.RichText)
+            self.column_deflection_check_label.setText(
+                f"<span style='color: {status_colour};'>{html.escape('; '.join(column_deflection_parts))}</span>"
+                f"<span style='color: #8a8f98; font-weight: normal;'>; {html.escape(crane_racking_note)}</span>"
+            )
+        else:
+            self.column_deflection_check_label.setTextFormat(Qt.PlainText)
+            self.column_deflection_check_label.setText("; ".join(column_deflection_parts))
+        self.column_deflection_check_label.setStyleSheet(f"font-weight: bold; color: {status_colour};")
         truss_deflection_checks_by_component = truss_deflection_checks()
         side_deflection_checks_by_component = side_midspan_deflection_checks()
         all_truss_deflection_checks = {
@@ -19825,7 +20141,11 @@ class MainWindow(QMainWindow):
         ]
         if crane_deflection_item.get("value", -1.0) >= 0.0:
             serviceability_lines.append(
-                f"{crane_deflection_item.get('label', 'Crane rail deflection SLS')}: {crane_deflection_demand:.3f} mm <= {crane_deflection_limit:.3f} mm (H/{crane_deflection_divisor:.0f}) | Node {crane_deflection_item.get('node', '-')} | {crane_deflection_item.get('combo', '-')} | utilisation {crane_deflection_ratio:.3f} | {crane_deflection_status}"
+                f"{crane_deflection_item.get('label', 'Crane rail racking SLS')} (mean of both rails, frame alone): {crane_deflection_demand:.3f} mm vs {crane_deflection_limit:.3f} mm (H/{crane_deflection_divisor:.0f}) | Nodes {crane_deflection_item.get('node', '-')} | {crane_deflection_item.get('combo', '-')} | utilisation {crane_deflection_ratio:.3f} | REPORT ONLY - not a 2D check; neighbouring frames share crane loads through the roof bracing (3D check)"
+            )
+        if gauge_item.get("value", -1.0) >= 0.0:
+            serviceability_lines.append(
+                f"{gauge_item.get('label', 'Crane rail gauge change SLS')} (right minus left): {gauge_demand:.3f} mm <= {gauge_limit:.3f} mm | Nodes {gauge_item.get('node', '-')} | {gauge_item.get('combo', '-')} | utilisation {gauge_ratio:.3f} | {gauge_status}"
             )
         if mid_column_item.get("value", -1.0) >= 0.0:
             serviceability_lines.append(

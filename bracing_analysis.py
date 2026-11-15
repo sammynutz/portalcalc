@@ -9,7 +9,7 @@ import math
 
 import numpy as np
 
-from bracing_layout import brace_group
+from bracing_layout import FACE_LABELS, brace_group
 
 
 class AnalysisError(ValueError):
@@ -265,7 +265,9 @@ class AxialModel3D:
             "displacements_mm": displacement.reshape((-1, 3)).tolist(),
             "support_reactions_n": [{"node": i, "label": self.node_labels[i],
                                      "point_mm": self.nodes[i], "force_n": reaction[3*i:3*i+3].tolist()}
-                                    for i in range(len(self.nodes)) if 3*i in self.fixed],
+                                    # Any held direction (two-tier wall nodes are held in two).
+                                    for i in range(len(self.nodes))
+                                    if any(3*i+k in self.fixed for k in range(3))],
             "members": [{"id": m.id, "kind": m.kind, "panel_id": m.panel_id,
                          "start": m.start, "end": m.end, "length_mm": lengths[i],
                          "area_mm2": m.area_mm2, "modulus_mpa": m.modulus_mpa,
@@ -512,6 +514,7 @@ class PortalReduction:
 
 
 CANOPY_EDGE = "canopy edge"   # node label suffix for open-canopy edge nodes
+WALL_TIER = "wall tier"       # node label suffix for two-tier side-wall nodes on the columns
 
 
 def building_sway_node(label, height_mm):
@@ -519,21 +522,32 @@ def building_sway_node(label, height_mm):
 
     Global sway is measured on the main building above ground (portal roof
     nodes over the columns and roof), not at open canopy edges: a canopy edge
-    moves with its own canopy bracing beyond the column line.
+    moves with its own canopy bracing beyond the column line. Two-tier wall
+    nodes part-way up the columns are not roof sway either.
     """
-    return height_mm > 0 and not str(label).endswith(CANOPY_EDGE)
+    return height_mm > 0 and not str(label).endswith((CANOPY_EDGE, WALL_TIER))
 
 
 def build_braced_building(layout, portal, strut_area_mm2, roof_brace_area_mm2,
                          wall_brace_area_mm2, end_brace_area_mm2, end_post_area_mm2,
                          end_post_faces=("front_end", "back_end"), strut_overrides=None, brace_moduli=None,
-                         canopy_brace_area_mm2=None, portal_brace_sections=None):
+                         canopy_brace_area_mm2=None, portal_brace_sections=None,
+                         wall_tier_strut_area_mm2=None, runway_area_mm2=None):
     """Assemble the braced building network.
 
     ``portal_brace_sections`` is ``{'column': profile, 'beam': profile}`` for the
     layout's portal frame braces; each is condensed onto the Y translations of
     its two eave nodes (``bracing_portal_brace``) and listed in
     ``model.portal_braces`` for recovery.
+
+    Two-tier side-wall bays (``BracingPanel.tier_z_mm``) are braced as two X's
+    meeting at tier nodes on the columns. A tier node is held in X and Z by its
+    column and is free along the building (column minor-axis stiffness
+    ignored). On crane walls (``geometry.wall_tier_z_mm``) every frame has a
+    tier node and the runway beam (``runway_area_mm2``, kind 'runway_beam',
+    not designed here) links them all as the continuous strut; tall non-crane
+    bays get a mid-height strut (kind 'wall_tier_strut'). Crane wall tier
+    nodes are in ``model.wall_tier_nodes[(face, frame)]`` for buffer loads.
     """
     if not layout.selection:
         raise AnalysisError("Pin the brace panels to analyse in the 3D location editor first. Available panels are not installed braces.")
@@ -594,6 +608,35 @@ def build_braced_building(layout, portal, strut_area_mm2, roof_brace_area_mm2,
                 top = node((x, y, g.roof_z(x)))
                 model.add_member(AxialMember(f"post/{face}/{j}", base, top,
                                             positive(end_post_area_mm2, "End-post area"), kind="end_post"))
+    tier_planes = {}
+
+    def tier_node(point, label, out_of_plane=0):
+        # On a column or end post: held out of the wall's plane (X for side
+        # walls, Y for end walls) and vertically (the column/post carries it),
+        # free in the wall's plane. A corner node in both planes is free in both.
+        index = node(point, f"{label}, {WALL_TIER}")
+        planes = tier_planes.setdefault(index, set())
+        planes.add(out_of_plane)
+        model.fixed.add(3*index+2)
+        model.fixed.difference_update((3*index, 3*index+1))
+        if len(planes) == 1:
+            model.fixed.add(3*index+out_of_plane)
+        return index
+
+    model.wall_tier_nodes = {}
+    model.post_tiers = {}   # end post member id -> tier nodes on it
+    crane_walls = g.wall_tier_z_mm is not None
+    if crane_walls:
+        for face, x in (("left_wall", 0.), ("right_wall", g.span_mm)):
+            if not any(layout.panels[p].face == face for p in layout.pinned):
+                raise AnalysisError(f"The crane runway on the {FACE_LABELS[face].lower()} needs braced bays in that wall "
+                                    "to take the crane buffer and longitudinal forces")
+            for i, y in enumerate(g.bay_stations_mm):
+                model.wall_tier_nodes[(face, i)] = tier_node((x, y, g.wall_tier_z_mm), f"{face} frame {i+1}")
+            for i in range(len(g.bay_stations_mm)-1):
+                model.add_member(AxialMember(f"runway/{face}/bay/{i}", model.wall_tier_nodes[(face, i)],
+                                            model.wall_tier_nodes[(face, i+1)],
+                                            positive(runway_area_mm2, "Crane runway beam area"), kind="runway_beam"))
     for identifier in sorted(layout.pinned):
         panel = layout.panels[identifier]
         kind = brace_group(panel.face)
@@ -601,13 +644,27 @@ def build_braced_building(layout, portal, strut_area_mm2, roof_brace_area_mm2,
                 "wall_brace": wall_brace_area_mm2, "canopy_brace": canopy_brace_area_mm2}[kind]
         if area is None:
             raise AnalysisError("Select a canopy brace section to analyse braced canopy panels")
-        for j, (a, b) in enumerate(panel.diagonals):
+        end_face = panel.face in ("front_end", "back_end")
+        tier = [tier_node(point, identifier, 1 if end_face else 0) for point in panel.tier_points]
+        if end_face:
+            # The post below a tier node also carries the node's vertical force.
+            for point, index in zip(panel.tier_points, tier):
+                station = list(g.end_wall_stations_mm).index(point[0])
+                if 0 < station < len(g.end_wall_stations_mm)-1:   # the corners are portal columns
+                    model.post_tiers.setdefault(f"post/{panel.face}/{station}", set()).add(index)
+        for j, (a, b) in enumerate(panel.brace_diagonals):
             start = node(a, f"{identifier}, base", abs(a[2]) < 1e-6)
             end = node(b, f"{identifier}, base", abs(b[2]) < 1e-6)
             model.add_member(AxialMember(f"brace/{identifier}/{j}", start, end,
                                         positive(area, "Brace area"), tension_only=True,
                                         modulus_mpa=positive((brace_moduli or {}).get(kind, 200000.), "Brace modulus"),
                                         kind=kind, panel_id=identifier))
+        if tier and panel.tier == "tall":
+            # Mid-height wall strut between the two X's (crane walls use the runway beam).
+            model.add_member(AxialMember(f"wall_strut/{identifier}", *tier,
+                                        positive(wall_tier_strut_area_mm2 if wall_tier_strut_area_mm2 is not None
+                                                 else strut_area_mm2, "Wall tier strut area"),
+                                        kind="wall_tier_strut", panel_id=identifier))
     model.portal_braces = []
     if layout.portal_braces:
         from bracing_portal_brace import PortalBraceError, PortalBraceFrame
@@ -790,11 +847,47 @@ def load_path_evidence(nodes, result, workings, portal_braces=()):
             'basis':'End-wall normal pressure acts along Y, including the varying front/back suction under transverse wind. Roof/struts transfer roof-applied Y forces to side-wall bracing and any enabled SLS side-wall diaphragms. Normal roof/side-wall pressures also act through the portals, producing transverse X/Z reactions and coupled tie/brace forces. Front/back end-wall braces lie in X/Z: they can resist transverse roof/portal actions but have zero direct Y resistance. ULS transverse cases use conventional bracing only.'}
 
 
+def post_tier_forces(model, result):
+    """End posts with two-tier brace nodes: design axial force below the tier.
+
+    The post is one base-to-top member; a tier node on it is held vertically,
+    and that vertical reaction is really carried by the post below the node.
+    The post's design force (``axial_n``) becomes the more compressive of the
+    part above the tier (the member force) and below it (member force less
+    the tier reactions), else the larger tension. Both parts are recorded.
+    """
+    tiers = getattr(model, 'post_tiers', None)
+    if not tiers:
+        return
+    vertical = {item['node']: item['force_n'][2] for item in result['support_reactions_n']}
+    for member in result['members']:
+        nodes = tiers.get(member['id'])
+        if not nodes or member['kind'] != 'end_post':
+            continue
+        above = member['axial_n']
+        below = above - sum(vertical.get(n, 0.) for n in nodes)
+        member.update(axial_n_above_tier=above, axial_n_below_tier=below,
+                      axial_n=min(above, below) if min(above, below) < 0 else max(above, below))
+
+
 def solve_building_case(model, layout, portal, portal_dofs, point_nodes, case, member_forces=True):
     loads, workings = end_wall_load_vector(model, layout, point_nodes, case["front_kpa"], case["back_kpa"],case.get('end_wall_pressure_segments'))
     drag_loads,drag_workings=roof_drag_load_vector(model,layout,point_nodes,case.get('roof_drag'))
     loads+=drag_loads
     workings+=drag_workings
+    if case.get('wall_tier_loads'):
+        # Crane buffer impact: along-building forces at the runway level of a frame.
+        nodes = getattr(model, 'wall_tier_nodes', {})
+        total = 0.
+        for item in case['wall_tier_loads']:
+            key = (item['face'], int(item['frame']))
+            if key not in nodes:
+                raise AnalysisError('Crane buffer loads need the crane runway level in the bracing layout')
+            loads[3*nodes[key]+1] += float(item['fy_n'])
+            total += float(item['fy_n'])
+        # Reported with the roof-applied forces: the runway level is above ground.
+        workings.append({'face': 'crane_buffer', 'roof_resultant_n': total, 'direct_ground_resultant_n': 0.,
+                         'items': copy.deepcopy(case['wall_tier_loads'])})
     network_loads = loads.copy()
     portal_states = case.get('portal_loads')
     if portal_states is not None and len(portal_states) != len(portal_dofs):
@@ -806,6 +899,7 @@ def solve_building_case(model, layout, portal, portal_dofs, point_nodes, case, m
         loaded_portals.append(loaded)
         loads[dofs] += loaded.equivalent_load
     result = model.solve(loads, allow_neutral_equilibrium=case.get('gravity_only',False))
+    post_tier_forces(model, result)
     displacements = np.asarray(result["displacements_mm"]).reshape(-1)
     portals = []
     support_forces = np.array([item["force_n"] for item in result["support_reactions_n"]], dtype=float).reshape((-1, 3))

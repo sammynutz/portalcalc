@@ -433,3 +433,126 @@ def calculate_crane_beam(inputs: CraneBeamInputs) -> CraneBeamResults:
         composite_zmin_mm3=composite_zmin,
         composite_ry_mm=composite_ry,
     )
+
+
+# Portal crane bracket geometry (project-adopted, 2026-11-13).
+CRANE_RAIL_CLEARANCE_MM = 950.0     # bottom chord node to the top of the runway beam
+CRANE_BEAM_FACE_OFFSET_MM = 300.0   # inside column face to the runway beam centreline
+CRANE_GAUGE_CHANGE_LIMIT_MM = 15.0  # change in rail gauge under the crane in service
+# Long-travel buffer force per rail, kN = a + b * capacity (t) + c * crane span (m).
+# Fitted (2026-11-14) to supplier data sheets for 5 t x 14/15/30 m, 10 t x 24 m and
+# 20 t x 23 m single-girder cranes (10 t x 18 m, 28 kN, omitted as an outlier),
+# with the constant raised to cover every kept sheet.
+BUFFER_RULE = (9.0, 2.8, 1.33)
+BUFFER_ULS_FACTOR = 1.5   # project-adopted, on the full force at both rails
+
+
+def buffer_force_rule_kn(capacity_t: float, crane_span_mm: float) -> float:
+    """Default long-travel buffer force per rail (kN) from capacity and crane span."""
+    a, b, c = BUFFER_RULE
+    return a + b * max(capacity_t, 0.0) + c * max(crane_span_mm, 0.0) / 1000.0
+
+
+def _support_reaction(span_mm: float, wheelbase_mm: float, p1_kn: float, p2_kn: float) -> float:
+    """Largest frame reaction from two wheels on simply supported spans either side of the frame.
+
+    The larger wheel is over the frame and the other is one wheelbase into
+    the adjacent span: R = P_large + P_small * (L - a) / L.
+    """
+    span = max(span_mm, 1.0)
+    wheelbase = _clamp(wheelbase_mm, 0.0, span)
+    large, small = sorted((abs(p1_kn), abs(p2_kn)), reverse=True)
+    return large + small * (span - wheelbase) / span
+
+
+def portal_crane_reactions(inputs: CraneBeamInputs) -> dict:
+    """Crane actions on one portal from the runway beam calculation (kN per column).
+
+    - Vertical, crab side: the Pmax wheels; other side at the same time: the
+      Pmin wheels. ULS uses the dynamic wheel loads x the hoisted factor, SLS
+      the static wheel loads.
+    - Lateral: the lateral (inertia) wheel forces, the same direction on both
+      columns; ULS x the inertial factor. The oblique force stays a runway
+      beam check only.
+    - Permanent: runway beam and rail self weight, w x L on each column.
+    """
+    span, wheelbase = inputs.span_mm, inputs.wheelbase_mm
+
+    def reaction(p1, p2):
+        return _support_reaction(span, wheelbase, p1, p2)
+
+    return {
+        "span_mm": span,
+        "wheelbase_mm": _clamp(wheelbase, 0.0, max(span, 1.0)),
+        "uls_vertical_max_kn": reaction(inputs.pmax_21_kn, inputs.pmax_22_kn) * inputs.hoisted_factor,
+        "uls_vertical_min_kn": reaction(inputs.pmin_11_kn, inputs.pmin_12_kn) * inputs.hoisted_factor,
+        "sls_vertical_max_kn": reaction(inputs.pstatic_21_kn, inputs.pstatic_22_kn),
+        "sls_vertical_min_kn": reaction(inputs.pstatic_min_11_kn, inputs.pstatic_min_12_kn),
+        "uls_lateral_kn": reaction(inputs.phb_21_kn, inputs.phb_22_kn) * inputs.inertial_factor,
+        "sls_lateral_kn": reaction(inputs.phb_21_kn, inputs.phb_22_kn),
+        "permanent_kn": (inputs.beam_self_weight_kn_m + inputs.rail_self_weight_kn_m) * max(span, 1.0) / 1000.0,
+        "hoisted_factor": inputs.hoisted_factor,
+        "inertial_factor": inputs.inertial_factor,
+        "runway_depth_mm": inputs.composite_depth_mm if inputs.composite_depth_mm > 0.0 else inputs.beam_depth_mm,
+        # The runway beam acts as the longitudinal strut at rail level in the 3D bracing model.
+        "runway_area_mm2": inputs.composite_area_mm2 if inputs.composite_area_mm2 > 0.0 else 0.0,
+    }
+
+
+def crane_case(position):
+    """(crab side, lateral sign) from a ``crane_position`` such as "left:+x", or None."""
+    side, _, direction = str(position or "").partition(":")
+    if side not in ("left", "right"):
+        return None
+    return side, (-1.0 if direction == "-x" else 1.0 if direction == "+x" else 0.0)
+
+
+def crane_column_actions(crane_portal, crane_position, serviceability, g_factor):
+    """({side: [vertical kN down, lateral kN +X]}, description) for one combination.
+
+    The runway beam self weight is permanent (x g_factor) on both columns. In a
+    crane case the crab side takes the Pmax reaction and the other side the
+    Pmin reaction, and the lateral force acts the same way on both columns.
+    ULS: dynamic wheels x hoisted factor, lateral x inertial factor; SLS:
+    static wheels, unfactored lateral. Shared by the 2D frame (main.py) and the
+    3D bracing model so both apply identical crane loads.
+    """
+    permanent = crane_portal["permanent_kn"] * max(g_factor, 0.0)
+    actions = {"left": [permanent, 0.0], "right": [permanent, 0.0]}
+    case = crane_case(crane_position)
+    if case is None:
+        return actions, "runway self weight only"
+    crab, lateral_sign = case
+    level = "sls" if serviceability else "uls"
+    other = "right" if crab == "left" else "left"
+    actions[crab][0] += crane_portal[f"{level}_vertical_max_kn"]
+    actions[other][0] += crane_portal[f"{level}_vertical_min_kn"]
+    for side in actions:
+        actions[side][1] = lateral_sign * crane_portal[f"{level}_lateral_kn"]
+    direction = "+X" if lateral_sign > 0 else "-X" if lateral_sign < 0 else "none"
+    return actions, f"crab {crab}, lateral {direction} on both columns ({level.upper()})"
+
+
+def apply_crane_actions(structure, nodes, crane_portal, crane_position, serviceability, g_factor):
+    """Apply the crane column actions as nodal loads; returns display arrows (x, y, fx N, fy N).
+
+    ``nodes`` is {"left": node, "right": node} at the crane stub mid heights.
+    The vertical reaction acts at the runway beam centreline, inward of the
+    column centreline (+X on the left column, -X on the right), so it carries
+    an eccentric moment.
+    """
+    actions, _ = crane_column_actions(crane_portal, crane_position, serviceability, g_factor)
+    arrows = []
+    for side in ("left", "right"):
+        node = nodes[side]
+        vertical_kn, lateral_kn = actions[side]
+        eccentricity_mm = crane_portal["nodes"][side]["eccentricity_mm"] * (1.0 if side == "left" else -1.0)
+        vertical_n, lateral_n = vertical_kn * 1000.0, lateral_kn * 1000.0
+        if abs(vertical_n) > 1e-9:
+            structure.add_load(node.uy, -vertical_n)
+            structure.add_load(node.rz, eccentricity_mm * -vertical_n)
+            arrows.append((node.x + eccentricity_mm, node.y, 0.0, -vertical_n))
+        if abs(lateral_n) > 1e-9:
+            structure.add_load(node.ux, lateral_n)
+            arrows.append((node.x, node.y, lateral_n, 0.0))
+    return arrows

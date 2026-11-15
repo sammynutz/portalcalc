@@ -159,15 +159,16 @@ def sway_proposal(context, result, chosen, candidates, criteria, rates, tried):
         evidence['fallback'] = 'No eligible untried upgrade'
         return None, evidence
 
-    local = {**context, **{g: chosen[g] for g in SCREEN_GROUPS if g in chosen}}
+    local = {**context, **{g: chosen[g] for g in SCREEN_GROUPS + ('wall_tier_strut',) if g in chosen}}
     _, model, _, _, _, _ = prepare_analysis_models(local, chosen['strut'], chosen['end_post'])
     divisor = global_sway_basis(result, criteria, context)['divisor']
     # The same main-building nodes as the global sway check (no canopy edges).
     responses = [MovementResponse(f'Node {i+1} longitudinal sway', ((3*i+1, 1.),), p[2]/divisor)
                  for i, p in enumerate(model.nodes) if building_sway_node(model.node_labels[i], p[2])]
-    # Longitudinal acceptance only: transverse SLS frame sway does not govern.
+    # Longitudinal acceptance only: transverse SLS frame sway does not govern,
+    # and crane rail racking has its own check (bracing_design.attach_design).
     cases = [case for case in result['cases'] if case['case']['level'] == 'SLS'
-             and case['case'].get('wind_family') != 'transverse']
+             and case['case'].get('wind_family') not in ('transverse', 'crane')]
     screen = LightweightSlsScreen(model, cases, responses)
     baseline = max(screen.ratio(u) for u, _ in screen.derivatives)
     evidence['baseline_ratio'] = baseline

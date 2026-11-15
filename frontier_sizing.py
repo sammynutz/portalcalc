@@ -140,8 +140,13 @@ class Progress:
             window.optimisation_progress_listener = previous
 
 
-def bracing_points(context, candidates, criteria, practical, progress=None):
+def bracing_points(context, candidates, criteria, practical, progress=None, portal_braces=False):
     """3D-checked bracing options with the unrestrained frame.
+
+    ``portal_braces`` also tries portal frame braces on a side wall whose end
+    bays can't take X bracing (``portal_brace_seeds``). Off by default: on the
+    test projects they were never cheaper than roof bracing. Portal braces the
+    user pins are always kept, analysed and sized.
 
     The girder-layout sizings and the stepped-rod checks are independent, so
     each batch runs in worker processes (``bracing_parallel``); the result is
@@ -154,7 +159,8 @@ def bracing_points(context, candidates, criteria, practical, progress=None):
     unpinned = shared._with_layout(context, ())
     seeds = [(reason, set(selected)) for reason, selected in practical_seeds(unpinned, set()) if 'girder' in reason]
     extra = [(reason, set(selected)) for reason, selected in full_roof_seeds(unpinned)]
-    extra += [(reason, set(selected)) for reason, selected in portal_brace_seeds(unpinned)]
+    if portal_braces:
+        extra += [(reason, set(selected)) for reason, selected in portal_brace_seeds(unpinned)]
     # Each layout is sized from the practical sections and from the lightest
     # rods; the fast auto-size does not come far down from heavy sections, so
     # a light start can find a much cheaper passing set. The cheaper pass is kept.
@@ -345,12 +351,18 @@ def optimise(window, *, progress=None):
     topology = getattr(window, '_suppress_panel_topology_search', None)
     if topology is not None:
         window._suppress_panel_topology_search = True
+    # Read before any sizing: the 2D auto-size clamps the depth into range.
+    note = getattr(window, 'truss_depth_outside_range_note', lambda: '')()
     try:
         suspended = getattr(window, 'suspended_plotting', None)
         if suspended is None:
-            return _optimise(window, progress=progress)
-        with suspended():
-            return _optimise(window, progress=progress)
+            report = _optimise(window, progress=progress)
+        else:
+            with suspended():
+                report = _optimise(window, progress=progress)
+        if note:
+            report['warnings'] = [*report.get('warnings', []), note]
+        return report
     finally:
         if history is not None:
             window._history_suspended = history
@@ -389,7 +401,12 @@ def _optimise(window, *, progress=None):
                                                          .4*min(1., step/max(total, 1))))
         report('Sizing girder bracing layouts', .4)
         report.span(.4, 1.)
-        points = bracing_points(search_context, candidates, criteria, (layout, chosen), progress=report)
+        # Portal frame brace options are opt-in (workspace setting
+        # layout_search.try_portal_braces); pinned portal braces are always kept.
+        try_portal_braces = bool(((window.bracing_3d_settings or {}).get('layout_search') or {})
+                                 .get('try_portal_braces', False))
+        points = bracing_points(search_context, candidates, criteria, (layout, chosen), progress=report,
+                                portal_braces=try_portal_braces)
         counts['bracing_3d'] += len(points)
         options = frontier(points)
         if not options:
@@ -583,4 +600,6 @@ def report_text(report):
                      + ('same result, saved; reopen the workspace to inspect members.' if check['matches'] else
                         f"{'PASS' if check['passes'] else 'FAIL / UNVERIFIED'}, bracing ${money(check['estimated_cost'])} "
                         f"(optimiser ${money(best['bracing_cost'])}). Review in the 3D workspace."))
+    if report.get('warnings'):
+        lines += ['', *report['warnings']]
     return '\n'.join(lines)
