@@ -47,7 +47,7 @@ proposal that needs engineering review.
 ## Test
 
 ```powershell
-python run_tests.py                 # everything, about 30 minutes
+python run_tests.py                 # everything, 10 to 15 minutes
 python run_tests.py bracing_layout  # scripts whose name contains a word
 python tests/smoke_checks.py --quick
 ```

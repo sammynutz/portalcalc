@@ -3,7 +3,7 @@
 Each script runs in its own process, a few at a time, with the offscreen Qt
 platform and licensing off. Logs go to build/test-logs/<script>.log.
 
-    python run_tests.py                 # everything (about 30 minutes)
+    python run_tests.py                 # everything (10 to 15 minutes)
     python run_tests.py bracing purlin  # only scripts whose name contains a word
     python run_tests.py --jobs 2
 """

@@ -274,7 +274,7 @@ For packaging/release changes:
 From the repository root:
 
 ```powershell
-python run_tests.py                      # every regression script and the smoke checks (about 30 minutes)
+python run_tests.py                      # every regression script and the smoke checks (10 to 15 minutes)
 python run_tests.py bracing_layout       # only scripts whose name contains a word
 python tests/smoke_checks.py --quick     # fastest broad check
 python tests/bay_layout_regression.py    # one script directly
