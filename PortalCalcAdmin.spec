@@ -7,12 +7,12 @@ from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
 
-datas = [("assets", "assets")]
+datas = [("portalcalc/data/assets", "portalcalc/data/assets")]
 datas += collect_data_files("certifi")
 
 a = Analysis(
-    ["license_generator_app.py"],
-    pathex=[],
+    ["portalcalc/desktop/license_generator_app.py"],
+    pathex=["."],
     binaries=[],
     datas=datas,
     hiddenimports=[
@@ -65,7 +65,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon="assets/portalcalc_icon.ico",
+    icon="portalcalc/data/assets/portalcalc_icon.ico",
 )
 coll = COLLECT(
     exe,

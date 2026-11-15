@@ -7,31 +7,24 @@ from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
 
-datas = [
-    ("Shape_Catalog.xlsx", "."),
-    ("metroll_megaspan_capacity_tables.json", "."),
-    ("EULA.txt", "."),
-    ("presets", "presets"),
-    ("assets", "assets"),
-]
+# Section catalogue, capacity tables, factory defaults, EULA and brand assets.
+datas = [("portalcalc/data", "portalcalc/data")]
 datas += collect_data_files("certifi")
 datas += collect_data_files("reportlab", includes=["fonts/*.ttf"])
 
 a = Analysis(
     ["main.py"],
-    pathex=[],
+    pathex=["."],
     binaries=[],
     datas=datas,
     hiddenimports=[
-        "portalcalc_service",
-        "portalcalc_headless",
-        "configurator_review",
+        "portalcalc.service.contract",
+        "portalcalc.service.headless",
+        "portalcalc.service.configurator_review",
         "matplotlib.backends.backend_qtagg",
         "PySide6.QtCore",
         "PySide6.QtGui",
         "PySide6.QtWidgets",
-        "PySide6.QtOpenGL",
-        "PySide6.QtOpenGLWidgets",
     ],
     hookspath=[],
     hooksconfig={},
@@ -76,7 +69,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon="assets/portalcalc_icon.ico",
+    icon="portalcalc/data/assets/portalcalc_icon.ico",
 )
 coll = COLLECT(
     exe,

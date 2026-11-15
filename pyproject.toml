@@ -1,0 +1,11 @@
+[project]
+name = "portalcalc"
+description = "PortalCalc: structural analysis and design engine for BOLT steel buildings"
+requires-python = ">=3.11"
+dynamic = ["version"]
+
+[tool.pytest.ini_options]
+# Regression scripts are unittest modules named *_regression.py; smoke_checks.py is its own runner.
+testpaths = ["tests"]
+python_files = ["*_regression.py"]
+pythonpath = ["."]

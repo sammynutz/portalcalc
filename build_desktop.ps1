@@ -68,24 +68,24 @@ if (-not (Test-Path -LiteralPath $Python)) {
 }
 
 if (-not $Version) {
-    $Version = (& $Python -c "from app_metadata import APP_VERSION; print(APP_VERSION)")
+    $Version = (& $Python -c "from portalcalc.app_metadata import APP_VERSION; print(APP_VERSION)")
     if ($LASTEXITCODE -ne 0) {
         throw "Reading APP_VERSION failed with exit code $LASTEXITCODE"
     }
 }
 
-if (-not $SkipSmoke -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot "smoke_checks.py"))) {
+if (-not $SkipSmoke -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot "tests\smoke_checks.py"))) {
     $env:QT_QPA_PLATFORM = "offscreen"
     $smokeArg = "--$SmokeMode"
     try {
-        Invoke-Native { & $Python smoke_checks.py $smokeArg } "Smoke checks"
+        Invoke-Native { & $Python tests\smoke_checks.py $smokeArg } "Smoke checks"
     }
     finally {
         Remove-Item Env:\QT_QPA_PLATFORM -ErrorAction SilentlyContinue
     }
 }
 elseif (-not $SkipSmoke) {
-    Write-Warning "Source regression checks are archived. Continuing with packaged startup and report-export checks."
+    Write-Warning "tests\smoke_checks.py not found. Continuing with packaged startup and report-export checks."
 }
 
 Invoke-Native { & $Python -m PyInstaller --noconfirm --clean PortalCalc.spec } "PortalCalc PyInstaller build"
@@ -109,7 +109,7 @@ if ($reportProcess.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $reportSmokeP
 }
 
 New-Item -ItemType Directory -Force -Path "dist\PortalCalc\presets" | Out-Null
-Copy-Item -LiteralPath "presets\factory_defaults.json" -Destination "dist\PortalCalc\presets\factory_defaults.json" -Force
+Copy-Item -LiteralPath "portalcalc\data\presets\factory_defaults.json" -Destination "dist\PortalCalc\presets\factory_defaults.json" -Force
 
 $releaseRoot = Join-Path $PWD "release"
 $packageRoot = Join-Path $releaseRoot "PortalCalc-$Version"
@@ -123,8 +123,8 @@ New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
 
 Copy-Item -LiteralPath "dist\PortalCalc" -Destination $packageRoot -Recurse
 Copy-Item -LiteralPath "dist\PortalCalcAdmin" -Destination $packageRoot -Recurse
-Copy-Item -LiteralPath "EULA.txt" -Destination $packageRoot
-Copy-Item -LiteralPath "license_server_README.md" -Destination $packageRoot
+Copy-Item -LiteralPath "portalcalc\data\EULA.txt" -Destination $packageRoot
+Copy-Item -LiteralPath "docs\license_server_README.md" -Destination $packageRoot
 
 if (Test-Path -LiteralPath $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force
