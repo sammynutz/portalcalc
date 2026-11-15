@@ -44,9 +44,12 @@ and an engine that BOLT can call directly.
   `portalcalc/frame/engine/host.py`.
 - `portalcalc.desktop.main_window.MainWindow` is that engine plus the Qt user
   interface, which lives in the mixin modules in `portalcalc/desktop/`.
+- `portalcalc.frame.engine.headless.HeadlessFrameEngine` is the same engine with
+  plain input fields (`engine/fields.py`) built from `engine/form_schema.json`:
+  no window, no Qt.
 - `portalcalc.service.calculate(request)` is the entry point for other
-  applications. Its backend (`portalcalc/service/headless.py`) still creates an
-  offscreen `MainWindow` to supply the input fields; see Current Refactor Pressure.
+  applications. Its backend (`portalcalc/service/headless.py`) runs the request on
+  a `HeadlessFrameEngine`.
 
 Generated or packaged output lives in `build/`, `dist/`, `release/` and
 `__pycache__/`. Do not inspect those first unless the task is about packaging.
@@ -72,7 +75,10 @@ Release packaging is performed only when the user explicitly asks. Routine chang
 | `portalcalc/frame/sections.py`, `portalcalc/frame/solver.py`, `portalcalc/frame/common.py` | Section catalogue (`SectionProfile`, `ShapeCatalog`); 2D direct-stiffness solver (`Node`, `FrameElement2D`, `Structure2D`); shared constants, lookup tables and small helpers. |
 | `portalcalc/desktop/main_window.py` and the mixins beside it | The Qt window: form construction (`ui_build.py`), menus and dialogs (`menus.py`), preset files and undo (`preset_files.py`), Configurator Review (`review_ui.py`), visibility/theme/plot refresh (`view_state.py`), bracing dialogs (`bracing_actions.py`), custom widgets (`widgets.py`, `plot_canvas.py`) and branding (`branding.py`). |
 | `portalcalc/service/contract.py` | Qt-free calculation request/result contract, validation, linked-chord and live/snow policy, frozen request hashing and proposal provenance. |
-| `portalcalc/service/headless.py` | Offscreen compatibility backend that runs the current desktop calculation through the service contract while orchestration is extracted from `MainWindow`. |
+| `portalcalc/service/headless.py` | Service backend: applies a prepared request to a `HeadlessFrameEngine`, solves or sizes it and returns the dossier; combines per-group dossiers for v2 building requests. |
+| `portalcalc/frame/engine/headless.py`, `fields.py`, `form_schema.json` | The engine without a window. `fields.py` holds plain text/choice/tick/number fields with the small part of the widget interface the engine uses; `form_schema.json` is every field's starting value and options, generated from the real form by `python -m portalcalc.desktop.form_schema`. |
+| `tests/headless_engine_regression.py` | Holds the headless engine to the desktop: every snapshot scenario solved both ways and compared in full, the schema checked against the form, the change rules checked against the form's wiring, and a service call checked to import no Qt. |
+| `tests/results_snapshot_regression.py`, `tests/fixtures/results_snapshot.json` | Core results guard: 17 representative buildings solved and compared by numbers and selected sections only, never by wording. `--update` accepts new results. |
 | `tests/calculation_service_regression.py` | Frozen end-to-end `checkSpecified` and `autoSize` regression against factory defaults. |
 | `tests/building_service_regression.py` | Includes `ProppedMullionTests`: `MainWindow.propped_mullion_check` (propped end-frame props: frame axial plus end-wall wind via `end_wall.mullion_profile_design`, hooked into `member_and_connection_ratio` for INTERNAL_COLUMN when `propped_end_context()` is set). Service v2 (`portalcalc.calculation.request.v2` with a `building`). Covers the contract and rejections, unchanged v1 digest, `building_with_frame_inputs`/`reviewed_building`, real headless `checkSpecified` with per-gridline evidence and a resubmission round trip, legacy_2d ≥ v1, and v2 Configurator Review. v2 `autoSize` needs `PORTALCALC_SLOW_TESTS=1`. See `CALCULATION_SERVICE.md`. |
 | `portalcalc/service/configurator_review.py` | Configurator Review CLI parsing, request loading, controlled-input/member-selection merge, reviewed/cancelled result envelopes and atomic JSON writing. |
@@ -184,8 +190,8 @@ Search by symbol name (`rg -n "def name"`) rather than by line number.
   design/policy, desktop adaptation and Qt widgets into separate modules.
   Shared purlin modules currently obtain common types from `portalcalc/bracing/analysis.py`.
 - `portalcalc/service/contract.py` is a Qt-free request/result boundary. Its
-  backend in `portalcalc/service/headless.py` still constructs an offscreen
-  `MainWindow`, because the engine reads its inputs from the window's fields.
+  backend in `portalcalc/service/headless.py` runs on `HeadlessFrameEngine`, so a
+  service call never imports Qt (`tests/headless_engine_regression.py` checks this).
 - `portalcalc/frame/` (including `engine/`) and every other package except
   `portalcalc/desktop/` import no Qt. `tests/building_model_regression.py` and the
   split tool's own check guard this for the building model and the engine.
@@ -268,12 +274,21 @@ From the repository root:
 python run_tests.py                      # every regression script and the smoke checks (10 to 15 minutes)
 python run_tests.py bracing_layout       # only scripts whose name contains a word
 python tests/smoke_checks.py --quick     # fastest broad check
+python tests/results_snapshot_regression.py          # core results: numbers only
+python tests/results_snapshot_regression.py --update # accept changed results as the new baseline
 python tests/bay_layout_regression.py    # one script directly
 python -m pytest tests/bay_layout_regression.py
 ```
 
 `run_tests.py` sets the offscreen Qt platform and turns licensing off; the logs
 go to `build/test-logs/`.
+
+The smoke checks fail on values and state only. Where they compare report or screen
+wording they print a `wording note` and carry on; a reworded tooltip, label or report
+line never fails a run.
+
+After changing the input form (`ui_build.py`) or the section catalogue, regenerate the
+engine's field schema: `python -m portalcalc.desktop.form_schema`.
 
 For release packaging:
 
@@ -288,25 +303,30 @@ Use `-SkipSmoke` only after a passing smoke run, as described in `docs/PACKAGING
 Done in the 2026-11-15 restructure: shared constants and types, the section
 catalogue and the 2D solver are their own modules; model generation, checks,
 the optimiser and report assembly are in Qt-free engine modules behind an
-explicit set of UI hooks.
+explicit set of UI hooks; and the engine runs with no window through plain input
+fields, which is what the service uses.
 
 What is still coupled, in the order worth tackling:
 
-1. **Inputs still live in widgets.** The engine reads `self.span_input.text()`
-   and similar. The preset dictionary (`collect_preset_data` /
-   `apply_preset_data`) is already the complete plain-data form of the inputs.
-   Giving the engine a plain field store built from a preset, with the same
-   accessors, lets `FrameEngine` run with no window at all; the desktop then
-   binds its widgets to that store. The work is in `build_ui`: the field
-   defaults, combo option lists and change handlers that derive values must move
-   out of widget construction. Until then `service/headless.py` creates an
-   offscreen `MainWindow`.
-2. **Three very large functions.** `_generate_and_solve_once` (about 2,600
-   lines, `engine/solve.py`), `member_check_envelope_lines` (about 1,500,
-   `engine/member_checks.py`) and `update_section_checks_text` (about 1,200,
-   `engine/results.py`) were moved whole. Break them up along their existing
-   phases (geometry, loads, combinations, solve, envelope) with the regression
-   suite as the guard.
+1. **Two copies of the change rules.** The inputs that make the engine recompute when
+   they change (column matching, storage, bracing sizes) are wired once to the
+   widgets in `ui_build.py` and once to the plain fields in
+   `HeadlessFrameEngine.connect_input_rules`. A test keeps them equal; having the
+   desktop call the engine's method would leave one copy. Likewise the wall and
+   compass selectors have their state logic in both `desktop/widgets.py` and
+   `engine/fields.py`.
+2. **Three very large functions.** `_generate_and_solve_once` (about 2,300
+   lines, `engine/solve.py`), `member_check_envelope_lines` (about 1,400,
+   `engine/member_checks.py`) and `update_section_checks_text` (about 760,
+   `engine/results.py`). The inner helper functions that used nothing local have
+   been lifted out (50 of them, about 830 lines). What remains shares state:
+   `_generate_and_solve_once` has some 370 local variables and 50 inner functions
+   that read them (`apply_combination_loads` reads 40), and
+   `evaluate_combination` inside `member_check_envelope_lines` is 690 lines
+   reading 36. Breaking these up needs a deliberate design: gather the frame
+   geometry and the wind/load context into objects that are passed explicitly,
+   one phase at a time (geometry, loads, combinations, solve, envelope), with
+   `tests/results_snapshot_regression.py` as the guard after every step.
 3. **Results mixed with presentation.** `update_section_checks_text` and
    `update_results_text` both compute checks and write label text. Separate the
    checked result data from its formatting.

@@ -15,12 +15,11 @@ linked chord selections, and records the effective `max(Q, snow service)` load
 policy in the result provenance. Every response is proposal-only and requires a
 human engineering review before quote, Tekla or rendering release.
 
-`portalcalc/service/headless.py` is the isolated compatibility backend for the current
-1.5 working calculation source. It creates no visible window, shows no dialogs,
-and does not write optimiser learning. The service contract itself has no Qt
-dependency. Model generation, checks and the optimiser now live in the Qt-free
-`portalcalc/frame/engine/`; the adapter still creates an offscreen window only to
-hold the input fields (see Current Refactor Pressure in `docs/CODEMAP.md`).
+`portalcalc/service/headless.py` is the backend. It runs the request on
+`HeadlessFrameEngine` (`portalcalc/frame/engine/headless.py`): the frame engine with
+plain input fields, no window and no Qt. It shows no dialogs and does not write
+optimiser learning. `tests/headless_engine_regression.py` holds it to the desktop
+window result for result.
 
 Sizing proposals now include `inputs.calculation_service.main_truss_panel_count`
 alongside automatic web assignments. Supply that optional field on

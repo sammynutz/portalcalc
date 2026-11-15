@@ -60,6 +60,343 @@ from portalcalc.wind import (
 )
 
 
+def _y_at_x(nodes, x):
+    ordered = sorted(nodes, key=lambda node: node.x)
+    if x <= ordered[0].x:
+        return ordered[0].y
+    if x >= ordered[-1].x:
+        return ordered[-1].y
+    for n1, n2 in zip(ordered[:-1], ordered[1:]):
+        if min(n1.x, n2.x) - 1e-9 <= x <= max(n1.x, n2.x) + 1e-9:
+            dx = n2.x - n1.x
+            if abs(dx) <= 1e-9:
+                return n1.y
+            t = (x - n1.x) / dx
+            return n1.y + t * (n2.y - n1.y)
+    return ordered[-1].y
+
+
+def _slope_node_length(nodes):
+    return sum(math.hypot(n2.x - n1.x, n2.y - n1.y) for n1, n2 in zip(nodes[:-1], nodes[1:]))
+
+
+def _slope_midspan_check(key, label, nodes):
+    length_mm = _slope_node_length(nodes)
+    if length_mm <= 1e-9:
+        return None
+    station = 0.0
+    stations = [0.0]
+    for n1, n2 in zip(nodes[:-1], nodes[1:]):
+        station += math.hypot(n2.x - n1.x, n2.y - n1.y)
+        stations.append(station)
+    target = length_mm / 2.0
+    node = min(zip(nodes, stations), key=lambda item: abs(item[1] - target))[0]
+    node_station = min(zip(nodes, stations), key=lambda item: abs(item[1] - target))[1]
+    return {
+        "key": key,
+        "label": label,
+        "node": node,
+        "start": nodes[0],
+        "end": nodes[-1],
+        "station_mm": node_station,
+        "length_mm": length_mm,
+    }
+
+
+def _slope_path_length_m(nodes):
+    total = 0.0
+    for n1, n2 in zip(nodes[:-1], nodes[1:]):
+        total += math.hypot((n2.x - n1.x) / 1000.0, (n2.y - n1.y) / 1000.0)
+    return total
+
+
+def _wind_interval_load_kn(strips, start_m, end_m, scale):
+    total_kn = 0.0
+    for a, b, q_kn_m in strips:
+        overlap = max(0.0, min(end_m, b) - max(start_m, a))
+        total_kn += q_kn_m * scale * overlap
+    return total_kn
+
+
+def _cumulative_roof_distances(nodes):
+    distances = [0.0]
+    for n1, n2 in zip(nodes[:-1], nodes[1:]):
+        distances.append(distances[-1] + math.hypot((n2.x - n1.x) / 1000.0, (n2.y - n1.y) / 1000.0))
+    return distances
+
+
+def _continuous_roof_strips_for_nodes(wind_result, cpe_case, nodes):
+    case = str(cpe_case).strip()
+    if case.startswith("End") or wind_result.inputs.roof_pitch_deg < 10.0 or len(nodes) < 2:
+        return wind_result.case_roof_strips(cpe_case)
+    if getattr(wind_result.inputs, "roof_shape", "Gable") == "Skillion":
+        return wind_result.case_roof_strips(cpe_case)
+
+    distances = _cumulative_roof_distances(nodes)
+    total = distances[-1]
+    if total <= 1e-9:
+        return []
+    ridge_index = max(range(len(nodes)), key=lambda index: nodes[index].y)
+    ridge_s = min(max(distances[ridge_index], 0.0), total)
+    use_max = case.endswith("+")
+
+    def zone_line_load(name):
+        zone = next((item for item in wind_result.roof_zones if item.name == name), None)
+        if zone is None:
+            return 0.0
+        return zone.line_load_max_kn_m if use_max else zone.line_load_min_kn_m
+
+    upwind_q = zone_line_load("Upwind rafter")
+    downwind_q = zone_line_load("Downwind rafter")
+    if case.startswith("Right"):
+        strips = [(0.0, ridge_s, downwind_q), (ridge_s, total, upwind_q)]
+    else:
+        strips = [(0.0, ridge_s, upwind_q), (ridge_s, total, downwind_q)]
+    return [(a, b, q) for a, b, q in strips if b - a > 1e-9]
+
+
+def _canopy_free_roof_part(side_key, cpe_case):
+    case = str(cpe_case).strip()
+    if case.startswith("End"):
+        return "windward"
+    left_wind = case.startswith("Left")
+    if side_key == "left":
+        return "windward" if left_wind else "leeward"
+    return "leeward" if left_wind else "windward"
+
+
+def _add_vertical_line_load_to_nodes(target_structure, nodes, line_kn_m):
+    arrows = []
+    for n1, n2 in zip(nodes[:-1], nodes[1:]):
+        dx = (n2.x - n1.x) / 1000.0
+        dy = (n2.y - n1.y) / 1000.0
+        panel_len_m = math.hypot(dx, dy)
+        total_n = line_kn_m * panel_len_m * 1000.0
+        target_structure.add_load(n1.uy, total_n / 2.0)
+        target_structure.add_load(n2.uy, total_n / 2.0)
+        arrows.append(((n1.x + n2.x) / 2.0, (n1.y + n2.y) / 2.0 + 800.0, 0.0, total_n))
+    return arrows
+
+
+def _add_normal_line_load_to_nodes(target_structure, nodes, line_kn_m):
+    arrows = []
+    for n1, n2 in zip(nodes[:-1], nodes[1:]):
+        dx_m = (n2.x - n1.x) / 1000.0
+        dy_m = (n2.y - n1.y) / 1000.0
+        panel_len_m = math.hypot(dx_m, dy_m)
+        if panel_len_m <= 1e-12:
+            continue
+        # Positive free-roof Cpn frame load is uplift, so choose the
+        # segment normal with positive global-Y component.
+        nx = -dy_m / panel_len_m
+        ny = dx_m / panel_len_m
+        if ny < 0.0:
+            nx = -nx
+            ny = -ny
+        total_fx_n = line_kn_m * panel_len_m * 1000.0 * nx
+        total_fy_n = line_kn_m * panel_len_m * 1000.0 * ny
+        target_structure.add_load(n1.ux, total_fx_n / 2.0)
+        target_structure.add_load(n1.uy, total_fy_n / 2.0)
+        target_structure.add_load(n2.ux, total_fx_n / 2.0)
+        target_structure.add_load(n2.uy, total_fy_n / 2.0)
+        arrows.append((
+            (n1.x + n2.x) / 2.0,
+            (n1.y + n2.y) / 2.0 + 800.0,
+            line_kn_m * 1000.0 * nx,
+            line_kn_m * 1000.0 * ny,
+        ))
+    return arrows
+
+
+def _add_normal_uniform_line_load_to_members(target_structure, nodes, line_kn_m, element_group):
+    """Apply a roof-normal UDL to each matching top-chord member segment."""
+    arrows = []
+    for n1, n2 in zip(nodes[:-1], nodes[1:]):
+        dx_m = (n2.x - n1.x) / 1000.0
+        dy_m = (n2.y - n1.y) / 1000.0
+        panel_len_m = math.hypot(dx_m, dy_m)
+        if panel_len_m <= 1e-12:
+            continue
+
+        # Positive canopy wind load is uplift. Select the segment normal
+        # with a positive global-Y component, then resolve the UDL into
+        # global components for the frame-element member-load routine.
+        nx = -dy_m / panel_len_m
+        ny = dx_m / panel_len_m
+        if ny < 0.0:
+            nx = -nx
+            ny = -ny
+        fx_n_per_mm = line_kn_m * nx  # 1 kN/m = 1 N/mm
+        fy_n_per_mm = line_kn_m * ny
+
+        if hasattr(target_structure, "add_uniform_global_line_load_between"):
+            matched = target_structure.add_uniform_global_line_load_between(
+                n1,
+                n2,
+                fx_n_per_mm=fx_n_per_mm,
+                fy_n_per_mm=fy_n_per_mm,
+                element_groups={element_group},
+            )
+            if not matched:
+                raise ValueError(
+                    f"No {element_group} member found for the requested canopy wind line load."
+                )
+        else:
+            # Lightweight arrow collectors do not contain frame elements.
+            # Preserve the equivalent resultant solely for their display data.
+            total_fx_n = fx_n_per_mm * panel_len_m * 1000.0
+            total_fy_n = fy_n_per_mm * panel_len_m * 1000.0
+            target_structure.add_load(n1.ux, total_fx_n / 2.0)
+            target_structure.add_load(n1.uy, total_fy_n / 2.0)
+            target_structure.add_load(n2.ux, total_fx_n / 2.0)
+            target_structure.add_load(n2.uy, total_fy_n / 2.0)
+
+        arrows.append((
+            (n1.x + n2.x) / 2.0,
+            (n1.y + n2.y) / 2.0 + 800.0,
+            line_kn_m * 1000.0 * nx,
+            line_kn_m * 1000.0 * ny,
+        ))
+    return arrows
+
+
+def _enclosed_cpi_for_case(wind_result, cpi_case):
+    cpi_max, cpi_min = (
+        cyclonic_enclosed_cpi(wind_result.inputs, "Enclosed")
+        or CPI_BY_FRAME_TYPE["Enclosed"]
+    )
+    return cpi_max if str(cpi_case).strip() == "Cpi +" else cpi_min
+
+
+def _table_5_1b_cpi_for_opening(wind_result, cpi_case, cpe_case, wall_key, opening_area_m2, other_open_area_m2):
+    surface = wall_surface_for_cpe_case(cpe_case, wall_key)
+    cpe = wall_cpe_for_surface(wind_result, surface)
+    ratio = float("inf") if other_open_area_m2 <= 1e-12 else opening_area_m2 / other_open_area_m2
+    ka = opening_area_reduction_factor(surface, opening_area_m2)
+    kl = 1.0
+    signed_case = str(cpi_case).strip()
+
+    if ratio <= 0.5:
+        return 0.0 if signed_case == "Cpi +" else -0.3, ratio, surface, ka, kl
+    if ratio < 2.0:
+        if surface == "windward_wall":
+            return 0.2 if signed_case == "Cpi +" else -0.1, ratio, surface, ka, kl
+        return 0.0 if signed_case == "Cpi +" else -0.3, ratio, surface, ka, kl
+    if surface == "windward_wall" and ratio < 3.0:
+        multiplier = 0.7
+    elif surface == "windward_wall" and ratio < 6.0:
+        multiplier = 0.85
+    else:
+        multiplier = 1.0
+    return multiplier * ka * kl * cpe, ratio, surface, ka, kl
+
+
+def _add_horizontal_line_load(
+    target_structure,
+    base,
+    top,
+    line_kn_m,
+    direction,
+    element_group=None,
+    arrow_count=5,
+):
+    if base is None or top is None:
+        return []
+    height_m = abs(top.y - base.y) / 1000.0
+    if height_m <= 1e-9:
+        return []
+    total_n = line_kn_m * height_m * 1000.0 * direction
+    if hasattr(target_structure, "add_uniform_global_line_load_between"):
+        groups = {element_group} if element_group else None
+        matched = target_structure.add_uniform_global_line_load_between(
+            base,
+            top,
+            fx_n_per_mm=line_kn_m * direction,
+            element_groups=groups,
+        )
+        if not matched:
+            raise ValueError(
+                f"No {element_group or 'column'} elements found for wall load between "
+                f"({base.x:.0f}, {base.y:.0f}) and ({top.x:.0f}, {top.y:.0f})."
+            )
+    arrows = []
+    count = max(2, arrow_count)
+    for i in range(count):
+        t = (i + 0.5) / count
+        x = base.x + (top.x - base.x) * t
+        y = base.y + (top.y - base.y) * t
+        arrows.append((x, y, total_n / count, 0.0))
+    return arrows
+
+
+def _add_signed_horizontal_line_load(
+    target_structure,
+    base,
+    top,
+    signed_line_kn_m,
+    element_group=None,
+    arrow_count=5,
+):
+    if abs(signed_line_kn_m) <= 1e-12:
+        return []
+    direction = +1.0 if signed_line_kn_m > 0.0 else -1.0
+    return _add_horizontal_line_load(
+        target_structure,
+        base,
+        top,
+        abs(signed_line_kn_m),
+        direction,
+        element_group,
+        arrow_count,
+    )
+
+
+def _signed_internal_cpi_line_kn_m(wind_result, cpi, wind_pressure):
+    return (
+        cpi
+        * wind_result.wu_kn_m2
+        * wind_pressure_scale(wind_result, wind_pressure)
+        * internal_pressure_factor(wind_result, cpi)
+        * wind_result.inputs.bay_size_m
+    )
+
+
+def _arrow_collector():
+    class LoadOnlyStructure:
+        def add_load(self, dof, value):
+            return None
+
+    return LoadOnlyStructure()
+
+
+def _wind_case_for_single_label(label):
+    if label.startswith("Wu Cpe Left +"):
+        return "Left +", "ultimate"
+    if label.startswith("Wu Cpe Left -"):
+        return "Left -", "ultimate"
+    if label.startswith("Wu Cpe Right +"):
+        return "Right +", "ultimate"
+    if label.startswith("Wu Cpe Right -"):
+        return "Right -", "ultimate"
+    if label.startswith("Ws Cpe Left +"):
+        return "Left +", "serviceability"
+    if label.startswith("Ws Cpe Left -"):
+        return "Left -", "serviceability"
+    if label.startswith("Ws Cpe Right +"):
+        return "Right +", "serviceability"
+    if label.startswith("Ws Cpe Right -"):
+        return "Right -", "serviceability"
+    if label.startswith("Wu Cpe End +"):
+        return "End +", "ultimate"
+    if label.startswith("Wu Cpe End -"):
+        return "End -", "ultimate"
+    if label.startswith("Ws Cpe End +"):
+        return "End +", "serviceability"
+    if label.startswith("Ws Cpe End -"):
+        return "End -", "serviceability"
+    return None, None
+
+
 class SolveMixin:
     """Builds the 2D frame model from the inputs and solves every load combination."""
 
@@ -825,26 +1162,11 @@ class SolveMixin:
             bottom_nodes[0] = left_truss_bottom_node
             bottom_nodes[-1] = right_truss_bottom_node
 
-        def y_at_x(nodes, x):
-            ordered = sorted(nodes, key=lambda node: node.x)
-            if x <= ordered[0].x:
-                return ordered[0].y
-            if x >= ordered[-1].x:
-                return ordered[-1].y
-            for n1, n2 in zip(ordered[:-1], ordered[1:]):
-                if min(n1.x, n2.x) - 1e-9 <= x <= max(n1.x, n2.x) + 1e-9:
-                    dx = n2.x - n1.x
-                    if abs(dx) <= 1e-9:
-                        return n1.y
-                    t = (x - n1.x) / dx
-                    return n1.y + t * (n2.y - n1.y)
-            return ordered[-1].y
-
         def bottom_y_at_x(x):
-            return y_at_x(bottom_nodes, x)
+            return _y_at_x(bottom_nodes, x)
 
         def top_y_at_x(x):
-            return y_at_x(top_nodes, x)
+            return _y_at_x(top_nodes, x)
 
         internal_column_xs = []
         centre_x = left_column_offset + span / 2.0
@@ -1225,33 +1547,8 @@ class SolveMixin:
             "right", right_canopy_length, right_canopy_type, "Rafter" if right_canopy_is_rafter else "Truss", right_canopy_eave_height, right_canopy_pitch, right_canopy_shallow_depth,
             right_canopy_top_profile, right_canopy_bottom_profile, right_canopy_web_profile, right_lean_column_profile,
         )
-        def slope_node_length(nodes):
-            return sum(math.hypot(n2.x - n1.x, n2.y - n1.y) for n1, n2 in zip(nodes[:-1], nodes[1:]))
-
         canopy_tip_checks = []
         side_midspan_checks = []
-        def slope_midspan_check(key, label, nodes):
-            length_mm = slope_node_length(nodes)
-            if length_mm <= 1e-9:
-                return None
-            station = 0.0
-            stations = [0.0]
-            for n1, n2 in zip(nodes[:-1], nodes[1:]):
-                station += math.hypot(n2.x - n1.x, n2.y - n1.y)
-                stations.append(station)
-            target = length_mm / 2.0
-            node = min(zip(nodes, stations), key=lambda item: abs(item[1] - target))[0]
-            node_station = min(zip(nodes, stations), key=lambda item: abs(item[1] - target))[1]
-            return {
-                "key": key,
-                "label": label,
-                "node": node,
-                "start": nodes[0],
-                "end": nodes[-1],
-                "station_mm": node_station,
-                "length_mm": length_mm,
-            }
-
         if left_canopy_top_nodes and left_canopy_type == "Canopy":
             canopy_tip_checks.append({
                 "key": "LEFT",
@@ -1259,10 +1556,10 @@ class SolveMixin:
                 "anchor": left_canopy_top_nodes[0],
                 "tilt_reference": left_canopy_bottom_nodes[0] if left_canopy_bottom_nodes else None,
                 "tip": left_canopy_top_nodes[-1],
-                "length_mm": slope_node_length(left_canopy_top_nodes),
+                "length_mm": _slope_node_length(left_canopy_top_nodes),
             })
         if left_canopy_top_nodes and left_canopy_type == "Lean-to":
-            side_midspan_checks.append(slope_midspan_check("LEFT", "Left lean-to midspan", left_canopy_top_nodes))
+            side_midspan_checks.append(_slope_midspan_check("LEFT", "Left lean-to midspan", left_canopy_top_nodes))
         if right_canopy_top_nodes and right_canopy_type == "Canopy":
             canopy_tip_checks.append({
                 "key": "RIGHT",
@@ -1270,10 +1567,10 @@ class SolveMixin:
                 "anchor": right_canopy_top_nodes[0],
                 "tilt_reference": right_canopy_bottom_nodes[0] if right_canopy_bottom_nodes else None,
                 "tip": right_canopy_top_nodes[-1],
-                "length_mm": slope_node_length(right_canopy_top_nodes),
+                "length_mm": _slope_node_length(right_canopy_top_nodes),
             })
         if right_canopy_top_nodes and right_canopy_type == "Lean-to":
-            side_midspan_checks.append(slope_midspan_check("RIGHT", "Right lean-to midspan", right_canopy_top_nodes))
+            side_midspan_checks.append(_slope_midspan_check("RIGHT", "Right lean-to midspan", right_canopy_top_nodes))
         side_midspan_checks = [check for check in side_midspan_checks if check is not None]
         roof_top_nodes = (
             list(reversed(left_canopy_top_nodes[1:]))
@@ -1563,63 +1860,15 @@ class SolveMixin:
                         orientation=source_direction,
                         left_canopy_length_m=(
                             0.0 if roof_shape == "Skillion" and len(continuous_roof_top_nodes) > len(top_nodes)
-                            else slope_path_length_m(left_canopy_top_nodes) if not left_canopy_is_free_roof else 0.0
+                            else _slope_path_length_m(left_canopy_top_nodes) if not left_canopy_is_free_roof else 0.0
                         ),
                         right_canopy_length_m=(
                             0.0 if roof_shape == "Skillion" and len(continuous_roof_top_nodes) > len(top_nodes)
-                            else slope_path_length_m(right_canopy_top_nodes) if not right_canopy_is_free_roof else 0.0
+                            else _slope_path_length_m(right_canopy_top_nodes) if not right_canopy_is_free_roof else 0.0
                         ),
                     )
                 )
             return continuous_roof_wind_result_cache[source_direction]
-
-        def slope_path_length_m(nodes):
-            total = 0.0
-            for n1, n2 in zip(nodes[:-1], nodes[1:]):
-                total += math.hypot((n2.x - n1.x) / 1000.0, (n2.y - n1.y) / 1000.0)
-            return total
-
-        def wind_interval_load_kn(strips, start_m, end_m, scale):
-            total_kn = 0.0
-            for a, b, q_kn_m in strips:
-                overlap = max(0.0, min(end_m, b) - max(start_m, a))
-                total_kn += q_kn_m * scale * overlap
-            return total_kn
-
-        def cumulative_roof_distances(nodes):
-            distances = [0.0]
-            for n1, n2 in zip(nodes[:-1], nodes[1:]):
-                distances.append(distances[-1] + math.hypot((n2.x - n1.x) / 1000.0, (n2.y - n1.y) / 1000.0))
-            return distances
-
-        def continuous_roof_strips_for_nodes(wind_result, cpe_case, nodes):
-            case = str(cpe_case).strip()
-            if case.startswith("End") or wind_result.inputs.roof_pitch_deg < 10.0 or len(nodes) < 2:
-                return wind_result.case_roof_strips(cpe_case)
-            if getattr(wind_result.inputs, "roof_shape", "Gable") == "Skillion":
-                return wind_result.case_roof_strips(cpe_case)
-
-            distances = cumulative_roof_distances(nodes)
-            total = distances[-1]
-            if total <= 1e-9:
-                return []
-            ridge_index = max(range(len(nodes)), key=lambda index: nodes[index].y)
-            ridge_s = min(max(distances[ridge_index], 0.0), total)
-            use_max = case.endswith("+")
-
-            def zone_line_load(name):
-                zone = next((item for item in wind_result.roof_zones if item.name == name), None)
-                if zone is None:
-                    return 0.0
-                return zone.line_load_max_kn_m if use_max else zone.line_load_min_kn_m
-
-            upwind_q = zone_line_load("Upwind rafter")
-            downwind_q = zone_line_load("Downwind rafter")
-            if case.startswith("Right"):
-                strips = [(0.0, ridge_s, downwind_q), (ridge_s, total, upwind_q)]
-            else:
-                strips = [(0.0, ridge_s, upwind_q), (ridge_s, total, downwind_q)]
-            return [(a, b, q) for a, b, q in strips if b - a > 1e-9]
 
         left_canopy_top_node_ids = {id(node) for node in left_canopy_top_nodes}
         right_canopy_top_node_ids = {id(node) for node in right_canopy_top_nodes}
@@ -1634,17 +1883,17 @@ class SolveMixin:
 
         def apply_roof_wind_strips_to_nodes(target_structure, nodes, strips, wind_result, wind_pressure):
             scale = wind_pressure_scale(wind_result, wind_pressure)
-            distances = cumulative_roof_distances(nodes)
+            distances = _cumulative_roof_distances(nodes)
             arrows = []
             for index, (n1, n2) in enumerate(zip(nodes[:-1], nodes[1:])):
                 s1 = distances[index]
                 s2 = distances[index + 1]
                 panel_len = max(s2 - s1, 1e-9)
-                total_kn = wind_interval_load_kn(strips, s1, s2, scale)
+                total_kn = _wind_interval_load_kn(strips, s1, s2, scale)
                 canopy_group = canopy_top_group_for_segment(n1, n2)
                 if canopy_group is not None:
                     arrows.extend(
-                        add_normal_uniform_line_load_to_members(
+                        _add_normal_uniform_line_load_to_members(
                             target_structure,
                             [n1, n2],
                             total_kn / panel_len,
@@ -1671,15 +1920,6 @@ class SolveMixin:
             label = left_canopy_underside if side_key == "left" else right_canopy_underside
             return "blocked" if str(label).startswith("Blocked") else "empty"
 
-        def canopy_free_roof_part(side_key, cpe_case):
-            case = str(cpe_case).strip()
-            if case.startswith("End"):
-                return "windward"
-            left_wind = case.startswith("Left")
-            if side_key == "left":
-                return "windward" if left_wind else "leeward"
-            return "leeward" if left_wind else "windward"
-
         def manual_canopy_cpn(side_key, cpe_case):
             use_uplift = str(cpe_case).strip().endswith("+")
             if side_key == "left":
@@ -1688,7 +1928,7 @@ class SolveMixin:
 
         def canopy_free_roof_values(wind_result, side_key, cpe_case):
             use_uplift = str(cpe_case).strip().endswith("+")
-            part = canopy_free_roof_part(side_key, cpe_case)
+            part = _canopy_free_roof_part(side_key, cpe_case)
             underside = canopy_underside(side_key)
             pitch_deg = left_canopy_pitch if side_key == "left" else right_canopy_pitch
             if str(cpe_case).strip().startswith("End"):
@@ -1730,98 +1970,6 @@ class SolveMixin:
                 )
             return cpn_as, -cpn_as
 
-        def add_vertical_line_load_to_nodes(target_structure, nodes, line_kn_m):
-            arrows = []
-            for n1, n2 in zip(nodes[:-1], nodes[1:]):
-                dx = (n2.x - n1.x) / 1000.0
-                dy = (n2.y - n1.y) / 1000.0
-                panel_len_m = math.hypot(dx, dy)
-                total_n = line_kn_m * panel_len_m * 1000.0
-                target_structure.add_load(n1.uy, total_n / 2.0)
-                target_structure.add_load(n2.uy, total_n / 2.0)
-                arrows.append(((n1.x + n2.x) / 2.0, (n1.y + n2.y) / 2.0 + 800.0, 0.0, total_n))
-            return arrows
-
-        def add_normal_line_load_to_nodes(target_structure, nodes, line_kn_m):
-            arrows = []
-            for n1, n2 in zip(nodes[:-1], nodes[1:]):
-                dx_m = (n2.x - n1.x) / 1000.0
-                dy_m = (n2.y - n1.y) / 1000.0
-                panel_len_m = math.hypot(dx_m, dy_m)
-                if panel_len_m <= 1e-12:
-                    continue
-                # Positive free-roof Cpn frame load is uplift, so choose the
-                # segment normal with positive global-Y component.
-                nx = -dy_m / panel_len_m
-                ny = dx_m / panel_len_m
-                if ny < 0.0:
-                    nx = -nx
-                    ny = -ny
-                total_fx_n = line_kn_m * panel_len_m * 1000.0 * nx
-                total_fy_n = line_kn_m * panel_len_m * 1000.0 * ny
-                target_structure.add_load(n1.ux, total_fx_n / 2.0)
-                target_structure.add_load(n1.uy, total_fy_n / 2.0)
-                target_structure.add_load(n2.ux, total_fx_n / 2.0)
-                target_structure.add_load(n2.uy, total_fy_n / 2.0)
-                arrows.append((
-                    (n1.x + n2.x) / 2.0,
-                    (n1.y + n2.y) / 2.0 + 800.0,
-                    line_kn_m * 1000.0 * nx,
-                    line_kn_m * 1000.0 * ny,
-                ))
-            return arrows
-
-        def add_normal_uniform_line_load_to_members(target_structure, nodes, line_kn_m, element_group):
-            """Apply a roof-normal UDL to each matching top-chord member segment."""
-            arrows = []
-            for n1, n2 in zip(nodes[:-1], nodes[1:]):
-                dx_m = (n2.x - n1.x) / 1000.0
-                dy_m = (n2.y - n1.y) / 1000.0
-                panel_len_m = math.hypot(dx_m, dy_m)
-                if panel_len_m <= 1e-12:
-                    continue
-
-                # Positive canopy wind load is uplift. Select the segment normal
-                # with a positive global-Y component, then resolve the UDL into
-                # global components for the frame-element member-load routine.
-                nx = -dy_m / panel_len_m
-                ny = dx_m / panel_len_m
-                if ny < 0.0:
-                    nx = -nx
-                    ny = -ny
-                fx_n_per_mm = line_kn_m * nx  # 1 kN/m = 1 N/mm
-                fy_n_per_mm = line_kn_m * ny
-
-                if hasattr(target_structure, "add_uniform_global_line_load_between"):
-                    matched = target_structure.add_uniform_global_line_load_between(
-                        n1,
-                        n2,
-                        fx_n_per_mm=fx_n_per_mm,
-                        fy_n_per_mm=fy_n_per_mm,
-                        element_groups={element_group},
-                    )
-                    if not matched:
-                        raise ValueError(
-                            f"No {element_group} member found for the requested canopy wind line load."
-                        )
-                else:
-                    # Lightweight arrow collectors do not contain frame elements.
-                    # Preserve the equivalent resultant solely for their display data.
-                    total_fx_n = fx_n_per_mm * panel_len_m * 1000.0
-                    total_fy_n = fy_n_per_mm * panel_len_m * 1000.0
-                    target_structure.add_load(n1.ux, total_fx_n / 2.0)
-                    target_structure.add_load(n1.uy, total_fy_n / 2.0)
-                    target_structure.add_load(n2.ux, total_fx_n / 2.0)
-                    target_structure.add_load(n2.uy, total_fy_n / 2.0)
-
-                arrows.append((
-                    (n1.x + n2.x) / 2.0,
-                    (n1.y + n2.y) / 2.0 + 800.0,
-                    line_kn_m * 1000.0 * nx,
-                    line_kn_m * 1000.0 * ny,
-                ))
-            return arrows
-
         def apply_main_roof_free_roof_cpn(target_structure, wind_result, cpe_case, wind_pressure):
             scale = wind_pressure_scale(wind_result, wind_pressure)
             arrows = []
@@ -1832,7 +1980,7 @@ class SolveMixin:
                     continue
                 _, frame_cpn = values
                 line_kn_m = frame_cpn * wind_result.wu_kn_m2 * scale * wind_result.inputs.bay_size_m
-                arrows.extend(add_normal_line_load_to_nodes(target_structure, [n1, n2], line_kn_m))
+                arrows.extend(_add_normal_line_load_to_nodes(target_structure, [n1, n2], line_kn_m))
             return arrows
 
         def apply_canopy_wind_cpe(target_structure, wind_result, cpe_case, wind_pressure):
@@ -1842,9 +1990,9 @@ class SolveMixin:
             arrows = []
             for side_key, canopy_nodes, start_m in [
                 ("left", left_canopy_top_nodes, 0.0),
-                ("right", right_canopy_top_nodes, roof_length_m - slope_path_length_m(right_canopy_top_nodes)),
+                ("right", right_canopy_top_nodes, roof_length_m - _slope_path_length_m(right_canopy_top_nodes)),
             ]:
-                side_slope_m = slope_path_length_m(canopy_nodes)
+                side_slope_m = _slope_path_length_m(canopy_nodes)
                 if side_slope_m <= 1e-9:
                     continue
                 if canopy_uses_free_roof(side_key):
@@ -1852,7 +2000,7 @@ class SolveMixin:
                     line_kn_m = frame_cpn * wind_result.wu_kn_m2 * scale * wind_result.inputs.bay_size_m
                     element_group = "LEFT_CANOPY_TOP" if side_key == "left" else "RIGHT_CANOPY_TOP"
                     arrows.extend(
-                        add_normal_uniform_line_load_to_members(
+                        _add_normal_uniform_line_load_to_members(
                             target_structure,
                             canopy_nodes,
                             line_kn_m,
@@ -1861,40 +2009,11 @@ class SolveMixin:
                     )
             return arrows
 
-        def enclosed_cpi_for_case(wind_result, cpi_case):
-            cpi_max, cpi_min = (
-                cyclonic_enclosed_cpi(wind_result.inputs, "Enclosed")
-                or CPI_BY_FRAME_TYPE["Enclosed"]
-            )
-            return cpi_max if str(cpi_case).strip() == "Cpi +" else cpi_min
-
         def chamber_wall_opening_area_m2(chamber_width_m, wall_key):
             height_m = max(eave / 1000.0, 0.0)
             if wall_key in {"left", "right"}:
                 return max(building_length_m, 0.0) * height_m
             return max(chamber_width_m, 0.0) * height_m
-
-        def table_5_1b_cpi_for_opening(wind_result, cpi_case, cpe_case, wall_key, opening_area_m2, other_open_area_m2):
-            surface = wall_surface_for_cpe_case(cpe_case, wall_key)
-            cpe = wall_cpe_for_surface(wind_result, surface)
-            ratio = float("inf") if other_open_area_m2 <= 1e-12 else opening_area_m2 / other_open_area_m2
-            ka = opening_area_reduction_factor(surface, opening_area_m2)
-            kl = 1.0
-            signed_case = str(cpi_case).strip()
-
-            if ratio <= 0.5:
-                return 0.0 if signed_case == "Cpi +" else -0.3, ratio, surface, ka, kl
-            if ratio < 2.0:
-                if surface == "windward_wall":
-                    return 0.2 if signed_case == "Cpi +" else -0.1, ratio, surface, ka, kl
-                return 0.0 if signed_case == "Cpi +" else -0.3, ratio, surface, ka, kl
-            if surface == "windward_wall" and ratio < 3.0:
-                multiplier = 0.7
-            elif surface == "windward_wall" and ratio < 6.0:
-                multiplier = 0.85
-            else:
-                multiplier = 1.0
-            return multiplier * ka * kl * cpe, ratio, surface, ka, kl
 
         def chamber_cpi_from_openings(
             wind_result,
@@ -1914,7 +2033,7 @@ class SolveMixin:
                     if area > 1e-12:
                         openings.append((key, area))
             if not openings:
-                return enclosed_cpi_for_case(wind_result, cpi_case), "enclosed chamber Cpi"
+                return _enclosed_cpi_for_case(wind_result, cpi_case), "enclosed chamber Cpi"
 
             largest_area = max(area for _, area in openings)
             candidates = []
@@ -1922,7 +2041,7 @@ class SolveMixin:
                 if abs(area - largest_area) > 1e-9:
                     continue
                 other_area = sum(other for other_key, other in openings if other_key != wall_key)
-                candidates.append(table_5_1b_cpi_for_opening(wind_result, cpi_case, cpe_case, wall_key, area, other_area))
+                candidates.append(_table_5_1b_cpi_for_opening(wind_result, cpi_case, cpe_case, wall_key, area, other_area))
 
             pick = max if str(cpi_case).strip() == "Cpi +" else min
             cpi, ratio, surface, ka, kl = pick(candidates, key=lambda item: item[0])
@@ -2068,73 +2187,6 @@ class SolveMixin:
             )
             return cpi
 
-        def add_horizontal_line_load(
-            target_structure,
-            base,
-            top,
-            line_kn_m,
-            direction,
-            element_group=None,
-            arrow_count=5,
-        ):
-            if base is None or top is None:
-                return []
-            height_m = abs(top.y - base.y) / 1000.0
-            if height_m <= 1e-9:
-                return []
-            total_n = line_kn_m * height_m * 1000.0 * direction
-            if hasattr(target_structure, "add_uniform_global_line_load_between"):
-                groups = {element_group} if element_group else None
-                matched = target_structure.add_uniform_global_line_load_between(
-                    base,
-                    top,
-                    fx_n_per_mm=line_kn_m * direction,
-                    element_groups=groups,
-                )
-                if not matched:
-                    raise ValueError(
-                        f"No {element_group or 'column'} elements found for wall load between "
-                        f"({base.x:.0f}, {base.y:.0f}) and ({top.x:.0f}, {top.y:.0f})."
-                    )
-            arrows = []
-            count = max(2, arrow_count)
-            for i in range(count):
-                t = (i + 0.5) / count
-                x = base.x + (top.x - base.x) * t
-                y = base.y + (top.y - base.y) * t
-                arrows.append((x, y, total_n / count, 0.0))
-            return arrows
-
-        def add_signed_horizontal_line_load(
-            target_structure,
-            base,
-            top,
-            signed_line_kn_m,
-            element_group=None,
-            arrow_count=5,
-        ):
-            if abs(signed_line_kn_m) <= 1e-12:
-                return []
-            direction = +1.0 if signed_line_kn_m > 0.0 else -1.0
-            return add_horizontal_line_load(
-                target_structure,
-                base,
-                top,
-                abs(signed_line_kn_m),
-                direction,
-                element_group,
-                arrow_count,
-            )
-
-        def signed_internal_cpi_line_kn_m(wind_result, cpi, wind_pressure):
-            return (
-                cpi
-                * wind_result.wu_kn_m2
-                * wind_pressure_scale(wind_result, wind_pressure)
-                * internal_pressure_factor(wind_result, cpi)
-                * wind_result.inputs.bay_size_m
-            )
-
         def internal_wall_net_cpi_line(wind_result, side_key, cpi_case, wind_pressure, cpe_case):
             if side_key == "left":
                 if not (left_has_lean_to and wind_result.inputs.left_wall_clad):
@@ -2152,10 +2204,10 @@ class SolveMixin:
             candidates = []
             for main_case in CPI_CASE_OPTIONS:
                 main_cpi, _ = main_chamber_cpi(wind_result, main_case, cpe_case)
-                main_line = signed_internal_cpi_line_kn_m(wind_result, main_cpi, wind_pressure)
+                main_line = _signed_internal_cpi_line_kn_m(wind_result, main_cpi, wind_pressure)
                 for lean_case in CPI_CASE_OPTIONS:
                     lean_cpi = lean_cpi_for(lean_case)
-                    lean_line = signed_internal_cpi_line_kn_m(wind_result, lean_cpi, wind_pressure)
+                    lean_line = _signed_internal_cpi_line_kn_m(wind_result, lean_cpi, wind_pressure)
                     signed_line = main_sign * main_line + lean_sign * lean_line
                     candidates.append((signed_line, main_case, main_cpi, lean_case, lean_cpi))
             if not candidates:
@@ -2199,18 +2251,18 @@ class SolveMixin:
                 if frame_type not in {"Roof Only", "No Wind"}:
                     if wind_result.inputs.left_wall_clad and not left_has_lean_to:
                         side_line = cpe_line_for_wall(left_base, top_nodes[0], side_cpe, "side_wall")
-                        arrows.extend(add_horizontal_line_load(target_structure, left_base, top_nodes[0], side_line, -1.0, "LEFT_COLUMN"))
+                        arrows.extend(_add_horizontal_line_load(target_structure, left_base, top_nodes[0], side_line, -1.0, "LEFT_COLUMN"))
                     if wind_result.inputs.right_wall_clad and not right_has_lean_to:
                         side_line = cpe_line_for_wall(right_base, top_nodes[-1], side_cpe, "side_wall")
-                        arrows.extend(add_horizontal_line_load(target_structure, right_base, top_nodes[-1], side_line, +1.0, "RIGHT_COLUMN"))
+                        arrows.extend(_add_horizontal_line_load(target_structure, right_base, top_nodes[-1], side_line, +1.0, "RIGHT_COLUMN"))
                 if left_lean_outer_wall_clad:
                     base, top = lean_outer_wall_nodes("left")
                     side_line = cpe_line_for_wall(base, top, side_cpe, "side_wall")
-                    arrows.extend(add_horizontal_line_load(target_structure, base, top, side_line, -1.0, "LEFT_LEAN_COLUMN"))
+                    arrows.extend(_add_horizontal_line_load(target_structure, base, top, side_line, -1.0, "LEFT_LEAN_COLUMN"))
                 if right_lean_outer_wall_clad:
                     base, top = lean_outer_wall_nodes("right")
                     side_line = cpe_line_for_wall(base, top, side_cpe, "side_wall")
-                    arrows.extend(add_horizontal_line_load(target_structure, base, top, side_line, +1.0, "RIGHT_LEAN_COLUMN"))
+                    arrows.extend(_add_horizontal_line_load(target_structure, base, top, side_line, +1.0, "RIGHT_LEAN_COLUMN"))
                 return arrows
             left_wind = str(cpe_case).startswith("Left")
 
@@ -2218,30 +2270,30 @@ class SolveMixin:
                 if left_wind:
                     if wind_result.inputs.left_wall_clad and not left_lean_outer_wall_clad:
                         line = cpe_line_for_wall(left_base, top_nodes[0], 0.7, "windward_wall")
-                        arrows.extend(add_horizontal_line_load(target_structure, left_base, top_nodes[0], line, +1.0, "LEFT_COLUMN"))
+                        arrows.extend(_add_horizontal_line_load(target_structure, left_base, top_nodes[0], line, +1.0, "LEFT_COLUMN"))
                     if wind_result.inputs.right_wall_clad and not right_lean_outer_wall_clad:
                         line = cpe_line_for_wall(right_base, top_nodes[-1], wind_result.leeward_wall_cpe, "leeward_wall")
-                        arrows.extend(add_horizontal_line_load(target_structure, right_base, top_nodes[-1], line, +1.0, "RIGHT_COLUMN"))
+                        arrows.extend(_add_horizontal_line_load(target_structure, right_base, top_nodes[-1], line, +1.0, "RIGHT_COLUMN"))
                 else:
                     if wind_result.inputs.right_wall_clad and not right_lean_outer_wall_clad:
                         line = cpe_line_for_wall(right_base, top_nodes[-1], 0.7, "windward_wall")
-                        arrows.extend(add_horizontal_line_load(target_structure, right_base, top_nodes[-1], line, -1.0, "RIGHT_COLUMN"))
+                        arrows.extend(_add_horizontal_line_load(target_structure, right_base, top_nodes[-1], line, -1.0, "RIGHT_COLUMN"))
                     if wind_result.inputs.left_wall_clad and not left_lean_outer_wall_clad:
                         line = cpe_line_for_wall(left_base, top_nodes[0], wind_result.leeward_wall_cpe, "leeward_wall")
-                        arrows.extend(add_horizontal_line_load(target_structure, left_base, top_nodes[0], line, -1.0, "LEFT_COLUMN"))
+                        arrows.extend(_add_horizontal_line_load(target_structure, left_base, top_nodes[0], line, -1.0, "LEFT_COLUMN"))
 
             if left_lean_outer_wall_clad:
                 base, top = lean_outer_wall_nodes("left")
                 surface = "windward_wall" if left_wind else "leeward_wall"
                 cpe = 0.7 if left_wind else wind_result.leeward_wall_cpe
                 line = cpe_line_for_wall(base, top, cpe, surface)
-                arrows.extend(add_horizontal_line_load(target_structure, base, top, line, +1.0 if left_wind else -1.0, "LEFT_LEAN_COLUMN"))
+                arrows.extend(_add_horizontal_line_load(target_structure, base, top, line, +1.0 if left_wind else -1.0, "LEFT_LEAN_COLUMN"))
             if right_lean_outer_wall_clad:
                 base, top = lean_outer_wall_nodes("right")
                 surface = "leeward_wall" if left_wind else "windward_wall"
                 cpe = wind_result.leeward_wall_cpe if left_wind else 0.7
                 line = cpe_line_for_wall(base, top, cpe, surface)
-                arrows.extend(add_horizontal_line_load(target_structure, base, top, line, +1.0 if left_wind else -1.0, "RIGHT_LEAN_COLUMN"))
+                arrows.extend(_add_horizontal_line_load(target_structure, base, top, line, +1.0 if left_wind else -1.0, "RIGHT_LEAN_COLUMN"))
             return arrows
 
         def apply_wall_cpi_with_lean_to(target_structure, wind_result, cpi_case, wind_pressure, cpe_case):
@@ -2258,27 +2310,27 @@ class SolveMixin:
 
             if frame_type not in {"Roof Only", "No Wind"} and abs(main_line) > 1e-12:
                 if wind_result.inputs.left_wall_clad and not left_has_lean_to:
-                    arrows.extend(add_horizontal_line_load(target_structure, left_base, top_nodes[0], main_line, main_left_direction, "LEFT_COLUMN"))
+                    arrows.extend(_add_horizontal_line_load(target_structure, left_base, top_nodes[0], main_line, main_left_direction, "LEFT_COLUMN"))
                 if wind_result.inputs.right_wall_clad and not right_has_lean_to:
-                    arrows.extend(add_horizontal_line_load(target_structure, right_base, top_nodes[-1], main_line, main_right_direction, "RIGHT_COLUMN"))
+                    arrows.extend(_add_horizontal_line_load(target_structure, right_base, top_nodes[-1], main_line, main_right_direction, "RIGHT_COLUMN"))
 
             left_net_line, _ = internal_wall_net_cpi_line(wind_result, "left", cpi_case, wind_pressure, cpe_case)
-            arrows.extend(add_signed_horizontal_line_load(target_structure, left_base, top_nodes[0], left_net_line, "LEFT_COLUMN"))
+            arrows.extend(_add_signed_horizontal_line_load(target_structure, left_base, top_nodes[0], left_net_line, "LEFT_COLUMN"))
             right_net_line, _ = internal_wall_net_cpi_line(wind_result, "right", cpi_case, wind_pressure, cpe_case)
-            arrows.extend(add_signed_horizontal_line_load(target_structure, right_base, top_nodes[-1], right_net_line, "RIGHT_COLUMN"))
+            arrows.extend(_add_signed_horizontal_line_load(target_structure, right_base, top_nodes[-1], right_net_line, "RIGHT_COLUMN"))
 
             if left_lean_outer_wall_clad:
                 base, top = lean_outer_wall_nodes("left")
                 left_lean_cpi, _ = lean_to_cpi_for_case(wind_result, cpi_case, cpe_case, "left")
                 left_lean_line = wall_cpi_line_load_kn_m(wind_result, left_lean_cpi, wind_pressure)
                 direction = -1.0 if left_lean_cpi > 0 else +1.0
-                arrows.extend(add_horizontal_line_load(target_structure, base, top, left_lean_line, direction, "LEFT_LEAN_COLUMN"))
+                arrows.extend(_add_horizontal_line_load(target_structure, base, top, left_lean_line, direction, "LEFT_LEAN_COLUMN"))
             if right_lean_outer_wall_clad:
                 base, top = lean_outer_wall_nodes("right")
                 right_lean_cpi, _ = lean_to_cpi_for_case(wind_result, cpi_case, cpe_case, "right")
                 right_lean_line = wall_cpi_line_load_kn_m(wind_result, right_lean_cpi, wind_pressure)
                 direction = +1.0 if right_lean_cpi > 0 else -1.0
-                arrows.extend(add_horizontal_line_load(target_structure, base, top, right_lean_line, direction, "RIGHT_LEAN_COLUMN"))
+                arrows.extend(_add_horizontal_line_load(target_structure, base, top, right_lean_line, direction, "RIGHT_LEAN_COLUMN"))
             return arrows
 
         def internal_wall_cpi_summary_lines(wind_result, combination):
@@ -2349,14 +2401,14 @@ class SolveMixin:
             return lines
 
         def canopy_wind_summary_lines(wind_result, combination, active_cpi):
-            left_slope_m = slope_path_length_m(left_canopy_top_nodes)
-            right_slope_m = slope_path_length_m(right_canopy_top_nodes)
+            left_slope_m = _slope_path_length_m(left_canopy_top_nodes)
+            right_slope_m = _slope_path_length_m(right_canopy_top_nodes)
             if left_slope_m <= 1e-9 and right_slope_m <= 1e-9:
                 return []
 
             scale = wind_pressure_scale(wind_result, combination.wind_pressure)
-            strips = continuous_roof_strips_for_nodes(wind_result, combination.cpe_case, continuous_roof_top_nodes)
-            roof_length_m = slope_path_length_m(continuous_roof_top_nodes)
+            strips = _continuous_roof_strips_for_nodes(wind_result, combination.cpe_case, continuous_roof_top_nodes)
+            roof_length_m = _slope_path_length_m(continuous_roof_top_nodes)
             lines = ["", "CANOPY / LEAN-TO WIND LOADS"]
             for label, side_key, side_slope_m, start_m, end_m in [
                 ("Left", "left", left_slope_m, 0.0, left_slope_m),
@@ -2368,7 +2420,7 @@ class SolveMixin:
                     cpn_as, frame_cpn = canopy_free_roof_values(wind_result, side_key, combination.cpe_case)
                     line_kn_m = frame_cpn * wind_result.wu_kn_m2 * scale * wind_result.inputs.bay_size_m
                     total_kn = line_kn_m * side_slope_m
-                    part = canopy_free_roof_part(side_key, combination.cpe_case)
+                    part = _canopy_free_roof_part(side_key, combination.cpe_case)
                     if str(combination.cpe_case).strip().startswith("End"):
                         model_text = f"AS/NZS B.4(A) transverse free roof, alpha 0, {canopy_underside(side_key)} under"
                     else:
@@ -2390,7 +2442,7 @@ class SolveMixin:
                     * internal_pressure_factor(wind_result, canopy_cpi)
                     * wind_result.inputs.bay_size_m
                 )
-                cpe_total_kn = wind_interval_load_kn(strips, start_m, end_m, scale)
+                cpe_total_kn = _wind_interval_load_kn(strips, start_m, end_m, scale)
                 cpe_avg_kn_m = cpe_total_kn / side_slope_m
                 cpi_total_kn = canopy_cpi_line_kn_m * side_slope_m
                 combined_total_kn = cpe_total_kn + cpi_total_kn
@@ -2442,7 +2494,7 @@ class SolveMixin:
                 )
                 element_group = "LEFT_CANOPY_TOP" if side_key == "left" else "RIGHT_CANOPY_TOP"
                 arrows.extend(
-                    add_normal_uniform_line_load_to_members(
+                    _add_normal_uniform_line_load_to_members(
                         target_structure,
                         canopy_nodes,
                         line_kn_m,
@@ -2450,13 +2502,6 @@ class SolveMixin:
                     )
                 )
             return arrows
-
-        def arrow_collector():
-            class LoadOnlyStructure:
-                def add_load(self, dof, value):
-                    return None
-
-            return LoadOnlyStructure()
 
         def crane_column_actions(crane_position, serviceability, g_factor):
             """Crane column actions for one combination (crane_beam.crane_column_actions)."""
@@ -2503,40 +2548,13 @@ class SolveMixin:
                     f"{node['eccentricity_mm']:.0f} mm")
             return lines
 
-        def wind_case_for_single_label(label):
-            if label.startswith("Wu Cpe Left +"):
-                return "Left +", "ultimate"
-            if label.startswith("Wu Cpe Left -"):
-                return "Left -", "ultimate"
-            if label.startswith("Wu Cpe Right +"):
-                return "Right +", "ultimate"
-            if label.startswith("Wu Cpe Right -"):
-                return "Right -", "ultimate"
-            if label.startswith("Ws Cpe Left +"):
-                return "Left +", "serviceability"
-            if label.startswith("Ws Cpe Left -"):
-                return "Left -", "serviceability"
-            if label.startswith("Ws Cpe Right +"):
-                return "Right +", "serviceability"
-            if label.startswith("Ws Cpe Right -"):
-                return "Right -", "serviceability"
-            if label.startswith("Wu Cpe End +"):
-                return "End +", "ultimate"
-            if label.startswith("Wu Cpe End -"):
-                return "End -", "ultimate"
-            if label.startswith("Ws Cpe End +"):
-                return "End +", "serviceability"
-            if label.startswith("Ws Cpe End -"):
-                return "End -", "serviceability"
-            return None, None
-
         def build_single_load_arrows():
             cases = {}
 
             for label, kpa, placement in roof_loads.factored_components(1.0, 1.0):
                 if label in {"G", "Q", "Solar", "Fire service", "HVAC", "Other"}:
                     cases[label] = apply_roof_vertical_loads_in_zones(
-                        arrow_collector(),
+                        _arrow_collector(),
                         top_nodes,
                         kpa * roof_loads.bay_size_m,
                         placement.side,
@@ -2544,8 +2562,8 @@ class SolveMixin:
                         placement.to_percent,
                     )
 
-            left_wall_arrow = apply_wall_horizontal_loads(arrow_collector(), left_base, top_nodes[0], wall_loads.left_plus_x, direction=+1)
-            right_wall_arrow = apply_wall_horizontal_loads(arrow_collector(), right_base, top_nodes[-1], wall_loads.right_minus_x, direction=-1)
+            left_wall_arrow = apply_wall_horizontal_loads(_arrow_collector(), left_base, top_nodes[0], wall_loads.left_plus_x, direction=+1)
+            right_wall_arrow = apply_wall_horizontal_loads(_arrow_collector(), right_base, top_nodes[-1], wall_loads.right_minus_x, direction=-1)
             if left_wall_arrow:
                 cases["Left wall G"] = left_wall_arrow
             if right_wall_arrow:
@@ -2557,7 +2575,7 @@ class SolveMixin:
                     inputs=replace(storage_results.inputs, left_wall=left_wall, right_wall=right_wall),
                 )
                 storage_arrows = apply_storage_loads_to_columns(
-                    arrow_collector(),
+                    _arrow_collector(),
                     storage_case_results,
                     [left_base] + left_storage_nodes + [top_nodes[0]],
                     [right_base] + right_storage_nodes + [top_nodes[-1]],
@@ -2580,11 +2598,11 @@ class SolveMixin:
                 ("Crane Q crab left, H +X", "left:+x", 0.0),
                 ("Crane Q crab right, H -X", "right:-x", 0.0),
             ]:
-                crane_arrows = apply_crane_load(arrow_collector(), crane_position, True, g_factor)
+                crane_arrows = apply_crane_load(_arrow_collector(), crane_position, True, g_factor)
                 if crane_arrows:
                     cases[crane_label] = crane_arrows
 
-            self_weight_arrows = apply_structure_self_weight(arrow_collector(), structure.elements, 1.0).arrows
+            self_weight_arrows = apply_structure_self_weight(_arrow_collector(), structure.elements, 1.0).arrows
             if self_weight_arrows:
                 cases["Self weight"] = self_weight_arrows
 
@@ -2597,7 +2615,7 @@ class SolveMixin:
                 for label, kpa, _ in side_canopy_loads.factored_components(1.0, 1.0):
                     if label in {"G", "Q", "Solar"}:
                         arrows = apply_roof_vertical_loads(
-                            arrow_collector(),
+                            _arrow_collector(),
                             canopy_nodes,
                             kpa * side_canopy_loads.bay_size_m,
                         )
@@ -2605,17 +2623,17 @@ class SolveMixin:
                             cases[f"{side_label} {label}"] = arrows
 
             for label in ["Wu Cpe Left +", "Wu Cpe Left -", "Wu Cpe Right +", "Wu Cpe Right -", "Wu Cpe End +", "Wu Cpe End -", "Ws Cpe Left +", "Ws Cpe Left -", "Ws Cpe Right +", "Ws Cpe Right -", "Ws Cpe End +", "Ws Cpe End -"]:
-                cpe_case, pressure = wind_case_for_single_label(label)
+                cpe_case, pressure = _wind_case_for_single_label(label)
                 wind_result = get_wind_result(cpe_case)
                 continuous_roof_wind_result = get_continuous_roof_wind_result(cpe_case)
                 arrows = []
                 if main_roof_is_free_roof:
-                    arrows.extend(apply_main_roof_free_roof_cpn(arrow_collector(), continuous_roof_wind_result, cpe_case, pressure))
+                    arrows.extend(apply_main_roof_free_roof_cpn(_arrow_collector(), continuous_roof_wind_result, cpe_case, pressure))
                 else:
-                    continuous_strips = continuous_roof_strips_for_nodes(continuous_roof_wind_result, cpe_case, continuous_roof_top_nodes)
-                    arrows.extend(apply_roof_wind_strips_to_nodes(arrow_collector(), continuous_roof_top_nodes, continuous_strips, continuous_roof_wind_result, pressure))
-                arrows.extend(apply_canopy_wind_cpe(arrow_collector(), wind_result, cpe_case, pressure))
-                arrows.extend(apply_wall_cpe_with_lean_to(arrow_collector(), wind_result, cpe_case, pressure))
+                    continuous_strips = _continuous_roof_strips_for_nodes(continuous_roof_wind_result, cpe_case, continuous_roof_top_nodes)
+                    arrows.extend(apply_roof_wind_strips_to_nodes(_arrow_collector(), continuous_roof_top_nodes, continuous_strips, continuous_roof_wind_result, pressure))
+                arrows.extend(apply_canopy_wind_cpe(_arrow_collector(), wind_result, cpe_case, pressure))
+                arrows.extend(apply_wall_cpe_with_lean_to(_arrow_collector(), wind_result, cpe_case, pressure))
                 if arrows:
                     cases[label] = arrows
 
@@ -2623,13 +2641,13 @@ class SolveMixin:
                 wind_result = get_wind_result(cpe_case)
                 for cpi_case in CPI_CASE_OPTIONS:
                     arrows = []
-                    arrows.extend(apply_roof_and_canopy_cpi(arrow_collector(), wind_result, cpi_case, "ultimate", cpe_case))
-                    arrows.extend(apply_wall_cpi_with_lean_to(arrow_collector(), wind_result, cpi_case, "ultimate", cpe_case))
+                    arrows.extend(apply_roof_and_canopy_cpi(_arrow_collector(), wind_result, cpi_case, "ultimate", cpe_case))
+                    arrows.extend(apply_wall_cpi_with_lean_to(_arrow_collector(), wind_result, cpi_case, "ultimate", cpe_case))
                     if arrows:
                         cases[f"Wu {cpi_case} with {cpe_case}"] = arrows
                     sls_arrows = []
-                    sls_arrows.extend(apply_roof_and_canopy_cpi(arrow_collector(), wind_result, cpi_case, "serviceability", cpe_case))
-                    sls_arrows.extend(apply_wall_cpi_with_lean_to(arrow_collector(), wind_result, cpi_case, "serviceability", cpe_case))
+                    sls_arrows.extend(apply_roof_and_canopy_cpi(_arrow_collector(), wind_result, cpi_case, "serviceability", cpe_case))
+                    sls_arrows.extend(apply_wall_cpi_with_lean_to(_arrow_collector(), wind_result, cpi_case, "serviceability", cpe_case))
                     if sls_arrows:
                         cases[f"Ws {cpi_case} with {cpe_case}"] = sls_arrows
 
@@ -2649,7 +2667,7 @@ class SolveMixin:
             roof_nodes = continuous_roof_top_nodes if case.roof_basis == "cpe" else top_nodes
             canopy_bounds = {}
             if case.roof_basis == "cpe" and len(roof_nodes) > len(top_nodes):
-                distances = cumulative_roof_distances(roof_nodes)
+                distances = _cumulative_roof_distances(roof_nodes)
                 if len(left_canopy_top_nodes) > 1 and not left_canopy_is_free_roof:
                     canopy_bounds["left"] = (0.0, distances[len(left_canopy_top_nodes) - 1])
                 if len(right_canopy_top_nodes) > 1 and not right_canopy_is_free_roof:
@@ -2665,10 +2683,10 @@ class SolveMixin:
                               "right": (right_canopy_top_nodes, "RIGHT_CANOPY_TOP")}
             for side, line in case.canopy_cpe_kn_m.items():
                 nodes, group = canopy_members[side]
-                arrows.extend(add_normal_uniform_line_load_to_members(target_structure, nodes, line * scale, group))
+                arrows.extend(_add_normal_uniform_line_load_to_members(target_structure, nodes, line * scale, group))
             for column, signed in case.wall_cpe_kn_m.items():
                 base, top, group = columns[column]
-                arrows.extend(add_signed_horizontal_line_load(target_structure, base, top, signed * scale, group))
+                arrows.extend(_add_signed_horizontal_line_load(target_structure, base, top, signed * scale, group))
             roof_cpi = case.roof_cpi_kn_m.get(combination.cpi_case)
             if roof_cpi:
                 line_kn_m = roof_cpi * scale
@@ -2680,10 +2698,10 @@ class SolveMixin:
             for side, line in case.canopy_cpi_kn_m.get(combination.cpi_case, {}).items():
                 nodes, group = canopy_members[side]
                 if len(nodes) >= 2:
-                    arrows.extend(add_normal_uniform_line_load_to_members(target_structure, nodes, line * scale, group))
+                    arrows.extend(_add_normal_uniform_line_load_to_members(target_structure, nodes, line * scale, group))
             for column, signed in case.wall_cpi_kn_m.get(combination.cpi_case, {}).items():
                 base, top, group = columns[column]
-                arrows.extend(add_signed_horizontal_line_load(target_structure, base, top, signed * scale, group))
+                arrows.extend(_add_signed_horizontal_line_load(target_structure, base, top, signed * scale, group))
             return arrows
 
         def apply_combination_loads(combination, include_summary=False, target_structure=None, storage_case=None, include_self_weight=True):
@@ -2819,7 +2837,7 @@ class SolveMixin:
                         )
                     )
                 else:
-                    continuous_strips = continuous_roof_strips_for_nodes(
+                    continuous_strips = _continuous_roof_strips_for_nodes(
                         continuous_roof_wind_result,
                         combination.cpe_case,
                         continuous_roof_top_nodes,

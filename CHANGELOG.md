@@ -12,6 +12,15 @@ All notable PortalCalc desktop releases should be recorded here.
   - The one-off hay shed and future solar study tools were removed (they remain in the Git history).
   - About 480 lines of unreferenced code removed (superseded wind load paths, an unwired web auto-size action, unused helpers).
   - Checked: the regression suite gives the same pass/fail results before and after, and ten design scenarios give identical results text, checks, costing, footings and displacements.
+- **The engine runs without a window. No change to calculation results.**
+  - `portalcalc.service.calculate(request)` now runs on `HeadlessFrameEngine`: plain input fields instead of an offscreen window, and no Qt import. A check request on the factory defaults takes about 1.6 s instead of about 8 s.
+  - Checked: 17 representative buildings, including an Optimise run, give identical dossiers, report text, saved presets and displacements from the window and from the headless engine; the frozen service regressions pass unchanged.
+  - Fixed: the governing group reported for a tie between the linked top and bottom chords could read "TOP" on one run and "BOTTOM" on the next. It is now always the same.
+- **Tests.**
+  - New results snapshot test: 17 buildings compared by numbers and selected sections only. A changed ratio, deflection, cost or section fails it and lists what moved; rewording never does.
+  - Smoke checks no longer fail on report, label or tooltip wording; they print a note instead. Tooltip and What's New text checks are removed.
+  - The packaged build is now checked for working optimiser worker processes.
+  - The computation report test expected crane load combinations on a building with no crane; corrected.
 - **Removed: 3D Concept view, Export 3D Concept and Export Drawing Set.**
   - The Doors/Finishes tab went with them: sliding doors, PA doors, colours, skylights and the slab toggle only fed the 3D view and drawings.
   - Roof profile stays, on a new Cladding tab, because the 3D bracing wind loads use it for roof friction drag. Older presets still load; their door and colour entries are ignored.

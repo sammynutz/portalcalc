@@ -19,8 +19,130 @@ from portalcalc.loads import apply_structure_self_weight, crane_case
 from portalcalc.member_checks import check_member, MemberActions
 
 
+def _empty_action():
+    return {"value": -1.0, "combo": "-", "member": "-", "group": "-", "length_mm": 0.0}
+
+
+def _update_action(envelope, key, value, combination, element, coincident=None):
+    if value > envelope[key]["value"]:
+        envelope[key] = {
+            "value": value,
+            "combo": combination.name,
+            "member": element.id,
+            "group": element.group,
+            "length_mm": element.length(),
+        }
+        if coincident:
+            envelope[key].update(coincident)
+
+
+def _update_average_action(envelope, key, value, combination, group, length_mm):
+    if value > envelope[key]["value"]:
+        envelope[key] = {
+            "value": value,
+            "combo": combination.name,
+            "member": f"{group} average",
+            "group": group,
+            "length_mm": length_mm,
+        }
+
+
+def _action_line(label, item, unit):
+    member_value = str(item["member"])
+    member = f"Member {member_value}" if member_value.isdigit() else member_value
+    return f"{label:<18}: {item['value']:>8.2f} {unit:<3} | {member:<10} | {item['combo']}"
+
+
+def _new_member_envelope():
+    return {
+        "compression_kn": _empty_action(),
+        "tension_kn": _empty_action(),
+        "shear_kn": _empty_action(),
+        "moment_knm": _empty_action(),
+    }
+
+
+def _new_column_top_deflections():
+    return {
+        group: {"value": -1.0, "combo": "-", "node": "-", "height_mm": 0.0, "group": group, "label": "Column top deflection SLS"}
+        for group in ("LEFT_COLUMN", "RIGHT_COLUMN")
+    }
+
+
+def _new_truss_midspan_deflections():
+    return {
+        "G": {"value": -1.0, "combo": "-", "node": "-"},
+        "Q": {"value": -1.0, "combo": "-", "node": "-"},
+        "Ws": {"value": -1.0, "combo": "-", "node": "-"},
+    }
+
+
+def _merge_action_envelope(target, source):
+    for key, source_item in source.items():
+        if source_item["value"] > target[key]["value"]:
+            target[key] = source_item
+
+
+def _merge_foundation_reactions(target, source):
+    for target_item, source_item in zip(target, source):
+        for key, combo_key in [
+            ("compression_kn", "compression_combo"),
+            ("uplift_kn", "uplift_combo"),
+            ("shear_kn", "shear_combo"),
+            ("moment_knm", "moment_combo"),
+        ]:
+            if source_item[key] > target_item[key]:
+                target_item[key] = source_item[key]
+                target_item[combo_key] = source_item[combo_key]
+
+
+def _merge_web_member_demands(target, source):
+    for group, items in source.items():
+        group_target = target.setdefault(group, {})
+        for member_id, source_item in items.items():
+            group_target[member_id] = merge_web_member_demand(group_target.get(member_id), source_item, owned=True)
+
+
+def _merge_doubled_chord_zones(target, source):
+    for zone in source.values():
+        key = (zone["group"], zone["member"])
+        current = target.get(key)
+        if current is None or zone["single_ratio"] > current["single_ratio"]:
+            target[key] = zone
+
+
+def _apply_selected_doublers_to_envelope(envelope, group, zones):
+    doubled_members = {
+        int(zone["member"]) for zone in zones.values()
+        if zone["group"] == group and str(zone["member"]).isdigit()
+    }
+    if not doubled_members:
+        return
+    for key in ["compression_kn", "tension_kn", "shear_kn", "moment_knm"]:
+        item = envelope.get(key)
+        if not isinstance(item, dict):
+            continue
+        member = item.get("member")
+        if isinstance(member, str) and not member.isdigit():
+            continue
+        try:
+            member_id = int(member)
+        except (TypeError, ValueError):
+            continue
+        if member_id not in doubled_members:
+            continue
+        item["value"] *= 0.5
+        item["doubled_chord"] = True
+        for coincident_key in ["coincident_tension_kn", "coincident_shear_kn", "coincident_moment_knm"]:
+            if coincident_key in item:
+                item[coincident_key] *= 0.5
+
+
 class MemberChecksMixin:
     """Envelope member checks and their report lines."""
+
+    def _expand_doubled_chord_zones_to_web_joints(self, candidate_structure, zones):
+        return self.expand_doubled_chord_zones_to_web_joints(candidate_structure, zones)
 
     def member_check_envelope_lines(self, structure, combinations, apply_combination_loads, top_nodes, span, foundation_nodes=None, canopy_tip_checks=None, side_midspan_checks=None, storage_check_cases=None, crane_deflection_nodes=None, storage_rail_deflection_nodes=None, rafter_haunch_length_mm=0.0):
         from portalcalc.frame.column_flybracing import COLUMN_GROUPS, capture_case, girt_levels
@@ -69,85 +191,41 @@ class MemberChecksMixin:
         storage_rail_deflection_nodes = storage_rail_deflection_nodes or []
         use_second_order = getattr(self, "second_order_checkbox", None) is not None and self.second_order_checkbox.isChecked()
 
-        def empty_action():
-            return {"value": -1.0, "combo": "-", "member": "-", "group": "-", "length_mm": 0.0}
-
-        def update_action(envelope, key, value, combination, element, coincident=None):
-            if value > envelope[key]["value"]:
-                envelope[key] = {
-                    "value": value,
-                    "combo": combination.name,
-                    "member": element.id,
-                    "group": element.group,
-                    "length_mm": element.length(),
-                }
-                if coincident:
-                    envelope[key].update(coincident)
-
-        def update_average_action(envelope, key, value, combination, group, length_mm):
-            if value > envelope[key]["value"]:
-                envelope[key] = {
-                    "value": value,
-                    "combo": combination.name,
-                    "member": f"{group} average",
-                    "group": group,
-                    "length_mm": length_mm,
-                }
-
-        def action_line(label, item, unit):
-            member_value = str(item["member"])
-            member = f"Member {member_value}" if member_value.isdigit() else member_value
-            return f"{label:<18}: {item['value']:>8.2f} {unit:<3} | {member:<10} | {item['combo']}"
-
-        def new_member_envelope():
-            return {
-                "compression_kn": empty_action(),
-                "tension_kn": empty_action(),
-                "shear_kn": empty_action(),
-                "moment_knm": empty_action(),
-            }
-
         column_envelopes = {
-            "LEFT_COLUMN": new_member_envelope(),
-            "RIGHT_COLUMN": new_member_envelope(),
-            "INTERNAL_COLUMN": new_member_envelope(),
-            "LEFT_LEAN_COLUMN": new_member_envelope(),
-            "RIGHT_LEAN_COLUMN": new_member_envelope(),
-            "WEB": new_member_envelope(),
-            "LEFT_CANOPY_WEB": new_member_envelope(),
-            "RIGHT_CANOPY_WEB": new_member_envelope(),
+            "LEFT_COLUMN": _new_member_envelope(),
+            "RIGHT_COLUMN": _new_member_envelope(),
+            "INTERNAL_COLUMN": _new_member_envelope(),
+            "LEFT_LEAN_COLUMN": _new_member_envelope(),
+            "RIGHT_LEAN_COLUMN": _new_member_envelope(),
+            "WEB": _new_member_envelope(),
+            "LEFT_CANOPY_WEB": _new_member_envelope(),
+            "RIGHT_CANOPY_WEB": _new_member_envelope(),
         }
         column_envelope = {
-            "compression_kn": empty_action(),
-            "tension_kn": empty_action(),
-            "shear_kn": empty_action(),
-            "moment_knm": empty_action(),
+            "compression_kn": _empty_action(),
+            "tension_kn": _empty_action(),
+            "shear_kn": _empty_action(),
+            "moment_knm": _empty_action(),
         }
         chord_envelopes = {
-            "TOP": new_member_envelope(),
-            "BOTTOM": new_member_envelope(),
-            "LEFT_CANOPY_TOP": new_member_envelope(),
-            "LEFT_CANOPY_BOTTOM": new_member_envelope(),
-            "RIGHT_CANOPY_TOP": new_member_envelope(),
-            "RIGHT_CANOPY_BOTTOM": new_member_envelope(),
+            "TOP": _new_member_envelope(),
+            "BOTTOM": _new_member_envelope(),
+            "LEFT_CANOPY_TOP": _new_member_envelope(),
+            "LEFT_CANOPY_BOTTOM": _new_member_envelope(),
+            "RIGHT_CANOPY_TOP": _new_member_envelope(),
+            "RIGHT_CANOPY_BOTTOM": _new_member_envelope(),
         }
         single_chord_envelopes = {
-            "TOP": new_member_envelope(),
-            "BOTTOM": new_member_envelope(),
-            "LEFT_CANOPY_TOP": new_member_envelope(),
-            "LEFT_CANOPY_BOTTOM": new_member_envelope(),
-            "RIGHT_CANOPY_TOP": new_member_envelope(),
-            "RIGHT_CANOPY_BOTTOM": new_member_envelope(),
+            "TOP": _new_member_envelope(),
+            "BOTTOM": _new_member_envelope(),
+            "LEFT_CANOPY_TOP": _new_member_envelope(),
+            "LEFT_CANOPY_BOTTOM": _new_member_envelope(),
+            "RIGHT_CANOPY_TOP": _new_member_envelope(),
+            "RIGHT_CANOPY_BOTTOM": _new_member_envelope(),
         }
         doubled_chord_zones = {}
         sls_column_top_deflection = {"value": -1.0, "combo": "-", "node": "-", "height_mm": 0.0, "label": "Column top deflection SLS"}
-        def new_column_top_deflections():
-            return {
-                group: {"value": -1.0, "combo": "-", "node": "-", "height_mm": 0.0, "group": group, "label": "Column top deflection SLS"}
-                for group in ("LEFT_COLUMN", "RIGHT_COLUMN")
-            }
-
-        sls_column_top_deflections = new_column_top_deflections()
+        sls_column_top_deflections = _new_column_top_deflections()
         sls_crane_rail_deflection = {"value": -1.0, "combo": "-", "node": "-", "height_mm": 0.0, "label": "Crane rail racking SLS"}
         sls_crane_gauge_change = {"value": -1.0, "combo": "-", "node": "-", "height_mm": 0.0, "label": "Crane rail gauge change SLS"}
         sls_column_midspan_ws_deflection = {"value": -1.0, "combo": "-", "member": "-", "group": "-", "height_mm": 0.0}
@@ -159,21 +237,14 @@ class MemberChecksMixin:
             }
 
         sls_column_midspan_ws_deflections = new_column_midspan_ws_deflections()
-        def new_truss_midspan_deflections():
-            return {
-                "G": {"value": -1.0, "combo": "-", "node": "-"},
-                "Q": {"value": -1.0, "combo": "-", "node": "-"},
-                "Ws": {"value": -1.0, "combo": "-", "node": "-"},
-            }
-
-        sls_truss_midspan_deflections = new_truss_midspan_deflections()
+        sls_truss_midspan_deflections = _new_truss_midspan_deflections()
         def new_side_midspan_deflections():
             return {
                 check["key"]: {
                     "label": check["label"],
                     "length_mm": check["length_mm"],
                     "node": getattr(check["node"], "id", "-"),
-                    "components": new_truss_midspan_deflections(),
+                    "components": _new_truss_midspan_deflections(),
                 }
                 for check in side_midspan_checks
             }
@@ -287,9 +358,6 @@ class MemberChecksMixin:
                 return True
             return is_single_chord_design_panel(element, group_key)
 
-        def expand_doubled_chord_zones_to_web_joints(candidate_structure, zones):
-            return self.expand_doubled_chord_zones_to_web_joints(candidate_structure, zones)
-
         def column_midheight_deflection_items(candidate_structure, displacements):
             if storage_rail_deflection_nodes:
                 return []
@@ -347,36 +415,6 @@ class MemberChecksMixin:
             d, reactions, force_vector = candidate_structure.solve()
             return d, reactions, force_vector, None
 
-        def merge_action_envelope(target, source):
-            for key, source_item in source.items():
-                if source_item["value"] > target[key]["value"]:
-                    target[key] = source_item
-
-        def merge_foundation_reactions(target, source):
-            for target_item, source_item in zip(target, source):
-                for key, combo_key in [
-                    ("compression_kn", "compression_combo"),
-                    ("uplift_kn", "uplift_combo"),
-                    ("shear_kn", "shear_combo"),
-                    ("moment_knm", "moment_combo"),
-                ]:
-                    if source_item[key] > target_item[key]:
-                        target_item[key] = source_item[key]
-                        target_item[combo_key] = source_item[combo_key]
-
-        def merge_web_member_demands(target, source):
-            for group, items in source.items():
-                group_target = target.setdefault(group, {})
-                for member_id, source_item in items.items():
-                    group_target[member_id] = merge_web_member_demand(group_target.get(member_id), source_item, owned=True)
-
-        def merge_doubled_chord_zones(target, source):
-            for zone in source.values():
-                key = (zone["group"], zone["member"])
-                current = target.get(key)
-                if current is None or zone["single_ratio"] > current["single_ratio"]:
-                    target[key] = zone
-
         def merge_combination_result(result):
             for group, case in result.get('column_flybrace_cases', {}).items():
                 column_cases[group].append(case)
@@ -386,13 +424,13 @@ class MemberChecksMixin:
             uls_count += result["uls_count"]
             sls_count += result["sls_count"]
             for group, envelope in result["column_envelopes"].items():
-                merge_action_envelope(column_envelopes[group], envelope)
-            merge_action_envelope(column_envelope, result["column_envelope"])
+                _merge_action_envelope(column_envelopes[group], envelope)
+            _merge_action_envelope(column_envelope, result["column_envelope"])
             for group, envelope in result["chord_envelopes"].items():
-                merge_action_envelope(chord_envelopes[group], envelope)
+                _merge_action_envelope(chord_envelopes[group], envelope)
             for group, envelope in result["single_chord_envelopes"].items():
-                merge_action_envelope(single_chord_envelopes[group], envelope)
-            merge_foundation_reactions(foundation_reactions, result["foundation_reactions"])
+                _merge_action_envelope(single_chord_envelopes[group], envelope)
+            _merge_foundation_reactions(foundation_reactions, result["foundation_reactions"])
             if result["sls_column_top_deflection"]["value"] > sls_column_top_deflection["value"]:
                 sls_column_top_deflection = result["sls_column_top_deflection"]
             for group, item in result["sls_column_top_deflections"].items():
@@ -420,8 +458,8 @@ class MemberChecksMixin:
             for key, item in result["sls_canopy_tip_deflections"].items():
                 if item["value"] > sls_canopy_tip_deflections[key]["value"]:
                     sls_canopy_tip_deflections[key] = item
-            merge_web_member_demands(web_member_demands, result["web_member_demands"])
-            merge_doubled_chord_zones(doubled_chord_zones, result["doubled_chord_zones"])
+            _merge_web_member_demands(web_member_demands, result["web_member_demands"])
+            _merge_doubled_chord_zones(doubled_chord_zones, result["doubled_chord_zones"])
 
         def evaluate_combination(evaluation_item):
             evaluation_case, precomputed_solution = evaluation_item
@@ -434,40 +472,40 @@ class MemberChecksMixin:
                 candidate_structure = copy.copy(structure)
                 candidate_structure.restore_element_load_snapshot(precomputed_solution[3])
             local_column_envelopes = {
-                "LEFT_COLUMN": new_member_envelope(),
-                "RIGHT_COLUMN": new_member_envelope(),
-                "INTERNAL_COLUMN": new_member_envelope(),
-                "LEFT_LEAN_COLUMN": new_member_envelope(),
-                "RIGHT_LEAN_COLUMN": new_member_envelope(),
-                "WEB": new_member_envelope(),
-                "LEFT_CANOPY_WEB": new_member_envelope(),
-                "RIGHT_CANOPY_WEB": new_member_envelope(),
+                "LEFT_COLUMN": _new_member_envelope(),
+                "RIGHT_COLUMN": _new_member_envelope(),
+                "INTERNAL_COLUMN": _new_member_envelope(),
+                "LEFT_LEAN_COLUMN": _new_member_envelope(),
+                "RIGHT_LEAN_COLUMN": _new_member_envelope(),
+                "WEB": _new_member_envelope(),
+                "LEFT_CANOPY_WEB": _new_member_envelope(),
+                "RIGHT_CANOPY_WEB": _new_member_envelope(),
             }
-            local_column_envelope = new_member_envelope()
+            local_column_envelope = _new_member_envelope()
             local_chord_envelopes = {
-                "TOP": new_member_envelope(),
-                "BOTTOM": new_member_envelope(),
-                "LEFT_CANOPY_TOP": new_member_envelope(),
-                "LEFT_CANOPY_BOTTOM": new_member_envelope(),
-                "RIGHT_CANOPY_TOP": new_member_envelope(),
-                "RIGHT_CANOPY_BOTTOM": new_member_envelope(),
+                "TOP": _new_member_envelope(),
+                "BOTTOM": _new_member_envelope(),
+                "LEFT_CANOPY_TOP": _new_member_envelope(),
+                "LEFT_CANOPY_BOTTOM": _new_member_envelope(),
+                "RIGHT_CANOPY_TOP": _new_member_envelope(),
+                "RIGHT_CANOPY_BOTTOM": _new_member_envelope(),
             }
             local_single_chord_envelopes = {
-                "TOP": new_member_envelope(),
-                "BOTTOM": new_member_envelope(),
-                "LEFT_CANOPY_TOP": new_member_envelope(),
-                "LEFT_CANOPY_BOTTOM": new_member_envelope(),
-                "RIGHT_CANOPY_TOP": new_member_envelope(),
-                "RIGHT_CANOPY_BOTTOM": new_member_envelope(),
+                "TOP": _new_member_envelope(),
+                "BOTTOM": _new_member_envelope(),
+                "LEFT_CANOPY_TOP": _new_member_envelope(),
+                "LEFT_CANOPY_BOTTOM": _new_member_envelope(),
+                "RIGHT_CANOPY_TOP": _new_member_envelope(),
+                "RIGHT_CANOPY_BOTTOM": _new_member_envelope(),
             }
             local_foundation_reactions = new_foundation_reactions()
             local_sls_column_top_deflection = {"value": -1.0, "combo": "-", "node": "-", "height_mm": 0.0, "label": "Column top deflection SLS"}
-            local_sls_column_top_deflections = new_column_top_deflections()
+            local_sls_column_top_deflections = _new_column_top_deflections()
             local_sls_crane_rail_deflection = {"value": -1.0, "combo": "-", "node": "-", "height_mm": 0.0, "label": "Crane rail racking SLS"}
             local_sls_crane_gauge_change = {"value": -1.0, "combo": "-", "node": "-", "height_mm": 0.0, "label": "Crane rail gauge change SLS"}
             local_sls_column_midspan_ws_deflection = {"value": -1.0, "combo": "-", "member": "-", "group": "-", "height_mm": 0.0}
             local_sls_column_midspan_ws_deflections = new_column_midspan_ws_deflections()
-            local_sls_truss_midspan_deflections = new_truss_midspan_deflections()
+            local_sls_truss_midspan_deflections = _new_truss_midspan_deflections()
             local_sls_side_midspan_deflections = new_side_midspan_deflections()
             local_sls_canopy_tip_deflections = new_canopy_tip_deflections()
             local_web_member_demands = {
@@ -580,10 +618,10 @@ class MemberChecksMixin:
                     if total_length <= 1e-9:
                         continue
                     average_moment = sum(summary["moment_knm"] * element.length() for element, summary in preliminary_items) / total_length
-                    preliminary_envelope = new_member_envelope()
-                    update_average_action(preliminary_envelope, "moment_knm", average_moment, display_combination, chord_group, total_length / len(preliminary_items))
+                    preliminary_envelope = _new_member_envelope()
+                    _update_average_action(preliminary_envelope, "moment_knm", average_moment, display_combination, chord_group, total_length / len(preliminary_items))
                     for chord_element, summary in preliminary_items:
-                        update_action(
+                        _update_action(
                             preliminary_envelope,
                             "compression_kn",
                             summary["compression_kn"],
@@ -596,8 +634,8 @@ class MemberChecksMixin:
                                 "coincident_moment_member": f"{chord_group} average",
                             },
                         )
-                        update_action(preliminary_envelope, "tension_kn", summary["tension_kn"], display_combination, chord_element)
-                        update_action(preliminary_envelope, "shear_kn", summary["shear_kn"], display_combination, chord_element)
+                        _update_action(preliminary_envelope, "tension_kn", summary["tension_kn"], display_combination, chord_element)
+                        _update_action(preliminary_envelope, "shear_kn", summary["shear_kn"], display_combination, chord_element)
                     group_result = self.member_check_result(preliminary_items[0][0].profile, preliminary_envelope, chord_group)
                     if group_result.governing_ratio > DOUBLED_CHORD_TRIGGER_RATIO:
                         chord_groups_requiring_doublers.add(chord_group)
@@ -726,7 +764,7 @@ class MemberChecksMixin:
                             add_doubled_chord_zone(chord_element, single_result, doubled_result, doubled_envelope)
                             local_doubled_chord_zones[(companion_group, chord_element.id)]["companion_zone"] = True
 
-                local_doubled_chord_zones = expand_doubled_chord_zones_to_web_joints(
+                local_doubled_chord_zones = self._expand_doubled_chord_zones_to_web_joints(
                     candidate_structure,
                     local_doubled_chord_zones,
                 )
@@ -862,15 +900,15 @@ class MemberChecksMixin:
                         moment_knm = max(moment_knm, eccentric_moment_knm)
                     if group_key in local_column_envelopes:
                         envelope = local_column_envelopes[group_key]
-                        update_action(envelope, "compression_kn", summary["compression_kn"], display_combination, element)
-                        update_action(envelope, "tension_kn", summary["tension_kn"], display_combination, element)
-                        update_action(envelope, "shear_kn", summary["shear_kn"], display_combination, element)
-                        update_action(envelope, "moment_knm", moment_knm, display_combination, element)
+                        _update_action(envelope, "compression_kn", summary["compression_kn"], display_combination, element)
+                        _update_action(envelope, "tension_kn", summary["tension_kn"], display_combination, element)
+                        _update_action(envelope, "shear_kn", summary["shear_kn"], display_combination, element)
+                        _update_action(envelope, "moment_knm", moment_knm, display_combination, element)
                         if group_key in {"LEFT_COLUMN", "RIGHT_COLUMN", "INTERNAL_COLUMN"}:
-                            update_action(local_column_envelope, "compression_kn", summary["compression_kn"], display_combination, element)
-                            update_action(local_column_envelope, "tension_kn", summary["tension_kn"], display_combination, element)
-                            update_action(local_column_envelope, "shear_kn", summary["shear_kn"], display_combination, element)
-                            update_action(local_column_envelope, "moment_knm", moment_knm, display_combination, element)
+                            _update_action(local_column_envelope, "compression_kn", summary["compression_kn"], display_combination, element)
+                            _update_action(local_column_envelope, "tension_kn", summary["tension_kn"], display_combination, element)
+                            _update_action(local_column_envelope, "shear_kn", summary["shear_kn"], display_combination, element)
+                            _update_action(local_column_envelope, "moment_knm", moment_knm, display_combination, element)
                         if group_key in local_web_member_demands:
                             axial_kn = max(summary["compression_kn"], summary["tension_kn"])
                             connection_context = web_joint_context(element, group_key)
@@ -923,8 +961,8 @@ class MemberChecksMixin:
                         average_moment = sum(summary["moment_knm"] * design_scale * element.length() for element, summary, design_scale in items) / total_length
                     else:
                         single_average_moment = 0.0
-                    update_average_action(local_single_chord_envelopes[group], "moment_knm", single_average_moment, display_combination, group, total_length / len(items))
-                    update_average_action(local_chord_envelopes[group], "moment_knm", average_moment, display_combination, group, total_length / len(items))
+                    _update_average_action(local_single_chord_envelopes[group], "moment_knm", single_average_moment, display_combination, group, total_length / len(items))
+                    _update_average_action(local_chord_envelopes[group], "moment_knm", average_moment, display_combination, group, total_length / len(items))
                     for element, summary, design_scale in items:
                         single_coincident = {
                             "coincident_tension_kn": summary["tension_kn"],
@@ -932,7 +970,7 @@ class MemberChecksMixin:
                             "coincident_moment_knm": single_average_moment,
                             "coincident_moment_member": f"{group} average",
                         }
-                        update_action(
+                        _update_action(
                             local_single_chord_envelopes[group],
                             "compression_kn",
                             summary["compression_kn"],
@@ -940,8 +978,8 @@ class MemberChecksMixin:
                             element,
                             coincident=single_coincident,
                         )
-                        update_action(local_single_chord_envelopes[group], "tension_kn", summary["tension_kn"], display_combination, element)
-                        update_action(local_single_chord_envelopes[group], "shear_kn", summary["shear_kn"], display_combination, element)
+                        _update_action(local_single_chord_envelopes[group], "tension_kn", summary["tension_kn"], display_combination, element)
+                        _update_action(local_single_chord_envelopes[group], "shear_kn", summary["shear_kn"], display_combination, element)
                         coincident = {
                             "coincident_tension_kn": summary["tension_kn"] * design_scale,
                             "coincident_shear_kn": summary["shear_kn"] * design_scale,
@@ -950,7 +988,7 @@ class MemberChecksMixin:
                         }
                         if design_scale < 1.0:
                             coincident["doubled_chord"] = True
-                        update_action(
+                        _update_action(
                             local_chord_envelopes[group],
                             "compression_kn",
                             summary["compression_kn"] * design_scale,
@@ -958,8 +996,8 @@ class MemberChecksMixin:
                             element,
                             coincident=coincident,
                         )
-                        update_action(local_chord_envelopes[group], "tension_kn", summary["tension_kn"] * design_scale, display_combination, element, coincident if design_scale < 1.0 else None)
-                        update_action(local_chord_envelopes[group], "shear_kn", summary["shear_kn"] * design_scale, display_combination, element, coincident if design_scale < 1.0 else None)
+                        _update_action(local_chord_envelopes[group], "tension_kn", summary["tension_kn"] * design_scale, display_combination, element, coincident if design_scale < 1.0 else None)
+                        _update_action(local_chord_envelopes[group], "shear_kn", summary["shear_kn"] * design_scale, display_combination, element, coincident if design_scale < 1.0 else None)
 
             if combination.is_serviceability:
                 local_sls_count += 1
@@ -1221,32 +1259,6 @@ class MemberChecksMixin:
                     return element.profile
             return None
 
-        def apply_selected_doublers_to_envelope(envelope, group, zones):
-            doubled_members = {
-                int(zone["member"]) for zone in zones.values()
-                if zone["group"] == group and str(zone["member"]).isdigit()
-            }
-            if not doubled_members:
-                return
-            for key in ["compression_kn", "tension_kn", "shear_kn", "moment_knm"]:
-                item = envelope.get(key)
-                if not isinstance(item, dict):
-                    continue
-                member = item.get("member")
-                if isinstance(member, str) and not member.isdigit():
-                    continue
-                try:
-                    member_id = int(member)
-                except (TypeError, ValueError):
-                    continue
-                if member_id not in doubled_members:
-                    continue
-                item["value"] *= 0.5
-                item["doubled_chord"] = True
-                for coincident_key in ["coincident_tension_kn", "coincident_shear_kn", "coincident_moment_knm"]:
-                    if coincident_key in item:
-                        item[coincident_key] *= 0.5
-
         def add_aggregate_doubled_chord_zone(group, profile, single_envelope, single_result):
             if single_result is None or single_result.governing_ratio <= DOUBLED_CHORD_TRIGGER_RATIO:
                 return
@@ -1306,9 +1318,9 @@ class MemberChecksMixin:
                 }
             if not aggregate_zones:
                 return
-            aggregate_zones = expand_doubled_chord_zones_to_web_joints(structure, aggregate_zones)
+            aggregate_zones = self._expand_doubled_chord_zones_to_web_joints(structure, aggregate_zones)
             doubled_envelope = copy.deepcopy(single_envelope)
-            apply_selected_doublers_to_envelope(doubled_envelope, group, aggregate_zones)
+            _apply_selected_doublers_to_envelope(doubled_envelope, group, aggregate_zones)
             doubled_result = self.member_check_result(profile, doubled_envelope, group)
             for zone_key, aggregate_zone in aggregate_zones.items():
                 aggregate_zone["doubled_ratio"] = float(doubled_result.governing_ratio)
@@ -1340,7 +1352,7 @@ class MemberChecksMixin:
                     if zone["group"] != chord_group or key in retained_zones
                 }
                 if retained_zones:
-                    apply_selected_doublers_to_envelope(chord_envelopes[chord_group], chord_group, retained_zones)
+                    _apply_selected_doublers_to_envelope(chord_envelopes[chord_group], chord_group, retained_zones)
                     worst_zone = max(retained_zones.values(), key=lambda zone: zone["doubled_ratio"])
                     chord_envelopes[chord_group]["doubled_chord_zone"] = {
                         "value": worst_zone["doubled_ratio"],
@@ -1355,7 +1367,7 @@ class MemberChecksMixin:
                         "doubled_envelope": copy.deepcopy(worst_zone.get("doubled_envelope")),
                     }
             else:
-                apply_selected_doublers_to_envelope(chord_envelopes[chord_group], chord_group, doubled_chord_zones)
+                _apply_selected_doublers_to_envelope(chord_envelopes[chord_group], chord_group, doubled_chord_zones)
                 group_zones = [zone for zone in doubled_chord_zones.values() if zone["group"] == chord_group]
                 if group_zones:
                     worst_zone = max(group_zones, key=lambda zone: zone["doubled_ratio"])
@@ -1415,10 +1427,10 @@ class MemberChecksMixin:
         lines.append("STRENGTH ENVELOPES")
         lines.append("")
         lines.append("COLUMNS - ULS ENVELOPE")
-        lines.append(action_line("Compression", column_envelope["compression_kn"], "kN"))
-        lines.append(action_line("Tension", column_envelope["tension_kn"], "kN"))
-        lines.append(action_line("Shear", column_envelope["shear_kn"], "kN"))
-        lines.append(action_line("Bending", column_envelope["moment_knm"], "kNm"))
+        lines.append(_action_line("Compression", column_envelope["compression_kn"], "kN"))
+        lines.append(_action_line("Tension", column_envelope["tension_kn"], "kN"))
+        lines.append(_action_line("Shear", column_envelope["shear_kn"], "kN"))
+        lines.append(_action_line("Bending", column_envelope["moment_knm"], "kNm"))
         lines.append("")
         lines.append("RAFTER - ULS ENVELOPE" if is_rafter else "TRUSS CHORDS - ULS ENVELOPE")
         if is_rafter:
@@ -1450,18 +1462,18 @@ class MemberChecksMixin:
                 continue
             lines.append("")
             lines.append(title)
-            lines.append(action_line("Compression", chord_envelopes[group]["compression_kn"], "kN"))
-            lines.append(action_line("Tension", chord_envelopes[group]["tension_kn"], "kN"))
-            lines.append(action_line("Shear", chord_envelopes[group]["shear_kn"], "kN"))
-            lines.append(action_line("Bending", chord_envelopes[group]["moment_knm"], "kNm"))
+            lines.append(_action_line("Compression", chord_envelopes[group]["compression_kn"], "kN"))
+            lines.append(_action_line("Tension", chord_envelopes[group]["tension_kn"], "kN"))
+            lines.append(_action_line("Shear", chord_envelopes[group]["shear_kn"], "kN"))
+            lines.append(_action_line("Bending", chord_envelopes[group]["moment_knm"], "kNm"))
 
         if column_envelopes["WEB"]["compression_kn"]["value"] >= 0.0:
             lines.append("")
             lines.append("WEBS / POSTS - ULS ENVELOPE")
-            lines.append(action_line("Compression", column_envelopes["WEB"]["compression_kn"], "kN"))
-            lines.append(action_line("Tension", column_envelopes["WEB"]["tension_kn"], "kN"))
-            lines.append(action_line("Shear", column_envelopes["WEB"]["shear_kn"], "kN"))
-            lines.append(action_line("Bending", column_envelopes["WEB"]["moment_knm"], "kNm"))
+            lines.append(_action_line("Compression", column_envelopes["WEB"]["compression_kn"], "kN"))
+            lines.append(_action_line("Tension", column_envelopes["WEB"]["tension_kn"], "kN"))
+            lines.append(_action_line("Shear", column_envelopes["WEB"]["shear_kn"], "kN"))
+            lines.append(_action_line("Bending", column_envelopes["WEB"]["moment_knm"], "kNm"))
         envelope_actions = {
             "COLUMN": column_envelope,
             "LEFT_COLUMN": column_envelopes["LEFT_COLUMN"],

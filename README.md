@@ -39,6 +39,7 @@ result = calculate({
 })
 ```
 
+The call needs no window and does not load the Qt user interface.
 The request and result are plain JSON-shaped dictionaries. A v2 request carries
 a whole building (`portalcalc.building.v1`) and is checked gridline by gridline.
 Schemas and policy are in `docs/CALCULATION_SERVICE.md`. Every result is a
@@ -50,6 +51,7 @@ proposal that needs engineering review.
 python run_tests.py                 # everything, 10 to 15 minutes
 python run_tests.py bracing_layout  # scripts whose name contains a word
 python tests/smoke_checks.py --quick
+python tests/results_snapshot_regression.py   # core results, numbers only
 ```
 
 ## Build the Windows package

@@ -8,7 +8,11 @@ from PyInstaller.utils.hooks import collect_data_files
 block_cipher = None
 
 # Section catalogue, capacity tables, factory defaults, EULA and brand assets.
-datas = [("portalcalc/data", "portalcalc/data")]
+datas = [
+    ("portalcalc/data", "portalcalc/data"),
+    # Field schema the headless engine (portalcalc.service) starts from.
+    ("portalcalc/frame/engine/form_schema.json", "portalcalc/frame/engine"),
+]
 datas += collect_data_files("certifi")
 datas += collect_data_files("reportlab", includes=["fonts/*.ttf"])
 

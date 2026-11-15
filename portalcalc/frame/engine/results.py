@@ -17,6 +17,41 @@ from portalcalc.storage_loads import is_centre_stub_storage_mode, storage_summar
 from portalcalc.wind import calculate_wind
 
 
+def _bucket_count_text(bucket):
+    count = bucket["count"]
+    return f"{count} webs" if count != 1 else "1 web"
+
+
+def _deflection_overlay_candidate(kind, item, demand, limit, ratio, status, divisor, direction="horizontal"):
+    return {
+        "kind": kind,
+        "item": dict(item),
+        "value_mm": float(demand),
+        "signed_value_mm": float(item.get("signed_value", demand)),
+        "limit_mm": float(limit),
+        "ratio": float(ratio),
+        "status": status,
+        "divisor": float(divisor),
+        "combo": item.get("combo", "-"),
+        "group": item.get("group", ""),
+        "direction": direction,
+    }
+
+
+def _update_serviceability_status_label(label, item, prefix, limit_label="Span"):
+    if item is None:
+        label.setText("Not checked")
+        label.setStyleSheet("font-weight: bold;")
+        return
+    status = item.get("status", "NOT OK")
+    color = "#1b7f3a" if status == "OK" else "#b42318"
+    label.setText(
+        f"{status} - {prefix} {item['demand']:.2f} / {item['limit']:.2f} mm = "
+        f"{item['ratio']:.3f} ({limit_label}/{item['divisor']:.0f})"
+    )
+    label.setStyleSheet(f"font-weight: bold; color: {color};")
+
+
 class ResultsMixin:
     """Turns a solved, checked model into text reports and the service dossier."""
 
@@ -404,6 +439,430 @@ class ResultsMixin:
             "sized_building": sized_building,
         }
 
+    def _resolved_section_check(self, profile, envelope, group):
+        return self.resolved_member_check(profile, envelope, group)
+
+    def _format_check_set(self, title, profile, envelope, group):
+        result, actions, restraint, extra_notes = self._resolved_section_check(profile, envelope, group)
+        doubled_zone_check = envelope.get("doubled_chord_zone") if group in {
+            "TOP", "BOTTOM",
+            "LEFT_CANOPY_TOP", "LEFT_CANOPY_BOTTOM",
+            "RIGHT_CANOPY_TOP", "RIGHT_CANOPY_BOTTOM",
+        } else None
+        doubled_zone_ratio, _ = self.doubled_chord_zone_ratio(profile, envelope, group)
+        governing_ratio = max(result.governing_ratio, doubled_zone_ratio)
+        governing_check = "Doubled chord zone" if doubled_zone_ratio > result.governing_ratio else result.governing_check
+        doubled_fraction = self.doubled_chord_length_fraction(group)
+        doubled_length_ratio = doubled_fraction / MAX_DOUBLED_CHORD_LENGTH_FRACTION
+        if doubled_length_ratio > governing_ratio:
+            governing_ratio = doubled_length_ratio
+            governing_check = "Doubled chord length limit"
+        web_joint_ratio, web_joint_label = self.web_assignment_chord_joint_ratio(profile, group)
+        if web_joint_ratio > governing_ratio:
+            governing_ratio = web_joint_ratio
+            governing_check = web_joint_label
+        status = "OK" if self.design_utilization_ok(governing_ratio) else "NOT OK"
+        clad_text = ""
+        if restraint.get("clad") is not None:
+            clad_text = f" | clad: {'yes' if restraint.get('clad') else 'no'}"
+        crane_minor_text = " | crane minor length: base to crane height" if restraint.get("crane_minor") else ""
+        storage_restraint_text = " | storage rail restraint" if restraint.get("storage_restraint") else ""
+        ke = max(restraint.get("ke", 1.0), 1e-9)
+        restraint_major = restraint.get("major_mm")
+        restraint_minor = restraint.get("minor_mm")
+        if restraint_major is None:
+            restraint_major = (actions.effective_length_z_mm or 0.0) / ke if actions.effective_length_z_mm else 0.0
+        if restraint_minor is None:
+            restraint_minor = (actions.effective_length_y_mm or 0.0) / ke if actions.effective_length_y_mm else 0.0
+        lines = [
+            title,
+            f"Section: {profile.name}",
+            f"Restraint lengths: major {restraint_major:.0f} mm, minor {restraint_minor:.0f} mm | effective: major {actions.effective_length_z_mm or 0.0:.0f} mm, minor {actions.effective_length_y_mm or 0.0:.0f} mm | ke {restraint.get('ke', 1.0):.2f} | am {actions.moment_modifier:.2f} | kt/kl/kr {actions.kt:.2f}/{actions.kl:.2f}/{actions.kr:.2f}{clad_text}{crane_minor_text}{storage_restraint_text}",
+            f"Governing: {governing_check} | ratio {governing_ratio:.3f} | {status}",
+            "Check        | Demand      | Capacity    | Ratio  | Status | Source",
+        ]
+        if group == "INTERNAL_COLUMN":
+            lines.append("Internal column bending includes AS4100 eccentricity moment Mx = Nc x D/2.")
+        source_keys = {
+            "compression": "compression_kn",
+            "local_compression": "compression_kn",
+            "tension": "tension_kn",
+            "shear": "shear_kn",
+            "bending": "moment_knm",
+        }
+        check_keys = ["compression"]
+        if "local_compression" in result.checks:
+            check_keys.append("local_compression")
+        check_keys.extend(["tension", "shear", "bending", "combined"])
+        for key in check_keys:
+            check = result.checks[key]
+            unit = f" {check.unit}" if check.unit else ""
+            check_status = "OK" if self.design_utilization_ok(check.ratio) else "NOT OK"
+            if restraint.get('flybraces'):
+                source = restraint['flybraces']['sources'][key]
+                source_text = f"{source['from_mm']:.0f}-{source['to_mm']:.0f} mm | {source['combo']} | am {source['am']:.3f}"
+            elif key == "bending" and group in {"TOP", "BOTTOM", "LEFT_CANOPY_TOP", "LEFT_CANOPY_BOTTOM", "RIGHT_CANOPY_TOP", "RIGHT_CANOPY_BOTTOM"}:
+                source = envelope["compression_kn"]
+                source_member = source.get("coincident_moment_member", f"{group} average")
+                source_text = f"{source_member} | {source['combo']} | compression case"
+            elif key in source_keys:
+                source = envelope[source_keys[key]]
+                source_text = f"Member {source['member']} | {source['combo']}"
+            else:
+                source_text = "Envelope interaction"
+            lines.append(
+                f"{check.label:<12} | {check.demand:>8.2f}{unit:<4} | "
+                f"{check.capacity:>8.2f}{unit:<4} | {check.ratio:>6.3f} | {check_status:<6} | {source_text}"
+            )
+        if doubled_zone_check:
+            doubled_status = "OK" if self.design_utilization_ok(doubled_zone_ratio) else "NOT OK"
+            lines.append(
+                f"{'Doubled zone':<12} | {doubled_zone_check['single_ratio']:>8.3f}     | "
+                f"{1.0:>8.2f}     | {doubled_zone_ratio:>6.3f} | {doubled_status:<6} | "
+                f"Member {doubled_zone_check['member']} | {doubled_zone_check['combo']} | after 50/50 chord sharing"
+            )
+        if group in {"WEB", "LEFT_CANOPY_WEB", "RIGHT_CANOPY_WEB"}:
+            connection = self.web_connection_check(profile, envelope, group)
+            governing_source = envelope["compression_kn"]
+            if envelope["tension_kn"]["value"] > governing_source["value"]:
+                governing_source = envelope["tension_kn"]
+            for connection_check in connection.get("checks", []):
+                connection_status = "OK" if self.design_utilization_ok(connection_check["ratio"]) else "NOT OK"
+                source_text = f"Member {governing_source['member']} | {governing_source['combo']} | {connection['governing_chord']}"
+                lines.append(
+                    f"{connection_check['label']:<12} | {connection_check['demand']:>8.2f} {connection_check['unit']:<3} | "
+                    f"{connection_check['capacity']:>8.2f} {connection_check['unit']:<3} | {connection_check['ratio']:>6.3f} | {connection_status:<6} | {source_text}"
+                )
+            if not connection.get("checks"):
+                connection_status = "OK" if self.design_utilization_ok(connection["ratio"]) else "NOT OK"
+                lines.append(
+                    f"{connection['label']:<12} | {connection['demand']:>8.2f} {connection['unit']:<3} | "
+                    f"{connection['capacity']:>8.2f} {connection['unit']:<3} | {connection['ratio']:>6.3f} | {connection_status:<6} | Connection geometry unavailable"
+                )
+        notes = extra_notes + [check.notes for check in result.checks.values() if check.notes]
+        if group in {"WEB", "LEFT_CANOPY_WEB", "RIGHT_CANOPY_WEB"}:
+            notes.append(f"Chord-web connection assumes a {WEB_CONNECTION_CFW_LEG_MM:.0f} mm continuous fillet weld all around, using the larger of web compression and tension demand.")
+            notes.extend(check.get("notes", "") for check in connection.get("checks", []) if check.get("notes"))
+        if notes:
+            lines.append("Notes:")
+            for note in dict.fromkeys(notes):
+                lines.append(f"- {note}")
+        return lines
+
+    def _web_assignment_buckets(self, base_profile, group):
+        if not self.web_assignment_basis_matches(group):
+            return []
+        assignments = (self.auto_web_profile_assignments or {}).get(group, {})
+        demand_items = (self.design_envelope_actions.get("web_member_demands", {}) or {}).get(group, {})
+        if not assignments or not demand_items:
+            return []
+        chord_profiles = self.web_connection_group_profiles(group)
+        invalid_assignment = False
+
+        def merge_bucket_envelope(bucket, envelope):
+            for key in ["compression_kn", "tension_kn", "shear_kn", "moment_knm"]:
+                if envelope[key]["value"] > bucket["envelope"][key]["value"]:
+                    bucket["envelope"][key] = envelope[key]
+            axial_value = max(envelope["compression_kn"]["value"], envelope["tension_kn"]["value"])
+            if axial_value > bucket["connection_axial_value"]:
+                bucket["connection_axial_value"] = axial_value
+                bucket["envelope"]["connection"] = envelope.get("connection", {})
+
+        buckets = {}
+        for member_id, demand in demand_items.items():
+            if not self.is_output_web_demand(demand):
+                continue
+            assigned_name = assignments.get(int(member_id)) or assignments.get(member_id)
+            profile = self.catalog.get(assigned_name) if assigned_name else base_profile
+            if profile is None:
+                continue
+            if not self.web_profile_fits_chords(profile, group, chord_profiles=chord_profiles):
+                invalid_assignment = True
+                continue
+            envelope = self.web_member_demand_envelope(demand)
+            ratio, check_label, _ = self.member_and_connection_ratio(profile, envelope, group)
+            bucket = buckets.setdefault(profile.name, {
+                "profile": profile,
+                "count": 0,
+                "type_counts": {},
+                "envelope": {
+                    "compression_kn": {"value": -1.0, "combo": "-", "member": "-", "group": "-", "length_mm": 0.0},
+                    "tension_kn": {"value": -1.0, "combo": "-", "member": "-", "group": "-", "length_mm": 0.0},
+                    "shear_kn": {"value": -1.0, "combo": "-", "member": "-", "group": "-", "length_mm": 0.0},
+                    "moment_knm": {"value": -1.0, "combo": "-", "member": "-", "group": "-", "length_mm": 0.0},
+                    "connection": {},
+                },
+                "connection_axial_value": -1.0,
+                "worst_ratio": -1.0,
+                "worst_check": "-",
+                "worst_envelope": envelope,
+                "worst_demand": demand,
+            })
+            bucket["count"] += 1
+            bucket["type_counts"]["webs"] = bucket["type_counts"].get("webs", 0) + 1
+            merge_bucket_envelope(bucket, envelope)
+            if ratio > bucket["worst_ratio"]:
+                bucket["worst_ratio"] = ratio
+                bucket["worst_check"] = check_label
+                bucket["worst_envelope"] = envelope
+                bucket["worst_demand"] = demand
+        if invalid_assignment:
+            (self.auto_web_profile_assignments or {}).pop(group, None)
+            (getattr(self, "auto_web_assignment_basis", {}) or {}).pop(group, None)
+            (getattr(self, "auto_web_joint_doubler_sides", {}) or {}).pop(group, None)
+            (getattr(self, "web_split_failures", {}) or {}).pop(group, None)
+            return []
+        return sorted(
+            buckets.values(),
+            key=lambda item: (item["profile"].A, item["profile"].name),
+        )
+
+    def _update_web_split_label(self, label_widget, base_profile, group):
+        buckets = self._web_assignment_buckets(base_profile, group)
+        if not buckets:
+            failure = (getattr(self, "web_split_failures", {}) or {}).get(group)
+            if failure:
+                base_ratio, _ = self.web_group_single_size_ratio(group, base_profile)
+                if not self.design_utilization_ok(base_ratio):
+                    label_widget.setText(failure)
+                    label_widget.setStyleSheet("font-weight: bold; color: #b42318;")
+                    return
+                (getattr(self, "web_split_failures", {}) or {}).pop(group, None)
+            demand_items = (self.design_envelope_actions.get("web_member_demands", {}) or {}).get(group, {})
+            output_demands = [demand for demand in demand_items.values() if self.is_output_web_demand(demand)]
+            if base_profile is not None and output_demands:
+                label_widget.setText(f"{base_profile.name}: {self.web_member_count_text(output_demands)}")
+            else:
+                label_widget.setText("Single size")
+            label_widget.setStyleSheet("font-weight: bold;")
+            return
+        parts = [f"{bucket['profile'].name}: {_bucket_count_text(bucket)}" for bucket in buckets]
+        label_widget.setText("Adopted split: " + "; ".join(parts))
+        label_widget.setStyleSheet("font-weight: bold; color: #1b7f3a;")
+
+    def _section_result(self, profile, envelope, group):
+        buckets = self._web_assignment_buckets(profile, group) if group in {"WEB", "LEFT_CANOPY_WEB", "RIGHT_CANOPY_WEB"} else []
+        if buckets:
+            overall = max(buckets, key=lambda item: item["worst_ratio"])
+            notes = [f"Auto-sized split active across {len(buckets)} assigned web sizes."]
+            return overall["profile"], notes, overall["worst_ratio"], overall["worst_check"]
+        result, _, _, notes = self._resolved_section_check(profile, envelope, group)
+        extra_ratio = 0.0
+        extra_label = ""
+        doubled_ratio, doubled_label = self.doubled_chord_zone_ratio(profile, envelope, group)
+        if doubled_ratio > extra_ratio:
+            extra_ratio = doubled_ratio
+            extra_label = doubled_label
+        if group in {
+            "TOP", "BOTTOM", "LEFT_CANOPY_TOP", "LEFT_CANOPY_BOTTOM",
+            "RIGHT_CANOPY_TOP", "RIGHT_CANOPY_BOTTOM",
+        }:
+            length_ratio = self.doubled_chord_length_fraction(group) / MAX_DOUBLED_CHORD_LENGTH_FRACTION
+            if length_ratio > extra_ratio:
+                extra_ratio = length_ratio
+                extra_label = "Doubled chord length limit"
+            web_joint_ratio, web_joint_label = self.web_assignment_chord_joint_ratio(profile, group)
+            if web_joint_ratio > extra_ratio:
+                extra_ratio = web_joint_ratio
+                extra_label = web_joint_label
+        if group in {"WEB", "LEFT_CANOPY_WEB", "RIGHT_CANOPY_WEB"}:
+            connection = self.web_connection_check(profile, envelope, group)
+            extra_ratio = connection["ratio"]
+            extra_label = connection["label"]
+        return result, notes, extra_ratio, extra_label
+
+    def _update_status_label(self, label, result_info):
+        result, notes, extra_ratio, extra_label = result_info
+        if not hasattr(result, "governing_ratio"):
+            governing_ratio = extra_ratio
+            governing_check = extra_label
+            status = "OK" if self.design_utilization_ok(governing_ratio) else "NOT OK"
+            color = "#1b7f3a" if governing_ratio < 0.90 else "#a87900" if governing_ratio < 0.95 else "#c45a00" if self.design_utilization_ok(governing_ratio) else "#b42318"
+            label.setText(f"{status} - auto-sized split active, max utilisation {governing_ratio:.3f} ({governing_check})")
+            label.setStyleSheet(f"font-weight: bold; color: {color};")
+            return
+        governing_ratio = max(result.governing_ratio, extra_ratio)
+        governing_check = extra_label if extra_ratio > result.governing_ratio else result.governing_check
+        status = "OK" if self.design_utilization_ok(governing_ratio) else "NOT OK"
+        if notes and self.design_utilization_ok(governing_ratio):
+            color = "#a87900"
+        elif not self.design_utilization_ok(governing_ratio):
+            color = "#b42318"
+        elif governing_ratio >= 0.95:
+            color = "#c45a00"
+        elif governing_ratio >= 0.90:
+            color = "#a87900"
+        else:
+            color = "#1b7f3a"
+        suffix = " - additional flybracing required" if notes else ""
+        label.setText(f"{status}{suffix} - max utilisation {governing_ratio:.3f} ({governing_check})")
+        label.setStyleSheet(f"font-weight: bold; color: {color};")
+
+    def _column_deflection_check(self):
+        item = self.design_envelope_actions.get("sls_column_top_deflection", {})
+        height = item.get("height_mm") or self.serviceability_height_mm or 0.0
+        divisor = self.eave_deflection_divisor()
+        limit = height / divisor if height > 0.0 else 0.0
+        demand = max(item.get("value", -1.0), 0.0)
+        ratio = demand / limit if limit > 1e-12 else float("inf")
+        status = "OK" if ratio <= 1.0 else "NOT OK"
+        return demand, limit, ratio, status, divisor, item
+
+    def _crane_rail_deflection_check(self):
+        item = self.design_envelope_actions.get("sls_crane_rail_deflection", {})
+        height = item.get("height_mm") or 0.0
+        divisor = self.serviceability_limit_value("crane_rail_height")
+        limit = height / divisor if height > 0.0 else 0.0
+        demand = max(item.get("value", -1.0), 0.0)
+        ratio = demand / limit if limit > 1e-12 else float("inf")
+        status = "OK" if ratio <= 1.0 else "NOT OK"
+        return demand, limit, ratio, status, divisor, item
+
+    def _crane_gauge_change_check(self):
+        item = self.design_envelope_actions.get("sls_crane_gauge_change", {})
+        limit = item.get("limit_mm") or CRANE_GAUGE_CHANGE_LIMIT_MM
+        demand = max(item.get("value", -1.0), 0.0)
+        ratio = demand / limit if limit > 1e-12 else float("inf")
+        return demand, limit, ratio, "OK" if ratio <= 1.0 else "NOT OK", item
+
+    def _column_midspan_ws_deflection_check(self, group=None):
+        if group is None:
+            item = self.design_envelope_actions.get("sls_column_midspan_ws_deflection", {})
+        else:
+            item = self.design_envelope_actions.get("sls_column_midspan_ws_deflections", {}).get(group, {})
+        height = item.get("height_mm") or self.serviceability_height_mm or 0.0
+        divisor = self.column_deflection_divisor()
+        limit = height / divisor if height > 0.0 else 0.0
+        demand = max(item.get("value", -1.0), 0.0)
+        ratio = demand / limit if limit > 1e-12 else float("inf")
+        status = "OK" if ratio <= 1.0 else "NOT OK"
+        return demand, limit, ratio, status, divisor, item
+
+    def _column_midspan_ws_deflection_line(self, group):
+        demand, limit, ratio, status, divisor, item = self._column_midspan_ws_deflection_check(group)
+        if item.get("value", -1.0) < 0.0:
+            return ""
+        return (
+            f"Column midspan deflection Ws: {demand:.3f} mm <= {limit:.3f} mm "
+            f"(H/{divisor:.0f}) | Member {item.get('member', '-')} | "
+            f"{item.get('combo', '-')} | utilisation {ratio:.3f} | {status}"
+        )
+
+    def _truss_deflection_checks(self):
+        span = self.serviceability_span_mm or 0.0
+        checks = {}
+        items = self.design_envelope_actions.get("sls_truss_midspan_deflections", {})
+        for component, divisor in self.midspan_component_deflection_divisors().items():
+            item = items.get(component, {})
+            demand = max(item.get("value", -1.0), 0.0)
+            checks[component] = self.midspan_component_deflection_check(
+                component, demand, span, divisor, item,
+            )
+        combined_divisor = self.midspan_deflection_divisor()
+        combined_demand = sum(checks.get(component, {}).get("demand", 0.0) for component in ("G", "Q"))
+        combined_limit = span / combined_divisor if span > 0.0 else 0.0
+        combined_ratio = combined_demand / combined_limit if combined_limit > 1e-12 else float("inf")
+        checks["G+Q"] = {
+            "demand": combined_demand,
+            "limit": combined_limit,
+            "ratio": combined_ratio,
+            "status": "REFERENCE",
+            "divisor": combined_divisor,
+            "item": {"combo": "G + Q component envelope"},
+            "component": "G+Q",
+            "governing": False,
+            "precamber_required_mm": 0.0,
+        }
+        return checks
+
+    def _side_midspan_deflection_checks(self):
+        checks = {}
+        items = self.design_envelope_actions.get("sls_side_midspan_deflections", {})
+        for key, side_result in items.items():
+            span = side_result.get("length_mm") or 0.0
+            components = side_result.get("components", {})
+            label = side_result.get("label", key)
+            for component, divisor in self.midspan_component_deflection_divisors().items():
+                item = components.get(component, {})
+                demand = max(item.get("value", -1.0), 0.0)
+                checks[f"{key} {component}"] = {
+                    **self.midspan_component_deflection_check(component, demand, span, divisor, item),
+                    "label": f"{label} {component}",
+                }
+            combined_divisor = self.midspan_deflection_divisor()
+            combined_demand = sum(max(components.get(component, {}).get("value", -1.0), 0.0) for component in ("G", "Q"))
+            combined_limit = span / combined_divisor if span > 0.0 else 0.0
+            combined_ratio = combined_demand / combined_limit if combined_limit > 1e-12 else float("inf")
+            checks[f"{key} G+Q"] = {
+                "label": f"{label} G+Q",
+                "demand": combined_demand,
+                "limit": combined_limit,
+                "ratio": combined_ratio,
+                "status": "REFERENCE",
+                "divisor": combined_divisor,
+                "item": {"combo": "G + Q component envelope"},
+                "component": "G+Q",
+                "governing": False,
+                "precamber_required_mm": 0.0,
+            }
+        return checks
+
+    def _canopy_tip_deflection_checks(self):
+        checks = {}
+        divisor = self.canopy_tip_deflection_divisor()
+        items = self.design_envelope_actions.get("sls_canopy_tip_deflections", {})
+        for key, item in items.items():
+            length = item.get("length_mm") or 0.0
+            limit = length / divisor if length > 0.0 else 0.0
+            demand = max(item.get("value", -1.0), 0.0)
+            ratio = demand / limit if limit > 1e-12 else float("inf")
+            status = "OK" if ratio <= 1.0 else "NOT OK"
+            checks[key] = {
+                "demand": demand,
+                "limit": limit,
+                "ratio": ratio,
+                "status": status,
+                "divisor": divisor,
+                "item": item,
+            }
+        return checks
+
+    def _register_deflection_hover(self, label, overlay, limit_name):
+        if label is None or not overlay or overlay.get("item", {}).get("value", -1.0) < 0.0:
+            return
+        self.deflection_hover_overlays[label] = overlay
+        item = overlay.get("item", {})
+        location = (
+            f"Node {item.get('node')}" if item.get("node") not in (None, "-")
+            else f"Member {item.get('member', '-')}"
+        )
+        label.setToolTip("\n".join([
+            "Governing deflection",
+            f"Check: {overlay['kind']}",
+            f"Location: {location}",
+            f"Demand: {overlay['value_mm']:.3f} mm",
+            f"Limit: {overlay['limit_mm']:.3f} mm ({limit_name}/{overlay['divisor']:.0f})",
+            f"Utilisation: {overlay['ratio']:.3f} - {overlay['status']}",
+            f"Load case: {overlay['combo']}",
+            "",
+            "Keep hovering to preview the exaggerated governing shape on the Geometry view.",
+        ]))
+        label.setToolTipDuration(30000)
+
+    def _lean_column_midheight_check(self, group):
+        demand, limit, ratio, status, divisor, item = self._column_midspan_ws_deflection_check(group)
+        if item.get("value", -1.0) < 0.0:
+            return None
+        return {
+            "demand": demand,
+            "limit": limit,
+            "ratio": ratio,
+            "status": status,
+            "divisor": divisor,
+            "item": item,
+            "component": "Ws",
+        }
+
     def update_section_checks_text(
         self,
         left_column_profile,
@@ -436,215 +895,10 @@ class ResultsMixin:
             self.section_checks_box.setText("Generate and solve the frame to view section checks.")
             return
 
-        def resolved_section_check(profile, envelope, group):
-            return self.resolved_member_check(profile, envelope, group)
-
-        def format_check_set(title, profile, envelope, group):
-            result, actions, restraint, extra_notes = resolved_section_check(profile, envelope, group)
-            doubled_zone_check = envelope.get("doubled_chord_zone") if group in {
-                "TOP", "BOTTOM",
-                "LEFT_CANOPY_TOP", "LEFT_CANOPY_BOTTOM",
-                "RIGHT_CANOPY_TOP", "RIGHT_CANOPY_BOTTOM",
-            } else None
-            doubled_zone_ratio, _ = self.doubled_chord_zone_ratio(profile, envelope, group)
-            governing_ratio = max(result.governing_ratio, doubled_zone_ratio)
-            governing_check = "Doubled chord zone" if doubled_zone_ratio > result.governing_ratio else result.governing_check
-            doubled_fraction = self.doubled_chord_length_fraction(group)
-            doubled_length_ratio = doubled_fraction / MAX_DOUBLED_CHORD_LENGTH_FRACTION
-            if doubled_length_ratio > governing_ratio:
-                governing_ratio = doubled_length_ratio
-                governing_check = "Doubled chord length limit"
-            web_joint_ratio, web_joint_label = self.web_assignment_chord_joint_ratio(profile, group)
-            if web_joint_ratio > governing_ratio:
-                governing_ratio = web_joint_ratio
-                governing_check = web_joint_label
-            status = "OK" if self.design_utilization_ok(governing_ratio) else "NOT OK"
-            clad_text = ""
-            if restraint.get("clad") is not None:
-                clad_text = f" | clad: {'yes' if restraint.get('clad') else 'no'}"
-            crane_minor_text = " | crane minor length: base to crane height" if restraint.get("crane_minor") else ""
-            storage_restraint_text = " | storage rail restraint" if restraint.get("storage_restraint") else ""
-            ke = max(restraint.get("ke", 1.0), 1e-9)
-            restraint_major = restraint.get("major_mm")
-            restraint_minor = restraint.get("minor_mm")
-            if restraint_major is None:
-                restraint_major = (actions.effective_length_z_mm or 0.0) / ke if actions.effective_length_z_mm else 0.0
-            if restraint_minor is None:
-                restraint_minor = (actions.effective_length_y_mm or 0.0) / ke if actions.effective_length_y_mm else 0.0
-            lines = [
-                title,
-                f"Section: {profile.name}",
-                f"Restraint lengths: major {restraint_major:.0f} mm, minor {restraint_minor:.0f} mm | effective: major {actions.effective_length_z_mm or 0.0:.0f} mm, minor {actions.effective_length_y_mm or 0.0:.0f} mm | ke {restraint.get('ke', 1.0):.2f} | am {actions.moment_modifier:.2f} | kt/kl/kr {actions.kt:.2f}/{actions.kl:.2f}/{actions.kr:.2f}{clad_text}{crane_minor_text}{storage_restraint_text}",
-                f"Governing: {governing_check} | ratio {governing_ratio:.3f} | {status}",
-                "Check        | Demand      | Capacity    | Ratio  | Status | Source",
-            ]
-            if group == "INTERNAL_COLUMN":
-                lines.append("Internal column bending includes AS4100 eccentricity moment Mx = Nc x D/2.")
-            source_keys = {
-                "compression": "compression_kn",
-                "local_compression": "compression_kn",
-                "tension": "tension_kn",
-                "shear": "shear_kn",
-                "bending": "moment_knm",
-            }
-            check_keys = ["compression"]
-            if "local_compression" in result.checks:
-                check_keys.append("local_compression")
-            check_keys.extend(["tension", "shear", "bending", "combined"])
-            for key in check_keys:
-                check = result.checks[key]
-                unit = f" {check.unit}" if check.unit else ""
-                check_status = "OK" if self.design_utilization_ok(check.ratio) else "NOT OK"
-                if restraint.get('flybraces'):
-                    source = restraint['flybraces']['sources'][key]
-                    source_text = f"{source['from_mm']:.0f}-{source['to_mm']:.0f} mm | {source['combo']} | am {source['am']:.3f}"
-                elif key == "bending" and group in {"TOP", "BOTTOM", "LEFT_CANOPY_TOP", "LEFT_CANOPY_BOTTOM", "RIGHT_CANOPY_TOP", "RIGHT_CANOPY_BOTTOM"}:
-                    source = envelope["compression_kn"]
-                    source_member = source.get("coincident_moment_member", f"{group} average")
-                    source_text = f"{source_member} | {source['combo']} | compression case"
-                elif key in source_keys:
-                    source = envelope[source_keys[key]]
-                    source_text = f"Member {source['member']} | {source['combo']}"
-                else:
-                    source_text = "Envelope interaction"
-                lines.append(
-                    f"{check.label:<12} | {check.demand:>8.2f}{unit:<4} | "
-                    f"{check.capacity:>8.2f}{unit:<4} | {check.ratio:>6.3f} | {check_status:<6} | {source_text}"
-                )
-            if doubled_zone_check:
-                doubled_status = "OK" if self.design_utilization_ok(doubled_zone_ratio) else "NOT OK"
-                lines.append(
-                    f"{'Doubled zone':<12} | {doubled_zone_check['single_ratio']:>8.3f}     | "
-                    f"{1.0:>8.2f}     | {doubled_zone_ratio:>6.3f} | {doubled_status:<6} | "
-                    f"Member {doubled_zone_check['member']} | {doubled_zone_check['combo']} | after 50/50 chord sharing"
-                )
-            if group in {"WEB", "LEFT_CANOPY_WEB", "RIGHT_CANOPY_WEB"}:
-                connection = self.web_connection_check(profile, envelope, group)
-                governing_source = envelope["compression_kn"]
-                if envelope["tension_kn"]["value"] > governing_source["value"]:
-                    governing_source = envelope["tension_kn"]
-                for connection_check in connection.get("checks", []):
-                    connection_status = "OK" if self.design_utilization_ok(connection_check["ratio"]) else "NOT OK"
-                    source_text = f"Member {governing_source['member']} | {governing_source['combo']} | {connection['governing_chord']}"
-                    lines.append(
-                        f"{connection_check['label']:<12} | {connection_check['demand']:>8.2f} {connection_check['unit']:<3} | "
-                        f"{connection_check['capacity']:>8.2f} {connection_check['unit']:<3} | {connection_check['ratio']:>6.3f} | {connection_status:<6} | {source_text}"
-                    )
-                if not connection.get("checks"):
-                    connection_status = "OK" if self.design_utilization_ok(connection["ratio"]) else "NOT OK"
-                    lines.append(
-                        f"{connection['label']:<12} | {connection['demand']:>8.2f} {connection['unit']:<3} | "
-                        f"{connection['capacity']:>8.2f} {connection['unit']:<3} | {connection['ratio']:>6.3f} | {connection_status:<6} | Connection geometry unavailable"
-                    )
-            notes = extra_notes + [check.notes for check in result.checks.values() if check.notes]
-            if group in {"WEB", "LEFT_CANOPY_WEB", "RIGHT_CANOPY_WEB"}:
-                notes.append(f"Chord-web connection assumes a {WEB_CONNECTION_CFW_LEG_MM:.0f} mm continuous fillet weld all around, using the larger of web compression and tension demand.")
-                notes.extend(check.get("notes", "") for check in connection.get("checks", []) if check.get("notes"))
-            if notes:
-                lines.append("Notes:")
-                for note in dict.fromkeys(notes):
-                    lines.append(f"- {note}")
-            return lines
-
-        def web_assignment_buckets(base_profile, group):
-            if not self.web_assignment_basis_matches(group):
-                return []
-            assignments = (self.auto_web_profile_assignments or {}).get(group, {})
-            demand_items = (self.design_envelope_actions.get("web_member_demands", {}) or {}).get(group, {})
-            if not assignments or not demand_items:
-                return []
-            chord_profiles = self.web_connection_group_profiles(group)
-            invalid_assignment = False
-
-            def merge_bucket_envelope(bucket, envelope):
-                for key in ["compression_kn", "tension_kn", "shear_kn", "moment_knm"]:
-                    if envelope[key]["value"] > bucket["envelope"][key]["value"]:
-                        bucket["envelope"][key] = envelope[key]
-                axial_value = max(envelope["compression_kn"]["value"], envelope["tension_kn"]["value"])
-                if axial_value > bucket["connection_axial_value"]:
-                    bucket["connection_axial_value"] = axial_value
-                    bucket["envelope"]["connection"] = envelope.get("connection", {})
-
-            buckets = {}
-            for member_id, demand in demand_items.items():
-                if not self.is_output_web_demand(demand):
-                    continue
-                assigned_name = assignments.get(int(member_id)) or assignments.get(member_id)
-                profile = self.catalog.get(assigned_name) if assigned_name else base_profile
-                if profile is None:
-                    continue
-                if not self.web_profile_fits_chords(profile, group, chord_profiles=chord_profiles):
-                    invalid_assignment = True
-                    continue
-                envelope = self.web_member_demand_envelope(demand)
-                ratio, check_label, _ = self.member_and_connection_ratio(profile, envelope, group)
-                bucket = buckets.setdefault(profile.name, {
-                    "profile": profile,
-                    "count": 0,
-                    "type_counts": {},
-                    "envelope": {
-                        "compression_kn": {"value": -1.0, "combo": "-", "member": "-", "group": "-", "length_mm": 0.0},
-                        "tension_kn": {"value": -1.0, "combo": "-", "member": "-", "group": "-", "length_mm": 0.0},
-                        "shear_kn": {"value": -1.0, "combo": "-", "member": "-", "group": "-", "length_mm": 0.0},
-                        "moment_knm": {"value": -1.0, "combo": "-", "member": "-", "group": "-", "length_mm": 0.0},
-                        "connection": {},
-                    },
-                    "connection_axial_value": -1.0,
-                    "worst_ratio": -1.0,
-                    "worst_check": "-",
-                    "worst_envelope": envelope,
-                    "worst_demand": demand,
-                })
-                bucket["count"] += 1
-                bucket["type_counts"]["webs"] = bucket["type_counts"].get("webs", 0) + 1
-                merge_bucket_envelope(bucket, envelope)
-                if ratio > bucket["worst_ratio"]:
-                    bucket["worst_ratio"] = ratio
-                    bucket["worst_check"] = check_label
-                    bucket["worst_envelope"] = envelope
-                    bucket["worst_demand"] = demand
-            if invalid_assignment:
-                (self.auto_web_profile_assignments or {}).pop(group, None)
-                (getattr(self, "auto_web_assignment_basis", {}) or {}).pop(group, None)
-                (getattr(self, "auto_web_joint_doubler_sides", {}) or {}).pop(group, None)
-                (getattr(self, "web_split_failures", {}) or {}).pop(group, None)
-                return []
-            return sorted(
-                buckets.values(),
-                key=lambda item: (item["profile"].A, item["profile"].name),
-            )
-
-        def bucket_count_text(bucket):
-            count = bucket["count"]
-            return f"{count} webs" if count != 1 else "1 web"
-
-        def update_web_split_label(label_widget, base_profile, group):
-            buckets = web_assignment_buckets(base_profile, group)
-            if not buckets:
-                failure = (getattr(self, "web_split_failures", {}) or {}).get(group)
-                if failure:
-                    base_ratio, _ = self.web_group_single_size_ratio(group, base_profile)
-                    if not self.design_utilization_ok(base_ratio):
-                        label_widget.setText(failure)
-                        label_widget.setStyleSheet("font-weight: bold; color: #b42318;")
-                        return
-                    (getattr(self, "web_split_failures", {}) or {}).pop(group, None)
-                demand_items = (self.design_envelope_actions.get("web_member_demands", {}) or {}).get(group, {})
-                output_demands = [demand for demand in demand_items.values() if self.is_output_web_demand(demand)]
-                if base_profile is not None and output_demands:
-                    label_widget.setText(f"{base_profile.name}: {self.web_member_count_text(output_demands)}")
-                else:
-                    label_widget.setText("Single size")
-                label_widget.setStyleSheet("font-weight: bold;")
-                return
-            parts = [f"{bucket['profile'].name}: {bucket_count_text(bucket)}" for bucket in buckets]
-            label_widget.setText("Adopted split: " + "; ".join(parts))
-            label_widget.setStyleSheet("font-weight: bold; color: #1b7f3a;")
-
         def format_web_assignment_check_set(title, base_profile, group):
-            buckets = web_assignment_buckets(base_profile, group)
+            buckets = self._web_assignment_buckets(base_profile, group)
             if not buckets:
-                return format_check_set(title, base_profile, envelopes[group], group)
+                return self._format_check_set(title, base_profile, envelopes[group], group)
             overall = max(buckets, key=lambda item: item["worst_ratio"])
             overall_status = "OK" if self.design_utilization_ok(overall["worst_ratio"]) else "NOT OK"
             lines = [
@@ -653,223 +907,36 @@ class ResultsMixin:
             ]
             for bucket in buckets:
                 lines.append("")
-                lines.extend(format_check_set(
-                    f"{bucket['profile'].name} ({bucket_count_text(bucket)})",
+                lines.extend(self._format_check_set(
+                    f"{bucket['profile'].name} ({_bucket_count_text(bucket)})",
                     bucket["profile"],
                     bucket["envelope"],
                     group,
                 ))
             return lines
 
-        def section_result(profile, envelope, group):
-            buckets = web_assignment_buckets(profile, group) if group in {"WEB", "LEFT_CANOPY_WEB", "RIGHT_CANOPY_WEB"} else []
-            if buckets:
-                overall = max(buckets, key=lambda item: item["worst_ratio"])
-                notes = [f"Auto-sized split active across {len(buckets)} assigned web sizes."]
-                return overall["profile"], notes, overall["worst_ratio"], overall["worst_check"]
-            result, _, _, notes = resolved_section_check(profile, envelope, group)
-            extra_ratio = 0.0
-            extra_label = ""
-            doubled_ratio, doubled_label = self.doubled_chord_zone_ratio(profile, envelope, group)
-            if doubled_ratio > extra_ratio:
-                extra_ratio = doubled_ratio
-                extra_label = doubled_label
-            if group in {
-                "TOP", "BOTTOM", "LEFT_CANOPY_TOP", "LEFT_CANOPY_BOTTOM",
-                "RIGHT_CANOPY_TOP", "RIGHT_CANOPY_BOTTOM",
-            }:
-                length_ratio = self.doubled_chord_length_fraction(group) / MAX_DOUBLED_CHORD_LENGTH_FRACTION
-                if length_ratio > extra_ratio:
-                    extra_ratio = length_ratio
-                    extra_label = "Doubled chord length limit"
-                web_joint_ratio, web_joint_label = self.web_assignment_chord_joint_ratio(profile, group)
-                if web_joint_ratio > extra_ratio:
-                    extra_ratio = web_joint_ratio
-                    extra_label = web_joint_label
-            if group in {"WEB", "LEFT_CANOPY_WEB", "RIGHT_CANOPY_WEB"}:
-                connection = self.web_connection_check(profile, envelope, group)
-                extra_ratio = connection["ratio"]
-                extra_label = connection["label"]
-            return result, notes, extra_ratio, extra_label
-
-        def update_status_label(label, result_info):
-            result, notes, extra_ratio, extra_label = result_info
-            if not hasattr(result, "governing_ratio"):
-                governing_ratio = extra_ratio
-                governing_check = extra_label
-                status = "OK" if self.design_utilization_ok(governing_ratio) else "NOT OK"
-                color = "#1b7f3a" if governing_ratio < 0.90 else "#a87900" if governing_ratio < 0.95 else "#c45a00" if self.design_utilization_ok(governing_ratio) else "#b42318"
-                label.setText(f"{status} - auto-sized split active, max utilisation {governing_ratio:.3f} ({governing_check})")
-                label.setStyleSheet(f"font-weight: bold; color: {color};")
-                return
-            governing_ratio = max(result.governing_ratio, extra_ratio)
-            governing_check = extra_label if extra_ratio > result.governing_ratio else result.governing_check
-            status = "OK" if self.design_utilization_ok(governing_ratio) else "NOT OK"
-            if notes and self.design_utilization_ok(governing_ratio):
-                color = "#a87900"
-            elif not self.design_utilization_ok(governing_ratio):
-                color = "#b42318"
-            elif governing_ratio >= 0.95:
-                color = "#c45a00"
-            elif governing_ratio >= 0.90:
-                color = "#a87900"
-            else:
-                color = "#1b7f3a"
-            suffix = " - additional flybracing required" if notes else ""
-            label.setText(f"{status}{suffix} - max utilisation {governing_ratio:.3f} ({governing_check})")
-            label.setStyleSheet(f"font-weight: bold; color: {color};")
-
-        def column_deflection_check():
-            item = self.design_envelope_actions.get("sls_column_top_deflection", {})
-            height = item.get("height_mm") or self.serviceability_height_mm or 0.0
-            divisor = self.eave_deflection_divisor()
-            limit = height / divisor if height > 0.0 else 0.0
-            demand = max(item.get("value", -1.0), 0.0)
-            ratio = demand / limit if limit > 1e-12 else float("inf")
-            status = "OK" if ratio <= 1.0 else "NOT OK"
-            return demand, limit, ratio, status, divisor, item
-
-        def crane_rail_deflection_check():
-            item = self.design_envelope_actions.get("sls_crane_rail_deflection", {})
-            height = item.get("height_mm") or 0.0
-            divisor = self.serviceability_limit_value("crane_rail_height")
-            limit = height / divisor if height > 0.0 else 0.0
-            demand = max(item.get("value", -1.0), 0.0)
-            ratio = demand / limit if limit > 1e-12 else float("inf")
-            status = "OK" if ratio <= 1.0 else "NOT OK"
-            return demand, limit, ratio, status, divisor, item
-
-        def crane_gauge_change_check():
-            item = self.design_envelope_actions.get("sls_crane_gauge_change", {})
-            limit = item.get("limit_mm") or CRANE_GAUGE_CHANGE_LIMIT_MM
-            demand = max(item.get("value", -1.0), 0.0)
-            ratio = demand / limit if limit > 1e-12 else float("inf")
-            return demand, limit, ratio, "OK" if ratio <= 1.0 else "NOT OK", item
-
-        def column_midspan_ws_deflection_check(group=None):
-            if group is None:
-                item = self.design_envelope_actions.get("sls_column_midspan_ws_deflection", {})
-            else:
-                item = self.design_envelope_actions.get("sls_column_midspan_ws_deflections", {}).get(group, {})
-            height = item.get("height_mm") or self.serviceability_height_mm or 0.0
-            divisor = self.column_deflection_divisor()
-            limit = height / divisor if height > 0.0 else 0.0
-            demand = max(item.get("value", -1.0), 0.0)
-            ratio = demand / limit if limit > 1e-12 else float("inf")
-            status = "OK" if ratio <= 1.0 else "NOT OK"
-            return demand, limit, ratio, status, divisor, item
-
-        def column_midspan_ws_deflection_line(group):
-            demand, limit, ratio, status, divisor, item = column_midspan_ws_deflection_check(group)
-            if item.get("value", -1.0) < 0.0:
-                return ""
-            return (
-                f"Column midspan deflection Ws: {demand:.3f} mm <= {limit:.3f} mm "
-                f"(H/{divisor:.0f}) | Member {item.get('member', '-')} | "
-                f"{item.get('combo', '-')} | utilisation {ratio:.3f} | {status}"
-            )
-
-        def truss_deflection_checks():
-            span = self.serviceability_span_mm or 0.0
-            checks = {}
-            items = self.design_envelope_actions.get("sls_truss_midspan_deflections", {})
-            for component, divisor in self.midspan_component_deflection_divisors().items():
-                item = items.get(component, {})
-                demand = max(item.get("value", -1.0), 0.0)
-                checks[component] = self.midspan_component_deflection_check(
-                    component, demand, span, divisor, item,
-                )
-            combined_divisor = self.midspan_deflection_divisor()
-            combined_demand = sum(checks.get(component, {}).get("demand", 0.0) for component in ("G", "Q"))
-            combined_limit = span / combined_divisor if span > 0.0 else 0.0
-            combined_ratio = combined_demand / combined_limit if combined_limit > 1e-12 else float("inf")
-            checks["G+Q"] = {
-                "demand": combined_demand,
-                "limit": combined_limit,
-                "ratio": combined_ratio,
-                "status": "REFERENCE",
-                "divisor": combined_divisor,
-                "item": {"combo": "G + Q component envelope"},
-                "component": "G+Q",
-                "governing": False,
-                "precamber_required_mm": 0.0,
-            }
-            return checks
-
-        def side_midspan_deflection_checks():
-            checks = {}
-            items = self.design_envelope_actions.get("sls_side_midspan_deflections", {})
-            for key, side_result in items.items():
-                span = side_result.get("length_mm") or 0.0
-                components = side_result.get("components", {})
-                label = side_result.get("label", key)
-                for component, divisor in self.midspan_component_deflection_divisors().items():
-                    item = components.get(component, {})
-                    demand = max(item.get("value", -1.0), 0.0)
-                    checks[f"{key} {component}"] = {
-                        **self.midspan_component_deflection_check(component, demand, span, divisor, item),
-                        "label": f"{label} {component}",
-                    }
-                combined_divisor = self.midspan_deflection_divisor()
-                combined_demand = sum(max(components.get(component, {}).get("value", -1.0), 0.0) for component in ("G", "Q"))
-                combined_limit = span / combined_divisor if span > 0.0 else 0.0
-                combined_ratio = combined_demand / combined_limit if combined_limit > 1e-12 else float("inf")
-                checks[f"{key} G+Q"] = {
-                    "label": f"{label} G+Q",
-                    "demand": combined_demand,
-                    "limit": combined_limit,
-                    "ratio": combined_ratio,
-                    "status": "REFERENCE",
-                    "divisor": combined_divisor,
-                    "item": {"combo": "G + Q component envelope"},
-                    "component": "G+Q",
-                    "governing": False,
-                    "precamber_required_mm": 0.0,
-                }
-            return checks
-
-        def canopy_tip_deflection_checks():
-            checks = {}
-            divisor = self.canopy_tip_deflection_divisor()
-            items = self.design_envelope_actions.get("sls_canopy_tip_deflections", {})
-            for key, item in items.items():
-                length = item.get("length_mm") or 0.0
-                limit = length / divisor if length > 0.0 else 0.0
-                demand = max(item.get("value", -1.0), 0.0)
-                ratio = demand / limit if limit > 1e-12 else float("inf")
-                status = "OK" if ratio <= 1.0 else "NOT OK"
-                checks[key] = {
-                    "demand": demand,
-                    "limit": limit,
-                    "ratio": ratio,
-                    "status": status,
-                    "divisor": divisor,
-                    "item": item,
-                }
-            return checks
-
         envelopes = self.design_envelope_actions
         is_rafter = getattr(self, "frame_system_combo", None) is not None and self.frame_system_combo.currentText() == "Rafter"
-        update_web_split_label(self.web_split_label, web_profile, "WEB")
+        self._update_web_split_label(self.web_split_label, web_profile, "WEB")
         if left_canopy_web_profile is not None:
-            update_web_split_label(self.left_canopy_web_split_label, left_canopy_web_profile, "LEFT_CANOPY_WEB")
+            self._update_web_split_label(self.left_canopy_web_split_label, left_canopy_web_profile, "LEFT_CANOPY_WEB")
         if right_canopy_web_profile is not None:
-            update_web_split_label(self.right_canopy_web_split_label, right_canopy_web_profile, "RIGHT_CANOPY_WEB")
-        update_status_label(self.left_column_check_label, section_result(left_column_profile, envelopes["LEFT_COLUMN"], "LEFT_COLUMN"))
-        update_status_label(self.right_column_check_label, section_result(right_column_profile, envelopes["RIGHT_COLUMN"], "RIGHT_COLUMN"))
+            self._update_web_split_label(self.right_canopy_web_split_label, right_canopy_web_profile, "RIGHT_CANOPY_WEB")
+        self._update_status_label(self.left_column_check_label, self._section_result(left_column_profile, envelopes["LEFT_COLUMN"], "LEFT_COLUMN"))
+        self._update_status_label(self.right_column_check_label, self._section_result(right_column_profile, envelopes["RIGHT_COLUMN"], "RIGHT_COLUMN"))
         if envelopes["INTERNAL_COLUMN"]["compression_kn"]["value"] >= 0.0:
-            update_status_label(self.internal_column_check_label, section_result(internal_column_profile, envelopes["INTERNAL_COLUMN"], "INTERNAL_COLUMN"))
+            self._update_status_label(self.internal_column_check_label, self._section_result(internal_column_profile, envelopes["INTERNAL_COLUMN"], "INTERNAL_COLUMN"))
         else:
             self.internal_column_check_label.setText("Not checked")
             self.internal_column_check_label.setStyleSheet("font-weight: bold;")
-        update_status_label(self.top_chord_check_label, section_result(top_profile, envelopes["TOP"], "TOP"))
+        self._update_status_label(self.top_chord_check_label, self._section_result(top_profile, envelopes["TOP"], "TOP"))
         if is_rafter:
             self.bottom_chord_check_label.setText("Not checked")
             self.bottom_chord_check_label.setStyleSheet("font-weight: bold;")
             self.web_check_label.setText("Not checked")
             self.web_check_label.setStyleSheet("font-weight: bold;")
         else:
-            update_status_label(self.bottom_chord_check_label, section_result(bottom_profile, envelopes["BOTTOM"], "BOTTOM"))
+            self._update_status_label(self.bottom_chord_check_label, self._section_result(bottom_profile, envelopes["BOTTOM"], "BOTTOM"))
         purlin_check = self.purlin_check or {}
         if purlin_check:
             match = purlin_check.get("match", {})
@@ -988,29 +1055,29 @@ class ResultsMixin:
             self.storage_panel_check_label.setText("Not required - storage disabled")
             self.storage_panel_check_label.setStyleSheet("font-weight: bold;")
         if not is_rafter and envelopes["WEB"]["compression_kn"]["value"] >= 0.0:
-            update_status_label(self.web_check_label, section_result(web_profile, envelopes["WEB"], "WEB"))
+            self._update_status_label(self.web_check_label, self._section_result(web_profile, envelopes["WEB"], "WEB"))
         elif not is_rafter:
             self.web_check_label.setText("Not checked")
             self.web_check_label.setStyleSheet("font-weight: bold;")
         if left_canopy_top_profile is not None and envelopes["LEFT_CANOPY_TOP"]["compression_kn"]["value"] >= 0.0:
-            update_status_label(self.left_canopy_top_check_label, section_result(left_canopy_top_profile, envelopes["LEFT_CANOPY_TOP"], "LEFT_CANOPY_TOP"))
+            self._update_status_label(self.left_canopy_top_check_label, self._section_result(left_canopy_top_profile, envelopes["LEFT_CANOPY_TOP"], "LEFT_CANOPY_TOP"))
         if left_canopy_bottom_profile is not None and envelopes["LEFT_CANOPY_BOTTOM"]["compression_kn"]["value"] >= 0.0:
-            update_status_label(self.left_canopy_bottom_check_label, section_result(left_canopy_bottom_profile, envelopes["LEFT_CANOPY_BOTTOM"], "LEFT_CANOPY_BOTTOM"))
+            self._update_status_label(self.left_canopy_bottom_check_label, self._section_result(left_canopy_bottom_profile, envelopes["LEFT_CANOPY_BOTTOM"], "LEFT_CANOPY_BOTTOM"))
         if left_canopy_web_profile is not None and envelopes["LEFT_CANOPY_WEB"]["compression_kn"]["value"] >= 0.0:
-            update_status_label(self.left_canopy_web_check_label, section_result(left_canopy_web_profile, envelopes["LEFT_CANOPY_WEB"], "LEFT_CANOPY_WEB"))
+            self._update_status_label(self.left_canopy_web_check_label, self._section_result(left_canopy_web_profile, envelopes["LEFT_CANOPY_WEB"], "LEFT_CANOPY_WEB"))
         if left_lean_column_profile is not None and envelopes["LEFT_LEAN_COLUMN"]["compression_kn"]["value"] >= 0.0:
-            update_status_label(self.left_lean_column_check_label, section_result(left_lean_column_profile, envelopes["LEFT_LEAN_COLUMN"], "LEFT_LEAN_COLUMN"))
+            self._update_status_label(self.left_lean_column_check_label, self._section_result(left_lean_column_profile, envelopes["LEFT_LEAN_COLUMN"], "LEFT_LEAN_COLUMN"))
         if right_canopy_top_profile is not None and envelopes["RIGHT_CANOPY_TOP"]["compression_kn"]["value"] >= 0.0:
-            update_status_label(self.right_canopy_top_check_label, section_result(right_canopy_top_profile, envelopes["RIGHT_CANOPY_TOP"], "RIGHT_CANOPY_TOP"))
+            self._update_status_label(self.right_canopy_top_check_label, self._section_result(right_canopy_top_profile, envelopes["RIGHT_CANOPY_TOP"], "RIGHT_CANOPY_TOP"))
         if right_canopy_bottom_profile is not None and envelopes["RIGHT_CANOPY_BOTTOM"]["compression_kn"]["value"] >= 0.0:
-            update_status_label(self.right_canopy_bottom_check_label, section_result(right_canopy_bottom_profile, envelopes["RIGHT_CANOPY_BOTTOM"], "RIGHT_CANOPY_BOTTOM"))
+            self._update_status_label(self.right_canopy_bottom_check_label, self._section_result(right_canopy_bottom_profile, envelopes["RIGHT_CANOPY_BOTTOM"], "RIGHT_CANOPY_BOTTOM"))
         if right_canopy_web_profile is not None and envelopes["RIGHT_CANOPY_WEB"]["compression_kn"]["value"] >= 0.0:
-            update_status_label(self.right_canopy_web_check_label, section_result(right_canopy_web_profile, envelopes["RIGHT_CANOPY_WEB"], "RIGHT_CANOPY_WEB"))
+            self._update_status_label(self.right_canopy_web_check_label, self._section_result(right_canopy_web_profile, envelopes["RIGHT_CANOPY_WEB"], "RIGHT_CANOPY_WEB"))
         if right_lean_column_profile is not None and envelopes["RIGHT_LEAN_COLUMN"]["compression_kn"]["value"] >= 0.0:
-            update_status_label(self.right_lean_column_check_label, section_result(right_lean_column_profile, envelopes["RIGHT_LEAN_COLUMN"], "RIGHT_LEAN_COLUMN"))
-        deflection_demand, deflection_limit, deflection_ratio, deflection_status, deflection_divisor, deflection_item = column_deflection_check()
-        crane_deflection_demand, crane_deflection_limit, crane_deflection_ratio, crane_deflection_status, crane_deflection_divisor, crane_deflection_item = crane_rail_deflection_check()
-        mid_column_demand, mid_column_limit, mid_column_ratio, mid_column_status, mid_column_divisor, mid_column_item = column_midspan_ws_deflection_check()
+            self._update_status_label(self.right_lean_column_check_label, self._section_result(right_lean_column_profile, envelopes["RIGHT_LEAN_COLUMN"], "RIGHT_LEAN_COLUMN"))
+        deflection_demand, deflection_limit, deflection_ratio, deflection_status, deflection_divisor, deflection_item = self._column_deflection_check()
+        crane_deflection_demand, crane_deflection_limit, crane_deflection_ratio, crane_deflection_status, crane_deflection_divisor, crane_deflection_item = self._crane_rail_deflection_check()
+        mid_column_demand, mid_column_limit, mid_column_ratio, mid_column_status, mid_column_divisor, mid_column_item = self._column_midspan_ws_deflection_check()
         column_deflection_statuses = [deflection_status]
         column_deflection_parts = [
             f"Top {deflection_status} {deflection_ratio:.3f} (H/{deflection_divisor:.0f})",
@@ -1023,7 +1090,7 @@ class ResultsMixin:
                 f"crane racking, frame alone {crane_deflection_demand:.2f}/{crane_deflection_limit:.2f} mm = "
                 f"{crane_deflection_ratio:.3f} (H/{crane_deflection_divisor:.0f}) - report only, checked in 3D"
             )
-        gauge_demand, gauge_limit, gauge_ratio, gauge_status, gauge_item = crane_gauge_change_check()
+        gauge_demand, gauge_limit, gauge_ratio, gauge_status, gauge_item = self._crane_gauge_change_check()
         if gauge_item.get("value", -1.0) >= 0.0:
             column_deflection_statuses.append(gauge_status)
             column_deflection_parts.append(
@@ -1033,52 +1100,15 @@ class ResultsMixin:
             column_deflection_statuses.append(mid_column_status)
             column_deflection_parts.append(f"mid Ws {mid_column_status} {mid_column_ratio:.3f} (H/{mid_column_divisor:.0f})")
 
-        def deflection_overlay_candidate(kind, item, demand, limit, ratio, status, divisor, direction="horizontal"):
-            return {
-                "kind": kind,
-                "item": dict(item),
-                "value_mm": float(demand),
-                "signed_value_mm": float(item.get("signed_value", demand)),
-                "limit_mm": float(limit),
-                "ratio": float(ratio),
-                "status": status,
-                "divisor": float(divisor),
-                "combo": item.get("combo", "-"),
-                "group": item.get("group", ""),
-                "direction": direction,
-            }
-
-        def register_deflection_hover(label, overlay, limit_name):
-            if label is None or not overlay or overlay.get("item", {}).get("value", -1.0) < 0.0:
-                return
-            self.deflection_hover_overlays[label] = overlay
-            item = overlay.get("item", {})
-            location = (
-                f"Node {item.get('node')}" if item.get("node") not in (None, "-")
-                else f"Member {item.get('member', '-')}"
-            )
-            label.setToolTip("\n".join([
-                "Governing deflection",
-                f"Check: {overlay['kind']}",
-                f"Location: {location}",
-                f"Demand: {overlay['value_mm']:.3f} mm",
-                f"Limit: {overlay['limit_mm']:.3f} mm ({limit_name}/{overlay['divisor']:.0f})",
-                f"Utilisation: {overlay['ratio']:.3f} - {overlay['status']}",
-                f"Load case: {overlay['combo']}",
-                "",
-                "Keep hovering to preview the exaggerated governing shape on the Geometry view.",
-            ]))
-            label.setToolTipDuration(30000)
-
         deflection_candidates = [
-            deflection_overlay_candidate(
+            _deflection_overlay_candidate(
                 "Top eave sway", deflection_item, deflection_demand, deflection_limit,
                 deflection_ratio, deflection_status, deflection_divisor,
             )
         ]
         if mid_column_item.get("value", -1.0) >= 0.0:
             deflection_candidates.append(
-                deflection_overlay_candidate(
+                _deflection_overlay_candidate(
                     "Column midspan sway", mid_column_item, mid_column_demand,
                     mid_column_limit, mid_column_ratio, mid_column_status, mid_column_divisor,
                 )
@@ -1088,7 +1118,7 @@ class ResultsMixin:
             key=lambda candidate: candidate["ratio"],
         )
         governing_deflection = self.governing_column_deflection_overlay
-        register_deflection_hover(self.column_deflection_check_label, governing_deflection, "H")
+        self._register_deflection_hover(self.column_deflection_check_label, governing_deflection, "H")
         governing_item = governing_deflection["item"]
         governing_group = str(governing_deflection.get("group") or "").replace("_", " ").title()
         governing_location = governing_group or (
@@ -1118,8 +1148,8 @@ class ResultsMixin:
             self.set_label_rich_text(self.column_deflection_check_label, False)
             self.column_deflection_check_label.setText("; ".join(column_deflection_parts))
         self.column_deflection_check_label.setStyleSheet(f"font-weight: bold; color: {status_colour};")
-        truss_deflection_checks_by_component = truss_deflection_checks()
-        side_deflection_checks_by_component = side_midspan_deflection_checks()
+        truss_deflection_checks_by_component = self._truss_deflection_checks()
+        side_deflection_checks_by_component = self._side_midspan_deflection_checks()
         all_truss_deflection_checks = {
             **truss_deflection_checks_by_component,
             **side_deflection_checks_by_component,
@@ -1155,9 +1185,9 @@ class ResultsMixin:
             )
         self.truss_deflection_check_label.setText(truss_deflection_label)
         self.truss_deflection_check_label.setStyleSheet(f"font-weight: bold; color: {truss_deflection_color};")
-        register_deflection_hover(
+        self._register_deflection_hover(
             self.truss_deflection_check_label,
-            deflection_overlay_candidate(
+            _deflection_overlay_candidate(
                 f"Truss midspan {governing_component}", governing_item.get("item", {}),
                 governing_item["demand"], governing_item["limit"], governing_item["ratio"],
                 governing_item["status"], governing_item["divisor"], "vertical",
@@ -1203,7 +1233,7 @@ class ResultsMixin:
                 line += " | reference only; G excluded from governing sizing"
             side_midspan_serviceability_lines.append(line)
 
-        canopy_tip_checks_by_side = canopy_tip_deflection_checks()
+        canopy_tip_checks_by_side = self._canopy_tip_deflection_checks()
         canopy_tip_serviceability_lines = []
         for item in canopy_tip_checks_by_side.values():
             combo_item = item.get("item", {})
@@ -1213,19 +1243,6 @@ class ResultsMixin:
                 f"(L/{item['divisor']:.0f}) | {combo_item.get('combo', '-')} | ref {reference_text} | "
                 f"utilisation {item['ratio']:.3f} | {item['status']}"
             )
-
-        def update_serviceability_status_label(label, item, prefix, limit_label="Span"):
-            if item is None:
-                label.setText("Not checked")
-                label.setStyleSheet("font-weight: bold;")
-                return
-            status = item.get("status", "NOT OK")
-            color = "#1b7f3a" if status == "OK" else "#b42318"
-            label.setText(
-                f"{status} - {prefix} {item['demand']:.2f} / {item['limit']:.2f} mm = "
-                f"{item['ratio']:.3f} ({limit_label}/{item['divisor']:.0f})"
-            )
-            label.setStyleSheet(f"font-weight: bold; color: {color};")
 
         def governing_side_midspan_check(side):
             side_prefix = f"{side} "
@@ -1240,27 +1257,13 @@ class ResultsMixin:
             component = key.replace(side_prefix, "", 1)
             return {**item, "component": component}
 
-        def lean_column_midheight_check(group):
-            demand, limit, ratio, status, divisor, item = column_midspan_ws_deflection_check(group)
-            if item.get("value", -1.0) < 0.0:
-                return None
-            return {
-                "demand": demand,
-                "limit": limit,
-                "ratio": ratio,
-                "status": status,
-                "divisor": divisor,
-                "item": item,
-                "component": "Ws",
-            }
-
-        update_serviceability_status_label(
+        _update_serviceability_status_label(
             self.left_canopy_deflection_check_label,
             canopy_tip_checks_by_side.get("LEFT"),
             "tip",
             "L",
         )
-        update_serviceability_status_label(
+        _update_serviceability_status_label(
             self.right_canopy_deflection_check_label,
             canopy_tip_checks_by_side.get("RIGHT"),
             "tip",
@@ -1268,27 +1271,27 @@ class ResultsMixin:
         )
         left_lean_governing = governing_side_midspan_check("LEFT")
         right_lean_governing = governing_side_midspan_check("RIGHT")
-        left_lean_column_midheight = lean_column_midheight_check("LEFT_LEAN_COLUMN")
-        right_lean_column_midheight = lean_column_midheight_check("RIGHT_LEAN_COLUMN")
-        update_serviceability_status_label(
+        left_lean_column_midheight = self._lean_column_midheight_check("LEFT_LEAN_COLUMN")
+        right_lean_column_midheight = self._lean_column_midheight_check("RIGHT_LEAN_COLUMN")
+        _update_serviceability_status_label(
             self.left_lean_deflection_check_label,
             left_lean_governing,
             f"gov {left_lean_governing.get('component', '-')}" if left_lean_governing else "midspan",
             "Span",
         )
-        update_serviceability_status_label(
+        _update_serviceability_status_label(
             self.right_lean_deflection_check_label,
             right_lean_governing,
             f"gov {right_lean_governing.get('component', '-')}" if right_lean_governing else "midspan",
             "Span",
         )
-        update_serviceability_status_label(
+        _update_serviceability_status_label(
             self.left_lean_column_deflection_check_label,
             left_lean_column_midheight,
             "mid Ws",
             "H",
         )
-        update_serviceability_status_label(
+        _update_serviceability_status_label(
             self.right_lean_column_deflection_check_label,
             right_lean_column_midheight,
             "mid Ws",
@@ -1303,9 +1306,9 @@ class ResultsMixin:
             (self.right_lean_column_deflection_check_label, right_lean_column_midheight, "Right lean-to column mid-height sway", "H"),
         ):
             if check is not None:
-                register_deflection_hover(
+                self._register_deflection_hover(
                     label,
-                    deflection_overlay_candidate(
+                    _deflection_overlay_candidate(
                         f"{kind} {check.get('component', '')}".strip(), check.get("item", {}),
                         check["demand"], check["limit"], check["ratio"], check["status"],
                         check["divisor"],
@@ -1401,17 +1404,17 @@ class ResultsMixin:
         auto_size_report = getattr(self, "auto_size_report_text", "")
         if auto_size_report:
             lines.extend(["AUTO-SIZE REPORT", auto_size_report, ""])
-        lines.extend(format_check_set("LEFT COLUMN", left_column_profile, envelopes["LEFT_COLUMN"], "LEFT_COLUMN"))
+        lines.extend(self._format_check_set("LEFT COLUMN", left_column_profile, envelopes["LEFT_COLUMN"], "LEFT_COLUMN"))
         lines.append("")
-        lines.extend(format_check_set("RIGHT COLUMN", right_column_profile, envelopes["RIGHT_COLUMN"], "RIGHT_COLUMN"))
+        lines.extend(self._format_check_set("RIGHT COLUMN", right_column_profile, envelopes["RIGHT_COLUMN"], "RIGHT_COLUMN"))
         if envelopes["INTERNAL_COLUMN"]["compression_kn"]["value"] >= 0.0:
             lines.append("")
-            lines.extend(format_check_set("INTERNAL COLUMN", internal_column_profile, envelopes["INTERNAL_COLUMN"], "INTERNAL_COLUMN"))
+            lines.extend(self._format_check_set("INTERNAL COLUMN", internal_column_profile, envelopes["INTERNAL_COLUMN"], "INTERNAL_COLUMN"))
         lines.append("")
-        lines.extend(format_check_set("RAFTER" if is_rafter else "TOP CHORD - DESIGN ENVELOPE", top_profile, envelopes["TOP"], "TOP"))
+        lines.extend(self._format_check_set("RAFTER" if is_rafter else "TOP CHORD - DESIGN ENVELOPE", top_profile, envelopes["TOP"], "TOP"))
         if not is_rafter:
             lines.append("")
-            lines.extend(format_check_set("BOTTOM CHORD - DESIGN ENVELOPE", bottom_profile, envelopes["BOTTOM"], "BOTTOM"))
+            lines.extend(self._format_check_set("BOTTOM CHORD - DESIGN ENVELOPE", bottom_profile, envelopes["BOTTOM"], "BOTTOM"))
         if purlin_check:
             match = purlin_check.get("match", {})
             local_match = purlin_check.get("local_match", {})
@@ -1593,30 +1596,30 @@ class ResultsMixin:
             lines.extend(format_web_assignment_check_set("WEB", web_profile, "WEB"))
         if left_canopy_top_profile is not None and envelopes["LEFT_CANOPY_TOP"]["compression_kn"]["value"] >= 0.0:
             lines.append("")
-            lines.extend(format_check_set("LEFT CANOPY / LEAN-TO TOP CHORD", left_canopy_top_profile, envelopes["LEFT_CANOPY_TOP"], "LEFT_CANOPY_TOP"))
+            lines.extend(self._format_check_set("LEFT CANOPY / LEAN-TO TOP CHORD", left_canopy_top_profile, envelopes["LEFT_CANOPY_TOP"], "LEFT_CANOPY_TOP"))
         if left_canopy_bottom_profile is not None and envelopes["LEFT_CANOPY_BOTTOM"]["compression_kn"]["value"] >= 0.0:
             lines.append("")
-            lines.extend(format_check_set("LEFT CANOPY / LEAN-TO BOTTOM CHORD", left_canopy_bottom_profile, envelopes["LEFT_CANOPY_BOTTOM"], "LEFT_CANOPY_BOTTOM"))
+            lines.extend(self._format_check_set("LEFT CANOPY / LEAN-TO BOTTOM CHORD", left_canopy_bottom_profile, envelopes["LEFT_CANOPY_BOTTOM"], "LEFT_CANOPY_BOTTOM"))
         if left_canopy_web_profile is not None and envelopes["LEFT_CANOPY_WEB"]["compression_kn"]["value"] >= 0.0:
             lines.append("")
             lines.extend(format_web_assignment_check_set("LEFT CANOPY / LEAN-TO WEB", left_canopy_web_profile, "LEFT_CANOPY_WEB"))
         if left_lean_column_profile is not None and envelopes["LEFT_LEAN_COLUMN"]["compression_kn"]["value"] >= 0.0:
             lines.append("")
-            lines.extend(format_check_set("LEFT LEAN-TO OUTER COLUMN", left_lean_column_profile, envelopes["LEFT_LEAN_COLUMN"], "LEFT_LEAN_COLUMN"))
-            lines.append(column_midspan_ws_deflection_line("LEFT_LEAN_COLUMN"))
+            lines.extend(self._format_check_set("LEFT LEAN-TO OUTER COLUMN", left_lean_column_profile, envelopes["LEFT_LEAN_COLUMN"], "LEFT_LEAN_COLUMN"))
+            lines.append(self._column_midspan_ws_deflection_line("LEFT_LEAN_COLUMN"))
         if right_canopy_top_profile is not None and envelopes["RIGHT_CANOPY_TOP"]["compression_kn"]["value"] >= 0.0:
             lines.append("")
-            lines.extend(format_check_set("RIGHT CANOPY / LEAN-TO TOP CHORD", right_canopy_top_profile, envelopes["RIGHT_CANOPY_TOP"], "RIGHT_CANOPY_TOP"))
+            lines.extend(self._format_check_set("RIGHT CANOPY / LEAN-TO TOP CHORD", right_canopy_top_profile, envelopes["RIGHT_CANOPY_TOP"], "RIGHT_CANOPY_TOP"))
         if right_canopy_bottom_profile is not None and envelopes["RIGHT_CANOPY_BOTTOM"]["compression_kn"]["value"] >= 0.0:
             lines.append("")
-            lines.extend(format_check_set("RIGHT CANOPY / LEAN-TO BOTTOM CHORD", right_canopy_bottom_profile, envelopes["RIGHT_CANOPY_BOTTOM"], "RIGHT_CANOPY_BOTTOM"))
+            lines.extend(self._format_check_set("RIGHT CANOPY / LEAN-TO BOTTOM CHORD", right_canopy_bottom_profile, envelopes["RIGHT_CANOPY_BOTTOM"], "RIGHT_CANOPY_BOTTOM"))
         if right_canopy_web_profile is not None and envelopes["RIGHT_CANOPY_WEB"]["compression_kn"]["value"] >= 0.0:
             lines.append("")
             lines.extend(format_web_assignment_check_set("RIGHT CANOPY / LEAN-TO WEB", right_canopy_web_profile, "RIGHT_CANOPY_WEB"))
         if right_lean_column_profile is not None and envelopes["RIGHT_LEAN_COLUMN"]["compression_kn"]["value"] >= 0.0:
             lines.append("")
-            lines.extend(format_check_set("RIGHT LEAN-TO OUTER COLUMN", right_lean_column_profile, envelopes["RIGHT_LEAN_COLUMN"], "RIGHT_LEAN_COLUMN"))
-            lines.append(column_midspan_ws_deflection_line("RIGHT_LEAN_COLUMN"))
+            lines.extend(self._format_check_set("RIGHT LEAN-TO OUTER COLUMN", right_lean_column_profile, envelopes["RIGHT_LEAN_COLUMN"], "RIGHT_LEAN_COLUMN"))
+            lines.append(self._column_midspan_ws_deflection_line("RIGHT_LEAN_COLUMN"))
 
         self.section_checks_box.setText("\n".join(lines))
 
