@@ -28,8 +28,10 @@ def run_one(script: Path, timeout: int) -> dict:
     env["PORTALCALC_LICENSE_ENFORCED"] = "0"
     env["PYTHONPATH"] = str(ROOT)
     started = time.perf_counter()
+    # The regression scripts run on their own here, so the smoke suite only needs its own steps.
+    extra = ["--own-only"] if script.name == "smoke_checks.py" else []
     try:
-        proc = subprocess.run([sys.executable, str(script)], cwd=str(ROOT), env=env, capture_output=True,
+        proc = subprocess.run([sys.executable, str(script), *extra], cwd=str(ROOT), env=env, capture_output=True,
                               text=True, timeout=timeout, errors="replace")
         text, code = proc.stdout + "\n--- STDERR ---\n" + proc.stderr, proc.returncode
     except subprocess.TimeoutExpired as exc:
@@ -37,8 +39,10 @@ def run_one(script: Path, timeout: int) -> dict:
     (LOGS / f"{script.stem}.log").write_text(text, encoding="utf-8")
     ran = re.search(r"Ran (\d+) tests? in", text)
     failed = re.search(r"FAILED \(([^)]*)\)", text)
+    notes = len(set(re.findall(r"\[smoke\] wording note: (.+)", text)))
     return {"script": script.name, "exit": code, "seconds": time.perf_counter() - started,
-            "tests": int(ran.group(1)) if ran else None, "failed": failed.group(1) if failed else ""}
+            "tests": int(ran.group(1)) if ran else None, "failed": failed.group(1) if failed else "",
+            "notes": f"{notes} wording notes (not failures)" if notes else ""}
 
 
 def main() -> int:
@@ -63,7 +67,8 @@ def main() -> int:
             results.append(result)
             status = "ok" if result["exit"] == 0 else "FAILED"
             count = "" if result["tests"] is None else f"{result['tests']} tests"
-            print(f"{status:7s} {result['script']:44s} {count:10s} {result['seconds']:6.0f}s {result['failed']}", flush=True)
+            print(f"{status:7s} {result['script']:44s} {count:10s} {result['seconds']:6.0f}s "
+                  f"{result['failed']}{result['notes']}", flush=True)
     failing = [r for r in results if r["exit"] != 0]
     total = sum(r["tests"] or 0 for r in results)
     print(f"\n{len(results) - len(failing)} of {len(results)} scripts passed ({total} unittest tests).")

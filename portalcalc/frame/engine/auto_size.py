@@ -425,10 +425,12 @@ class AutoSizeMixin:
             ratio, check_label, _ = self.member_and_connection_ratio(self.selected_profile(combo), envelope, group)
             ratios.append((ratio, group, check_label))
 
-        for group in {
+        # A tuple, not a set: with linked chords the top and bottom fractions tie,
+        # and the reported governing group must not depend on set iteration order.
+        for group in (
             "TOP", "BOTTOM", "LEFT_CANOPY_TOP", "LEFT_CANOPY_BOTTOM",
             "RIGHT_CANOPY_TOP", "RIGHT_CANOPY_BOTTOM",
-        }:
+        ):
             fraction = self.doubled_chord_length_fraction(group)
             if fraction > 0.0:
                 ratios.append((fraction / MAX_DOUBLED_CHORD_LENGTH_FRACTION, group, "Doubled chord length limit"))
