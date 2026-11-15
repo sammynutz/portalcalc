@@ -70,37 +70,6 @@ class WindEnvelopeTests(unittest.TestCase):
                 screen_north_source = DIRECTION_ORDER[(-DIRECTION_ORDER.index(north)) % 8]
                 self.assertEqual(actual, symmetric_end_source_direction(region, screen_north_source))
 
-    def test_exact_rotation_minima(self):
-        from portalcalc.studies.hay_shed_orientation import exact_minimum
-        self.assertEqual(exact_minimum(offsets=(0,)), {"md": .89, "bearings_deg": [63.]})
-        self.assertEqual(exact_minimum(offsets=(90, 270)),
-                         {"md": .9625, "bearings_deg": [101.25, 281.25]})
-        self.assertEqual(exact_minimum(offsets=(0, 180)),
-                         {"md": .9625, "bearings_deg": [11.25, 191.25]})
-
-    def test_linear_sector_representation_matches_wind_windows(self):
-        from portalcalc.studies.hay_shed_orientation import sector_lines
-        for start in range(0, 360, 45):
-            for offset in (0, 90, 180, 270):
-                for t in (0, .19, .5, .81, 1):
-                    represented = max(a + slope * t for a, slope in sector_lines(A_SUBREGIONS, start, offset))
-                    direct = max(design_direction_multiplier(r, start + 45 * t + offset)
-                                 for r in A_SUBREGIONS)
-                    self.assertAlmostEqual(represented, direct, places=12)
-
-    def test_rotated_candidate_checks_every_actual_region_and_all_axes(self):
-        from portalcalc.studies.hay_shed_orientation import directional_factors
-        rotated = directional_factors(63)
-        baseline = directional_factors(90)
-        self.assertEqual(rotated, {"open": .89, "closed": 1., "end_1": .95,
-                                   "end_2": 1., "governing_end": 1.})
-        self.assertLess(rotated["open"], baseline["open"])
-        for name in ("closed", "end_1", "end_2"):
-            self.assertEqual(rotated[name], baseline[name])
-        for region in A_SUBREGIONS:
-            for name, offset in (("open", 0), ("closed", 180), ("end_1", 90), ("end_2", -90)):
-                self.assertLessEqual(design_direction_multiplier(region, 63 + offset), rotated[name] + 1e-12)
-
     def test_public_wind_calculation_accepts_degrees_and_envelopes_regions(self):
         for bearing in (63., "63°", 101.25, "101.25°", 333.):
             inputs = WindInputs(wind_region=A_ENVELOPE_REGION, orientation=bearing)
@@ -114,12 +83,10 @@ class WindEnvelopeTests(unittest.TestCase):
 
     def test_custom_bearing_maps_to_physical_sides_and_worse_end(self):
         from portalcalc.desktop.main_window import MainWindow
-        from portalcalc.studies.hay_shed_search import north_selector
         stub = SimpleNamespace(
             envelope_plan_selector=SimpleNamespace(wall_states=lambda: {"front": True, "back": True}),
             wind_region_combo=SimpleNamespace(currentText=lambda: A_ENVELOPE_REGION))
-        north = north_selector("63")
-        self.assertEqual(north, "27°")
+        north = "27°"  # screen north for an open side facing a true bearing of 63°
         self.assertEqual(MainWindow.wind_source_direction_for_case(stub, north, "Right +"), 63.)
         self.assertEqual(MainWindow.wind_source_direction_for_case(stub, north, "Left +"), 243.)
         self.assertEqual(MainWindow.wind_source_direction_for_case(stub, north, "End +"), 333.)

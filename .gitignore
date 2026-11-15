@@ -31,7 +31,6 @@ License Key Setup.txt
 
 # Generated reports and study output
 *.pdf
-/hay_shed_*/
 *.log
 *.tmp
 ~$*

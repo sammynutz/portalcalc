@@ -24,7 +24,6 @@ were checked identical before and after (see `CHANGELOG.md`).
 | `portalcalc/sizing/` | Combined frame + bracing sizing. |
 | `portalcalc/reports/` | Computation report data and PDF. |
 | `portalcalc/desktop/` | The PySide6 application: main window, 3D bracing workspace, licence admin app. |
-| `portalcalc/studies/` | One-off study tools (hay shed search, future solar). The app does not use them. |
 | `portalcalc/data/` | Section catalogue, purlin capacity tables, factory defaults, EULA and brand assets. |
 | `portalcalc/*.py` | Shared engineering modules: `wind`, `loads`, `member_checks`, `storage_loads`, `crane_beam`, `end_wall`, `costing`, `bay_layout`, plus `licensing`, `resources` and `app_metadata`. |
 | `tests/` | Regression scripts (`*_regression.py`), `smoke_checks.py` and fixtures. Run them with `python run_tests.py`. |
@@ -142,14 +141,6 @@ Release packaging is performed only when the user explicitly asks. Routine chang
 | `portalcalc/frame/reduced_optimizer.py` | Qt-free physics-guided stiffness screening, catalogue frontiers, candidate projection and static condensation; full-engine checking remains the acceptance gate. |
 | `tests/physics_optimiser_regression.py` | Real-frame reduced-screen evaluation and optional comparison with production optimisation. |
 | `portalcalc/frame/future_canopy_design.py`, `tests/future_canopy_design_regression.py` | Merge primary-steel/reinforcement schedules and recheck the same physical frame before/after canopy installation. Desktop orchestration uses Qt. See `FUTURE_CANOPY_DESIGN.md`. |
-| `portalcalc/studies/future_solar_design.py` | Four-state bare/canopy/solar/combined verification and bounded repair of one common schedule. See `FUTURE_SOLAR_DESIGN.md`. |
-| `portalcalc/studies/hay_shed_backend.py` | Search-specific backend and build-now cost objective, preserving future-condition structural checks. |
-| `portalcalc/studies/hay_shed_search.py`, `tests/hay_shed_search_regression.py` | Resumable process-parallel geometry search, exact proposal reload, ranking and policy regressions. See `HAY_SHED_SEARCH.md`. |
-| `hay_shed_check.py`, `portalcalc/studies/hay_shed_orientation.py` | Saved-input exact rechecking and orientation-factor assessment respectively. |
-| `hay_shed_pair.py`, `hay_shed_staged.py`, `hay_shed_fixed_bearing.py` | Paired solar/no-solar searches, staged geometry refinement and fixed-bearing actual-region verification. |
-| `hay_shed_future_solar.py`, `hay_shed_optional_solar_report.py` | Four-state checking of search finalists and assembly of the completed-study report. |
-| `hay_shed_pitch_bale_study.py`, `hay_shed_pitch_matched_check.py` | Separate pitch/storage study and matched-geometry checks against its saved leaders. |
-| `hay_shed_report.py`, `hay_shed_bale_comparison.py`, `hay_shed_pitch_bale_report.py` | Study-specific report generation and storage-capacity ranking of saved results. |
 | `tests/purlin_selection_regression.py` | Compatible general/edge profile selection and real roof-selection integration checks. |
 | `tests/storage_load_path_regression.py`, `tests/wind_envelope_regression.py`, `tests/web_force_envelope_regression.py` | Focused storage transfer, directional wind and web force-envelope regressions. |
 | `tests/smoke_checks.py` | Compile checks plus non-visual and UI smoke tests; selected specialist suites are also invoked here. Steps run in parallel processes (`--jobs`, `--jobs 1` serial) with single-threaded BLAS. |
@@ -198,8 +189,8 @@ Search by symbol name (`rg -n "def name"`) rather than by line number.
 - `portalcalc/frame/` (including `engine/`) and every other package except
   `portalcalc/desktop/` import no Qt. `tests/building_model_regression.py` and the
   split tool's own check guard this for the building model and the engine.
-- `portalcalc/frame/future_canopy_design.py` and the study tools in
-  `portalcalc/studies/` orchestrate the existing engine; they are not a separate solver.
+- `portalcalc/frame/future_canopy_design.py` orchestrates the existing engine; it is
+  not a separate solver.
 - `portalcalc/reports/computation_report.py` renders frozen evidence rather than
   solving a model.
 - `portalcalc/bracing/design.py` dispatches locally to `portalcalc/bracing/mixed_sizing.py`, which

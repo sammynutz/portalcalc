@@ -9,6 +9,7 @@ All notable PortalCalc desktop releases should be recorded here.
   - The 19,000-line main window file is split into a Qt-free frame engine (`portalcalc/frame/engine/`) and desktop UI modules (`portalcalc/desktop/`). The engine reaches the UI only through the hooks in `engine/host.py`.
   - Other applications call `portalcalc.service.calculate(request)`.
   - Data files (section catalogue, capacity tables, factory defaults, EULA, logos) moved to `portalcalc/data/`. The build specs and `build_desktop.ps1` follow.
+  - The one-off hay shed and future solar study tools were removed (they remain in the Git history).
   - About 480 lines of unreferenced code removed (superseded wind load paths, an unwired web auto-size action, unused helpers).
   - Checked: the regression suite gives the same pass/fail results before and after, and ten design scenarios give identical results text, checks, costing, footings and displacements.
 - **Removed: 3D Concept view, Export 3D Concept and Export Drawing Set.**

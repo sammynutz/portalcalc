@@ -26,10 +26,8 @@ Sizing proposals now include `inputs.calculation_service.main_truss_panel_count`
 alongside automatic web assignments. Supply that optional field on
 `checkSpecified` to reproduce the adopted truss topology before restoring web
 member IDs. Counts must be at least four and divisible by four for gable trusses.
-The hay shed search checks every passing proposal again from its exported inputs
-and requires the steel cost to match before ranking it. Use `hay_shed_check.py`
-to reload those calculation-service inputs; ordinary desktop preset loading does
-not currently consume the service's automatic web assignments.
+Ordinary desktop preset loading does not currently consume the service's
+automatic web assignments.
 
 Baseline identity for this extraction:
 
