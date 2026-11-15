@@ -15,7 +15,7 @@ python license_server.py keygen
 ```
 
 Keep `PORTALCALC_LICENSE_PRIVATE_KEY` on the server only. Put
-`PORTALCALC_LICENSE_PUBLIC_KEY` in the desktop app environment so `licensing.py`
+`PORTALCALC_LICENSE_PUBLIC_KEY` in the desktop app environment so `portalcalc/licensing.py`
 can verify signed tokens.
 
 ## Create the database and a license key

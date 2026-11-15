@@ -355,7 +355,7 @@ Select C or Z for each property group; the default is Z. The radius uses the
 web-relative/rectangular axis (Metroll labels it rx, corresponding to Ix-prime),
 not rotated principal Ix. Ag, radius, span, Ns, bending utilisation and remaining
 compression are displayed/exported. Properties and source SHA256 are frozen in
-JSON. `purlin_combined.py` contains the transcribed catalogue; no user-local PDF
+JSON. `portalcalc/purlins/combined.py` contains the transcribed catalogue; no user-local PDF
 or network is required at runtime. The inconsistent published Z15024 Ag/I/r row
 is rejected without silently correcting it; C15024 has a separate valid row.
 
@@ -548,15 +548,15 @@ Automatic sizing re-solves the affected run for a trial arrangement. The final
 combined candidate must pass exact global reanalysis and all adjoining member
 checks before adoption. The bounded search is still not a global optimum.
 
-Run `python purlin_beam_regression.py` for independent single/double-span beam
+Run `python tests/purlin_beam_regression.py` for independent single/double-span beam
 benchmarks, finite-coupling equilibrium, direct load pickup, reversal, mesh
 convergence, laps, missing-data gates, plot/save/invalidation and exact reanalysis
 of an adopted sizing candidate. Test stiffness/capacity inputs are synthetic.
 
 ## Project brace schedule
 
-`bracing_schedule.py` records the user image supplied on 29 October 2026, retained
-in `assets/project_bracing_schedule_2026-10-29.png` with its SHA256.
+`portalcalc/bracing/schedule.py` records the user image supplied on 29 October 2026, retained
+in `portalcalc/data/assets/project_bracing_schedule_2026-10-29.png` with its SHA256.
 Grade 300 rods are restricted to 16, 20, 24 and 30 mm, with factored capacities
 54.28672, 84.823, 122.1451 and 190.8518 kN. Grade 1570 wire ropes are 8, 10,
 12, 14 and 16 mm, with factored capacities 22.96, 35.92, 51.2, 70.4 and 92 kN.
@@ -676,7 +676,7 @@ assumption later.
 
 **Project rope pricing, 31 October 2026:** 8/10/12/14/16 mm use
 $1.35/$1.75/$1.90/$2.40/$3.50 per metre. The supplied 12 mm range is $1.80-$1.90;
-sizing adopts its upper end. Source: `assets/project_wire_rope_prices_2026-10-31.png`,
+sizing adopts its upper end. Source: `portalcalc/data/assets/project_wire_rope_prices_2026-10-31.png`,
 SHA256 `E8DEA355AA5A2DFF1AD297ECDECE57CEC9B5056DA95AD90EFBBF08118A16BD51`.
 Cost includes one matching forged-rated turnbuckle per physical diagonal, including
 the slack diagonal of an X. The prior schedule maps ropes to M10/M12/M16/M16/M20;
@@ -815,8 +815,8 @@ flexibility and production portal-restraint feedback remain separate. Neutral
 rod stability flags prevent automatic member/SLS acceptance. Production cost
 totals and the full-computations PDF are not overwritten.
 
-Run `python bracing_design_regression.py`, `python bracing_analysis_regression.py`
-or `python bracing_components_regression.py`, or `python smoke_checks.py --full`. Tests cover independent fracture, beam and
+Run `python tests/bracing_design_regression.py`, `python tests/bracing_analysis_regression.py`
+or `python tests/bracing_components_regression.py`, or `python tests/smoke_checks.py --full`. Tests cover independent fracture, beam and
 cost workings; a tiny catalogue exhaustively enumerated and exactly reanalysed;
 infeasible SLS; cancellation; real orbit/member picking; linked invalidation;
 and transactional layout/settings save. Visual QA covers full and compact sizes.
@@ -828,7 +828,7 @@ Load-path background: [SCI braced-frame systems](https://steelconstruction.info/
 # Response-guided 3D stiffness screening (first implementation)
 
 Sizing now ranks eligible brace upgrades using the building's SLS movement
-response. `bracing_stiffness_screen.py` captures the checked SLS load vectors,
+response. `portalcalc/bracing/stiffness_screen.py` captures the checked SLS load vectors,
 uses the shared physical model assembly, and computes local displacement
 derivatives with respect to roof/side-wall/end-wall brace EA. Up to four
 diversified catalogue upgrades then receive tension-only SLS trial solves.
@@ -856,7 +856,7 @@ and fallback reasons in `sizing_search.stiffness_screening`. The workspace
 report separates these from full 3D analysis counts. Cached calculations include
 the new screening engine revision.
 
-Run `python bracing_stiffness_screen_regression.py` for mechanics, reversal,
+Run `python tests/bracing_stiffness_screen_regression.py` for mechanics, reversal,
 simultaneous portal-load recovery comparisons, diaphragms, grouped/per-location
 sizing and fallback checks. Run it with `--benchmark` for a seven-repeat A/B
 comparison on a fixed five-bay building. Reported cost is the existing scoped

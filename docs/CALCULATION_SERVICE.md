@@ -1,6 +1,6 @@
 # PortalCalc Calculation Service
 
-The application-service contract is implemented in `portalcalc_service.py`.
+The application-service contract is implemented in `portalcalc/service/contract.py`.
 It accepts one complete preset-shaped input object and supports two modes:
 
 - `autoSize`: produce a sizing proposal and a full checked dossier.
@@ -15,12 +15,12 @@ linked chord selections, and records the effective `max(Q, snow service)` load
 policy in the result provenance. Every response is proposal-only and requires a
 human engineering review before quote, Tekla or rendering release.
 
-`portalcalc_headless.py` is the isolated compatibility backend for the current
+`portalcalc/service/headless.py` is the isolated compatibility backend for the current
 1.5 working calculation source. It creates no visible window, shows no dialogs,
 and does not write optimiser learning. The service contract itself has no Qt
-dependency. The remaining migration is to move model generation and optimiser
-state out of `MainWindow`, then replace this adapter without changing the
-configurator contract.
+dependency. Model generation, checks and the optimiser now live in the Qt-free
+`portalcalc/frame/engine/`; the adapter still creates an offscreen window only to
+hold the input fields (see Current Refactor Pressure in `docs/CODEMAP.md`).
 
 Sizing proposals now include `inputs.calculation_service.main_truss_panel_count`
 alongside automatic web assignments. Supply that optional field on
@@ -44,11 +44,9 @@ Baseline identity for this extraction:
 Minimal in-process usage:
 
 ```python
-from portalcalc_headless import HeadlessPortalCalcBackend
-from portalcalc_service import PortalCalcCalculationService
+from portalcalc.service import calculate
 
-service = PortalCalcCalculationService(HeadlessPortalCalcBackend())
-result = service.run({
+result = calculate({
     "schema": "portalcalc.calculation.request.v1",
     "request_id": "configurator-job-123",
     "mode": "autoSize",
@@ -56,17 +54,20 @@ result = service.run({
 })
 ```
 
+`calculate` wraps `PortalCalcCalculationService(HeadlessPortalCalcBackend()).run(request)`;
+use those two classes directly to supply a different backend.
+
 Run the frozen real-engine regression separately from the quick smoke suite:
 
 ```powershell
 $env:QT_QPA_PLATFORM='offscreen'
-python calculation_service_regression.py --mode both
+python tests/calculation_service_regression.py --mode both
 ```
 
 ## v2: a 3D building with per-gridline loads
 
 `portalcalc.calculation.request.v2` replaces `inputs` with a `building`
-(`portalcalc.building.v1`, see `building_model.py` and
+(`portalcalc.building.v1`, see `portalcalc/building/model.py` and
 `BUILDING_LOADS_3D_PLAN.md`):
 
 ```python
@@ -140,8 +141,8 @@ its final check as a v2 result. `configurator_review.reviewed_building`
 applies only the reviewer's selections.
 
 v1 requests, results and digests are unchanged
-(`calculation_service_regression.py`). The v2 tests are in
-`building_service_regression.py`.
+(`tests/calculation_service_regression.py`). The v2 tests are in
+`tests/building_service_regression.py`.
 
 ## Interactive Configurator Review
 
@@ -175,7 +176,7 @@ Run the interactive workflow regression offscreen with:
 
 ```powershell
 $env:QT_QPA_PLATFORM='offscreen'
-python configurator_review_regression.py
+python tests/configurator_review_regression.py
 ```
 
 Add `--with-optimiser` to include the slower real optimiser/restoration path.

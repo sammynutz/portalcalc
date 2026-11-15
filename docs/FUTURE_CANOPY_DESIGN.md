@@ -47,7 +47,7 @@ the primary frame and its reinforcement.
 Run the fast merge-policy tests with:
 
 ```powershell
-python future_canopy_design_regression.py
+python tests/future_canopy_design_regression.py
 ```
 
 The hay search additionally freezes and independently reloads each passing

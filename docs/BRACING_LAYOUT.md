@@ -147,7 +147,7 @@ frame brace is pinned or blocked (portal IDs are listed in the same
 `pinned_panels`/`blocked_panels` arrays). Older presets omit it. A v1 layout
 reads as a building without canopies or portal braces, and a layout without
 them is still written as v1 or v2. The Qt-free model in
-`bracing_layout.py` validates and serialises the same object, allowing BOLT to
+`portalcalc/bracing/layout.py` validates and serialises the same object, allowing BOLT to
 supply constraints without depending on desktop widgets. BOLT transport and
 automatic import are not connected yet.
 
@@ -341,9 +341,9 @@ installation costs and production portal restraint coupling remain separate
 integration steps. End-wall action in the portal plane remains distinct from
 longitudinal restraint.
 
-Run `python bracing_layout_regression.py`,
-`python bracing_layout_search_regression.py` and
-`python bracing_canopy_regression.py` (canopy faces, schema v2, carry-over and
+Run `python tests/bracing_layout_regression.py`,
+`python tests/bracing_layout_search_regression.py` and
+`python tests/bracing_canopy_regression.py` (canopy faces, schema v2, carry-over and
 the canopy bracing rule) for focused checks or
-`python smoke_checks.py --full` for the broad suite. Set `QT_QPA_PLATFORM=offscreen`
+`python tests/smoke_checks.py --full` for the broad suite. Set `QT_QPA_PLATFORM=offscreen`
 for unattended UI checks.

@@ -4,6 +4,17 @@ All notable PortalCalc desktop releases should be recorded here.
 
 ## Unreleased
 
+- **Source restructure for BOLT. No change to calculation results.**
+  - The flat scripts are now the `portalcalc` package, with `tests/`, `docs/` and `tools/` beside it. `main.py` is a small launcher.
+  - The 19,000-line main window file is split into a Qt-free frame engine (`portalcalc/frame/engine/`) and desktop UI modules (`portalcalc/desktop/`). The engine reaches the UI only through the hooks in `engine/host.py`.
+  - Other applications call `portalcalc.service.calculate(request)`.
+  - Data files (section catalogue, capacity tables, factory defaults, EULA, logos) moved to `portalcalc/data/`. The build specs and `build_desktop.ps1` follow.
+  - About 480 lines of unreferenced code removed (superseded wind load paths, an unwired web auto-size action, unused helpers).
+  - Checked: the regression suite gives the same pass/fail results before and after, and ten design scenarios give identical results text, checks, costing, footings and displacements.
+- **Removed: 3D Concept view, Export 3D Concept and Export Drawing Set.**
+  - The Doors/Finishes tab went with them: sliding doors, PA doors, colours, skylights and the slab toggle only fed the 3D view and drawings.
+  - Roof profile stays, on a new Cladding tab, because the 3D bracing wind loads use it for roof friction drag. Older presets still load; their door and colour entries are ignored.
+
 - **Changes Optimise results. Matched columns on symmetric buildings, a paired column sway repair and a better depth sweep.**
   - **Matched columns.** On a symmetric building Optimise keeps the left and right columns the same section. Symmetric means a gable roof, the same supports and column length adjustments, the same canopy/lean-to each side (type, size, frame, loads) and internal columns mirrored about mid-span; wind, cladding and openings may differ (`columns_should_match`).
     - Both columns are one decision, the way the top and bottom chords already are. The stiffness screen therefore has one column variable, and every repair or refinement move keeps the pair equal.

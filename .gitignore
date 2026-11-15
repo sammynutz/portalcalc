@@ -29,10 +29,8 @@ License Key Setup.txt
 *.zip
 *.7z
 
-# Generated drawings, reports and study output
+# Generated reports and study output
 *.pdf
-portal_3d_concept.html
-portal_3d_concept.dae
 /hay_shed_*/
 *.log
 *.tmp

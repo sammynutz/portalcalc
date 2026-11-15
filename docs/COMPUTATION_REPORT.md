@@ -32,16 +32,16 @@ report modes; the option controls printed detail.
 
 - `MainWindow.capture_computation_report` enables capture for one exact solve,
   restores capture flags in `finally`, and freezes the final evidence.
-- `computation_report_data.py` builds the frozen evidence. Cases are captured
+- `portalcalc/reports/computation_report_data.py` builds the frozen evidence. Cases are captured
   inside the existing envelope solver, including storage patterns and
   second-order results. Wind records are copied from the actual solver caches.
-- `computation_report.py` renders the PDF from that evidence without reading the
+- `portalcalc/reports/computation_report.py` renders the PDF from that evidence without reading the
   UI or re-solving. It uses ReportLab, repeating table headers, PDF bookmarks and
   an automatically paginated table of contents. Writes are atomic.
 - `MainWindow.resolved_member_check` is shared by the live Section Checks and
   the report, including the existing bottom-chord flybracing fallback.
 - Standard app solves do not capture the large report case records.
-- `computation_report_regression.py` checks exact result identity, web-selection
+- `tests/computation_report_regression.py` checks exact result identity, web-selection
   evidence, source cases, frozen inputs, PDF structure and atomic failures.
 
 The report describes implemented calculations, including their existing
@@ -53,8 +53,8 @@ distinguished from coincident case forces.
 
 ```powershell
 $env:QT_QPA_PLATFORM='offscreen'
-python computation_report_regression.py
-python smoke_checks.py --full
+python tests/computation_report_regression.py
+python tests/smoke_checks.py --full
 ```
 
 For PDF layout review, render the exported example using Poppler and inspect

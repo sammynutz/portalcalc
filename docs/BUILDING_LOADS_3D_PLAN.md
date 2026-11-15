@@ -2,14 +2,14 @@
 
 Status: 2026-11-11. Decisions D1–D7 and Q1–Q3 resolved.
 
-- **Phase 1 done:** `building_model.py`, `building_model_regression.py`.
-- **Phase 2 done for the main building:** `building_loads.py`,
-  `building_loads_regression.py`. It covers gravity and side wind; canopies,
+- **Phase 1 done:** `portalcalc/building/model.py`, `tests/building_model_regression.py`.
+- **Phase 2 done for the main building:** `portalcalc/building/loads.py`,
+  `tests/building_loads_regression.py`. It covers gravity and side wind; canopies,
   lean-tos and partitions are still to add.
 - **Phase 3 done.** It adds end wind in both directions, Cpi by opening
   position, Ka per frame, and Kc by effective-surface count
   (`surface_count`, the default). It runs in two bases:
-  - `legacy_2d`: today's cases × tributary; exact parity with main.py,
+  - `legacy_2d`: today's cases × tributary; exact parity with the frame engine,
     including End.
   - `building`: the proper 3D loading.
 
@@ -86,10 +86,10 @@ case's |Cpi| < 0.4, which keeps today's internal rule exactly.
 **Adopted 2026-11-11.** The user confirmed the count-to-Kc mapping
 (≥ 3 → 0.8, 2 → 0.9, 1 → 1.0). `surface_count` is now the default for the
 `building` basis. `legacy_2d` keeps today's Kc so it stays comparable with
-main.py.
+the frame engine.
 
-- **Phase 4 done (single sizing group).** It adds `frame_loading.py` and
-  `MainWindow.building_load_mode`. With the mode off, main.py behaves
+- **Phase 4 done (single sizing group).** It adds `portalcalc/frame/frame_loading.py` and
+  `MainWindow.building_load_mode`. With the mode off, the frame engine behaves
   exactly as before.
 
 - **Phase 5 done.** It adds active-set screening with a full-set acceptance
@@ -134,13 +134,13 @@ main.py.
   - Configurator Review stays single-group.
 - **Phase 7a done: full-length canopies and lean-tos.** The engine,
   `legacy_2d` parity with today's whole envelope on five attachment
-  buildings, the main.py applier, and service v2.
+  buildings, the the frame engine applier, and service v2.
   - Lean-to and canopy openings take positional Cpe in the `building`
     basis. An open lean-to front at the windward edge gives a more severe
     Cpi than today's first-bay average: −2.97 v −2.85 kN/m on the lean-to
     roof.
   - Still out of scope: part-length or eave-beam attachments (these need
-    multiple sizing groups), and skillion + attachment (main.py's
+    multiple sizing groups), and skillion + attachment (the frame engine's
     equivalent-geometry remap uses 2D node averages).
 - **Phase 6 done.** Service v2 (`portalcalc.calculation.request.v2`) takes a
   building and returns per-gridline sections, distinct load sets, governing
@@ -222,7 +222,7 @@ main.py.
   depth is the span. Phase 2 keeps this for parity (chamber Cpi uses the
   nominal bay); phase 3 replaces it with the opening's own band position.
 - **Snap to the actual ridge.** For gables at 10° or more, and for free
-  roofs, main.py splits the two slopes at the actual apex node, not at half
+  roofs, the frame engine splits the two slopes at the actual apex node, not at half
   the nominal slope length. The descriptors carry `roof_layout = "slopes"`
   so the phase 4 applier does the same.
 
@@ -239,7 +239,7 @@ gridlines instead of one "frame anywhere" envelope.
 
 ## Where we are today
 
-### The 2D frame (main.py)
+### The 2D frame (the frame engine)
 
 One generic interior frame, sized for 57 combinations
 (`loads.build_load_combinations`: 6 Cpe × 2 Cpi wind cases at ULS/SLS plus
@@ -249,12 +249,12 @@ Conservative "frame anywhere" assumptions this project removes:
 
 | Assumption | Where |
 | --- | --- |
-| Full `bay_size_m` tributary on every frame; no half-bay end frame | `wind.py:981,1114,1158`, `loads.py:151` |
-| End-wind roof Cpe: the worst bay-wide window of the Table 5.3(A) bands, applied uniformly to the whole roof | `WindCalculationResult.end_wind_critical_roof_line_load_kn_m` (`wind.py:333-383`) |
+| Full `bay_size_m` tributary on every frame; no half-bay end frame | `portalcalc/wind.py:981,1114,1158`, `portalcalc/loads.py:151` |
+| End-wind roof Cpe: the worst bay-wide window of the Table 5.3(A) bands, applied uniformly to the whole roof | `WindCalculationResult.end_wind_critical_roof_line_load_kn_m` (`portalcalc/wind.py:333-383`) |
 | End-wind roof h/d taken as h/span; d should be the along-wind depth (length) | same |
-| End-wind side walls: first-bay band average on every frame | `side_wall_cpe_first_frame` (`wind.py:636-650`) |
-| Both ends clad: end wind takes the larger Md of the two ends; otherwise only one end direction is run | `wind_source_direction_for_case` (`main.py:11328`) |
-| Enclosure is 4 whole-wall booleans; open walls become full-height openings for Table 5.1(B) Cpi | `main_chamber_cpi` (`main.py:13268`) |
+| End-wind side walls: first-bay band average on every frame | `side_wall_cpe_first_frame` (`portalcalc/wind.py:636-650`) |
+| Both ends clad: end wind takes the larger Md of the two ends; otherwise only one end direction is run | `wind_source_direction_for_case` (the frame engine:11328`) |
+| Enclosure is 4 whole-wall booleans; open walls become full-height openings for Table 5.1(B) Cpi | `main_chamber_cpi` (the frame engine:13268`) |
 | End frames are never sized separately | — |
 
 ### Code we can build on
@@ -273,14 +273,14 @@ Conservative "frame anywhere" assumptions this project removes:
     free-roof Cpn;
   - gravity with placements and canopies.
 - **Per-frame 2D re-solves** already work:
-  - `bracing_transverse_sls_regression.py:179-215`
+  - `tests/bracing_transverse_sls_regression.py:179-215`
   - `restraint_feedback_prototype.py`
 
 ### Limits of the 3D bracing load code as a frame-load engine
 
 1. **Wrong output form for frame checks.** Output is a pre-combined
    `loads_n` vector plus equivalent end forces, tied to one deep-copied
-   `Structure2D`'s DOF numbering. main.py's member checks need:
+   `Structure2D`'s DOF numbering. the frame engine's member checks need:
    - element uniform-load tuples, for forces and deflections within a member;
    - separate Cpe and Cpi basic cases;
    - its own combination machinery.
@@ -297,14 +297,14 @@ Conservative "frame anywhere" assumptions this project removes:
 
 ```
 BOLT request (portalcalc.calculation.request.v2)
-  └─ building_model.py      BuildingModel: gridlines, frame types, faces/panels, site
-       └─ building_loads.py  3D load engine → per-frame BasicLoadSet (descriptors, not vectors)
+  └─ portalcalc/building/model.py      BuildingModel: gridlines, frame types, faces/panels, site
+       └─ portalcalc/building/loads.py  3D load engine → per-frame BasicLoadSet (descriptors, not vectors)
             └─ frame_groups.py   dedupe + group frames → sizing groups, candidate load sets
-                 └─ main.py seam (member_check_envelope_lines)  2D solve/check/optimise per group
+                 └─ the frame engine seam (member_check_envelope_lines)  2D solve/check/optimise per group
                       └─ result: sections per gridline, governing frame+case per member group
 ```
 
-### 1. `building_model.py` (new, Qt-free)
+### 1. `portalcalc/building/model.py` (new, Qt-free)
 
 A frozen dataclass with JSON `to_dict`/`from_dict` and a schema
 `portalcalc.building.v1`. Building on `LayoutGeometry` rather than replacing it.
@@ -329,7 +329,7 @@ uniform building:
 That gives the desktop and every existing preset a path through the new engine,
 and gives us the parity tests.
 
-### 2. `building_loads.py` (new, Qt-free): the 3D load engine
+### 2. `portalcalc/building/loads.py` (new, Qt-free): the 3D load engine
 
 For each **wind direction relative to the building** (from left, from right,
 from front end, from back end):
@@ -359,13 +359,13 @@ from front end, from back end):
    - `RoofFriction(...)`
    - gravity `RoofVertical(...)`
    - storage and crane per frame
-5. **Keep Cpe and Cpi as separate basic cases**, as main.py does
-   (`main.py:13952-13979`), so `LoadCombination` factoring is unchanged.
+5. **Keep Cpe and Cpi as separate basic cases**, as the frame engine does
+   (the frame engine:13952-13979`), so `LoadCombination` factoring is unchanged.
 
 Gravity per gridline: tributary × kPa with the existing placements, using half
 bays at the ends and unequal bays where they exist.
 
-**Why descriptors and not load vectors.** main.py's own application functions
+**Why descriptors and not load vectors.** the frame engine's own application functions
 then apply them as element uniform loads:
 - `apply_roof_vertical_loads_in_zones`
 - `add_roof_panel_pressure`
@@ -375,15 +375,15 @@ Results within each member, deflections and the report stay correct.
 Descriptors are also independent of mesh and DOF numbering, so they survive
 truss-panel and topology changes during optimisation.
 
-The pressure calculations are lifted out of `bracing_roof_loads.py` and
-`bracing_side_wind.py` into shared functions. Phase 7 points the bracing code
+The pressure calculations are lifted out of `portalcalc/bracing/roof_loads.py` and
+`portalcalc/bracing/side_wind.py` into shared functions. Phase 7 points the bracing code
 at the same engine, so there is one source of truth for building loads.
 
 ### 3. `frame_groups.py` (new, Qt-free): choosing governing frames
 
 Every frame in a sizing group shares geometry and stiffness. The analysis is
 first-order linear and loads are already batched into one matrix solve
-(`member_check_envelope_lines`, `main.py:15470-15487`). So for **checking**,
+(`member_check_envelope_lines`, the frame engine:15470-15487`). So for **checking**,
 "size against every frame in the group" costs only extra load columns. That
 makes the selection exact rather than a heuristic:
 
@@ -400,22 +400,22 @@ makes the selection exact rather than a heuristic:
    deflection item or reaction. Optimiser iterations solve only that set.
    Every accepted design is re-verified against the **full** candidate set.
    This uses the same "reduced screen, exact acceptance gate" pattern as
-   `reduced_optimizer.py`.
+   `portalcalc/frame/reduced_optimizer.py`.
 4. **Report.** For each member group, list the governing gridline and case,
    e.g. "Left column: GL 2, ULS 0.9G+Wu End(back→front) Cpi−".
 
-Second-order analysis is re-applied per case (`main.py:14808`), so active-set
+Second-order analysis is re-applied per case (the frame engine:14808`), so active-set
 screening matters most there.
 
-### 4. Integration seam in main.py
+### 4. Integration seam in the frame engine
 
 Use seam (a): `member_check_envelope_lines(structure, combinations,
-apply_combination_loads, ...)` at `main.py:14205`. It is also used by
+apply_combination_loads, ...)` at the frame engine:14205`. It is also used by
 `foundation_design_from_reactions`.
 
 - **`FrameLoadCombination`** has the `LoadCombination` attributes plus
   `frame_id`. Its `name` includes the frame so the load-vector cache key
-  (`main.py:15452-15464`) stays unique.
+  (the frame engine:15452-15464`) stays unique.
 - **The `apply_combination_loads` replacement**, when a building load set is
   active:
   - applies that frame's descriptors for the combination's basic cases;
@@ -457,7 +457,7 @@ cheap.
 | 3 | **Load engine: end wind + Cpi from openings** | Both end directions with roof/side-wall bands per frame, real Md per direction, panel-based Table 5.1(B) Cpi. **Expected-difference tests:** every interior frame's end-wind load is ≤ today's 2D envelope, and each deviation is attributed (h/d basis, Kc). Agrees with `building_roof_cases` resultants per frame. |
 | 4 | **Seam + multi-frame checking** | `FrameLoadCombination` and the descriptor applier. For the factory default building with all frames in one group, envelope actions are ≤ today's, and equal on side-wind-governed members. Exact dedupe counts are asserted. |
 | 5 | **Governing selection in the optimiser** | Active-set screening with a full-set acceptance gate. Governing frame/case reported. Run time on factory defaults within ~1.5× of today. Sized frames are never heavier than the current path. |
-| 6 | **Service v2 + headless** | v2 request → per-gridline sections and governing evidence; v1 unchanged (`calculation_service_regression.py` still passes); Configurator Review loads v2. |
+| 6 | **Service v2 + headless** | v2 request → per-gridline sections and governing evidence; v1 unchanged (`tests/calculation_service_regression.py` still passes); Configurator Review loads v2. |
 | 7 | **Converge and widen** | Bracing consumes `building_loads` (one engine). Then the engine covers what the schema already describes: partial-length lean-tos and canopies (several frame types per building), lightweight end frames with propped rafters and mullion axial checks, partitioned chambers, storage and crane per bay range. |
 
 **Tonight's realistic target:** phases 0–2, possibly into 3. Phases 2 and 3 are
@@ -476,7 +476,7 @@ and carry no risk to the desktop.
   - It is its own frame type and sizing group.
   - The rafter is propped vertically at the mullion positions, so the 2D model
     needs mullion props (pinned) at those x positions.
-  - The mullions then carry axial load plus wind bending, so `end_wall.py`
+  - The mullions then carry axial load plus wind bending, so `portalcalc/end_wall.py`
     needs an axial + bending check for this case.
   - An end with this option cannot be extended without adding a frame.
 - **D2a Mullion lateral load** goes directly to bracing and is **not** in the

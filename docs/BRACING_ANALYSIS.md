@@ -98,7 +98,7 @@ Identical portal sections repeat at each longitudinal station, including ends.
 
 ## Portal frame braces
 
-A portal frame brace (`bracing_portal_brace.py`) sits in one side-wall bay. It
+A portal frame brace (`portalcalc/bracing/portal_brace.py`) sits in one side-wall bay. It
 is a UB column stitch-welded inside each portal column plus a UB beam
 moment-connected across the top at eave level, with pinned bases on their own
 base plates.
@@ -220,7 +220,7 @@ Individual diagonal forces remain available for boundary/collector checks. The
 surrogates appear as separate stiffness-only table rows and are excluded from
 physical member sizing and purchased quantities. Wall base reactions are also
 separated from conventional member reactions in the load-path evidence. Changing any option, c or direction
-invalidates the calculation/export cache. `bracing_diaphragm_regression.py`
+invalidates the calculation/export cache. `tests/bracing_diaphragm_regression.py`
 checks independent racking stiffness and reversal, directional conversion,
 ULS independence, recovery, sizing and saved-workspace behavior, and the open
 canopy panels (count, nodes, c/area, ULS independence, SLS edge movement, report).
@@ -437,7 +437,7 @@ Cpe). Factory geometry as a skillion agrees within 0.5%: 156.4 vs 157.0 mm at
 Low-pitch Table 5.3(A) bands are horizontal distances from the windward edge
 in both models; the main portal converts them to positions along the slope
 (it previously measured them along the slope).
-`bracing_transverse_sls_regression.py` checks the SLS/ULS scaling, recovery
+`tests/bracing_transverse_sls_regression.py` checks the SLS/ULS scaling, recovery
 and an independent 2D portal solve, bare-network use with diaphragms enabled,
 and that longitudinal acceptance is identical with and without these cases.
 
@@ -522,7 +522,7 @@ EA sections cost $22,745 (EA 75 roof braces). Sized from light rods it cost
 $13,610 (16 mm wire roof). The optimiser total fell from $93,634 to $90,827.
 
 The 3D option checks and girder-layout sizings in step 2 are independent and
-run in worker processes (`bracing_parallel.py`, up to 8; set
+run in worker processes (`portalcalc/bracing/parallel.py`, up to 8; set
 `PORTALCALC_BRACING_WORKERS=1` to run them in-process). A script that calls the
 optimiser must keep its code under `if __name__ == '__main__':`, because each
 worker imports the calling script.
@@ -563,8 +563,8 @@ $54,993) cost more than the unrestrained frame. The search stopped after 3
 auto-sizes in 139 s with the same result. Sizing every option's frame instead
 took 274 s for the same result.
 
-`combined_sizing.py` is the earlier fixed-option sweep (re-sizes the frame for
-every option) and holds the shared helpers. `bracing_restraint_regression.py` covers the sway spring, adoption,
+`portalcalc/sizing/combined.py` is the earlier fixed-option sweep (re-sizes the frame for
+every option) and holds the shared helpers. `tests/bracing_restraint_regression.py` covers the sway spring, adoption,
 staleness, floors, deferral and roof bands.
 
 Wall and exposed-member drag, underside friction on a roof with a clad end wall,
@@ -682,7 +682,7 @@ coupled interface, and end frames are not represented by it.
 
 ## Verification and references
 
-`python bracing_analysis_regression.py` checks closed-form crossed rods and
+`python tests/bracing_analysis_regression.py` checks closed-form crossed rods and
 spatial bars, load reversal/slackening, area scaling, missing paths, integrated
 end-wall forces/overturning, a sway mechanism stabilised by a real rod, loaded
 non-nodal portal reduction and an independently assembled unreduced building
@@ -690,16 +690,16 @@ with base springs. The cantilever point-load benchmark independently checks
 member end actions. Desktop checks exercise actual sections and offsets, legacy
 restraint removal, state preservation, gravity/normal-roof combinations, openings, stale geometry,
 section persistence, dialog tables, failed-rerun invalidation and JSON export.
-The suite is also included in `python smoke_checks.py --full`.
+The suite is also included in `python tests/smoke_checks.py --full`.
 
-`python bracing_canopy_regression.py` (25 tests) covers the canopy Cpi rule
+`python tests/bracing_canopy_regression.py` (25 tests) covers the canopy Cpi rule
 against 2D, the friction surfaces (main underside only with both ends open,
 canopy top and underside), open-ended and fully open buildings, canopy
 gravity/wind resultants per frame, side-wind parity with 2D, the guards, layout
 geometry/schema v2/carry-over, the canopy bracing rule, the `canopy_brace` group,
 the canopy network against an uncondensed full matrix, friction delivery and
 balance, the unbraced-canopy message, the desktop solve, the layout editor and
-**Find layout and size**. `smoke_checks.py` runs it as the step "open canopies,
+**Find layout and size**. `tests/smoke_checks.py` runs it as the step "open canopies,
 open-ended roofs and roof friction".
 
 For headless checks set `QT_QPA_PLATFORM=offscreen`, `OPENBLAS_NUM_THREADS=1` and
