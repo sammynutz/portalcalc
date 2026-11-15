@@ -1598,9 +1598,6 @@ class UiBuildMixin:
         combo.setCurrentIndex(next_index)
         self.calculate_crane_beam_report()
 
-    def step_truss_depth(self, delta_mm):
-        self.step_depth_input(self.depth_input, delta_mm)
-
     def step_depth_input(self, depth_input, delta_mm):
         if self.configurator_review is not None and depth_input is self.depth_input:
             minimum_mm, maximum_mm = review_truss_depth_bounds(

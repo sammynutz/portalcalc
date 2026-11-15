@@ -331,14 +331,6 @@ class ShapeCatalog:
                 ub.append(p)
         return ub
 
-    def purlin_profiles(self):
-        purlins = []
-        for p in self.profiles:
-            text = f"{p.name} {p.group_name} {p.shape_type}".upper()
-            if any(token in text for token in ["PURLIN", "ZED", "CEE", "Z PURLIN", "C PURLIN"]):
-                purlins.append(p)
-        return purlins
-
     def end_wall_mullion_profiles(self):
         profiles = []
         for profile in self.profiles:

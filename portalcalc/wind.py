@@ -31,7 +31,7 @@ Deliberate limitations
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 import math
 
 
@@ -868,7 +868,6 @@ def transverse_free_roof_cpn(underside: str, use_uplift: bool) -> float:
     return values[under][0 if use_uplift else 1]
 
 
-
 LEEWARD_WALL_CPE_TABLE: Dict[float, Dict[float, float]] = {
     0:  {1: -0.5, 2: -0.3, 4: -0.2},
     5:  {1: -0.5, 2: -0.3, 4: -0.2},
@@ -1055,42 +1054,6 @@ def add_roof_panel_pressure(structure, n1, n2, total_n: float) -> Tuple[float, f
     return nx, ny
 
 
-def apply_roof_wind_case_to_top_nodes(structure, top_nodes: Sequence, result: WindCalculationResult, case: WindCaseName, wind_pressure: str = "ultimate") -> List[LoadArrow]:
-    """
-    Apply a selected wind roof strip case to the portal frame top nodes.
-
-    Each top chord panel receives the overlap of each wind strip with the panel's
-    distance along the roof from the left eave, as a resultant normal to the
-    panel. Positive strip values act outward, matching the spreadsheet's
-    uplift-positive output.
-    """
-    scale = wind_pressure_scale(result, wind_pressure)
-    strips = result.case_roof_strips(case)
-    arrows: List[LoadArrow] = []
-
-    cumulative = [0.0]
-    for n1, n2 in zip(top_nodes[:-1], top_nodes[1:]):
-        dx = (n2.x - n1.x) / 1000
-        dy = (n2.y - n1.y) / 1000
-        cumulative.append(cumulative[-1] + math.hypot(dx, dy))
-
-    for i, (n1, n2) in enumerate(zip(top_nodes[:-1], top_nodes[1:])):
-        s1 = cumulative[i]
-        s2 = cumulative[i + 1]
-        panel_len = max(s2 - s1, 1e-9)
-        total_kn = 0.0
-        for a, b, q_kn_m in strips:
-            overlap = max(0.0, min(s2, b) - max(s1, a))
-            total_kn += q_kn_m * scale * overlap
-        total_n = total_kn * 1000.0
-        nx, ny = add_roof_panel_pressure(structure, n1, n2, total_n)
-        mx = (n1.x + n2.x) / 2
-        my = (n1.y + n2.y) / 2
-        arrows.append((mx, my + 800, total_n * nx, total_n * ny))
-    return arrows
-
-
-
 def active_cpi_for_case(result: WindCalculationResult, case: CpiCaseName, cpe_case: Optional[CpeCaseName] = None) -> float:
     if open_wall_count(result.inputs) == 1 and cpe_case is not None:
         return dominant_opening_cpi(result, cpe_case)
@@ -1100,12 +1063,6 @@ def active_cpi_for_case(result: WindCalculationResult, case: CpiCaseName, cpe_ca
     if case == "Cpi -":
         return result.cpi_min
     raise ValueError(f"Unsupported Cpi case: {case}. Use one of: {', '.join(CPI_CASE_OPTIONS)}")
-
-
-def apply_roof_cpi_case_to_top_nodes(structure, top_nodes: Sequence, result: WindCalculationResult, case: CpiCaseName, wind_pressure: str = "ultimate", cpe_case: Optional[CpeCaseName] = None) -> List[LoadArrow]:
-    """Apply Cpi-only roof pressure as a separate internal-pressure load case."""
-    cpi = active_cpi_for_case(result, case, cpe_case)
-    return apply_roof_cpi_to_top_nodes(structure, top_nodes, result, cpi, wind_pressure)
 
 
 def apply_roof_cpi_to_top_nodes(structure, top_nodes: Sequence, result: WindCalculationResult, cpi: float, wind_pressure: str = "ultimate") -> List[LoadArrow]:
@@ -1124,22 +1081,6 @@ def apply_roof_cpi_to_top_nodes(structure, top_nodes: Sequence, result: WindCalc
         my = (n1.y + n2.y) / 2
         arrows.append((mx, my + 800, total_n * nx, total_n * ny))
     return arrows
-
-
-def adjacent_wall_cpe_for_side(result: WindCalculationResult, cpe_case: CpeCaseName, side: str) -> float:
-    """Wall Cpe beneath a left/right canopy for the current wind side."""
-    side = str(side).strip().lower()
-    if str(cpe_case).startswith("End"):
-        return -0.65
-    left_wind = str(cpe_case).startswith("Left")
-    if side == "left":
-        return 0.7 if left_wind else result.leeward_wall_cpe
-    if side == "right":
-        return result.leeward_wall_cpe if left_wind else 0.7
-    raise ValueError("side must be 'left' or 'right'")
-
-def open_sided_frame_type(frame_type: str) -> bool:
-    return frame_type in {"3 Sided", "2 Sided", "1 Sided"}
 
 
 def effective_cpi_case_for_wind(result: WindCalculationResult, case: CpiCaseName, cpe_case: Optional[CpeCaseName] = None) -> CpiCaseName:
@@ -1161,126 +1102,6 @@ def wall_cpe_line_load_kn_m(result: WindCalculationResult, cpe: float, wind_pres
 def wall_cpi_line_load_kn_m(result: WindCalculationResult, cpi: float, wind_pressure: str = "ultimate") -> float:
     """Return wall Cpi-only line load magnitude in kN/m for one analysed frame."""
     return abs(cpi) * result.wu_kn_m2 * wind_pressure_scale(result, wind_pressure) * internal_pressure_factor(result, cpi) * result.inputs.bay_size_m
-
-
-def apply_column_wind_cpe_loads(structure, left_base, left_top, right_base, right_top, result: WindCalculationResult, case: CpeCaseName, wind_pressure: str = "ultimate") -> List[LoadArrow]:
-    """
-    Apply Cpe-only wall wind pressure to frame columns.
-
-    For analysis the pressure is applied as a consistent uniform member load,
-    including its fixed-end moments and local member curvature.  For plotting,
-    multiple arrows are returned along the column height.
-
-    Side-wall loads follow the selected wall enclosure directly. Open side
-    walls receive no column Cpe load.
-    """
-    walls = wall_cladding(result.inputs)
-    if not (walls.get("left") or walls.get("right")):
-        return []
-
-    left_wind = str(case).startswith("Left")
-    right_wind = str(case).startswith("Right")
-    if not (left_wind or right_wind):
-        return []
-
-    windward_cpe = 0.7
-    leeward_cpe = result.leeward_wall_cpe
-    arrows: List[LoadArrow] = []
-
-    def add_column_load(base, top, line_kn_m: float, direction: float, arrow_count: int = 5) -> None:
-        height_m = abs(top.y - base.y) / 1000.0
-        total_n = line_kn_m * height_m * 1000.0 * direction
-        if hasattr(structure, "add_uniform_global_line_load_between"):
-            column_groups = {
-                element.group
-                for element in structure.elements
-                if "COLUMN" in str(element.group).upper()
-            }
-            matched = structure.add_uniform_global_line_load_between(
-                base,
-                top,
-                fx_n_per_mm=line_kn_m * direction,
-                element_groups=column_groups,
-            )
-            if not matched:
-                raise ValueError("No column elements found for wall Cpe load.")
-        else:
-            structure.add_load(base.ux, total_n / 2.0)
-            structure.add_load(top.ux, total_n / 2.0)
-
-        # Plot as distributed arrows. The arrows sum to the applied resultant.
-        count = max(2, arrow_count)
-        for i in range(count):
-            t = (i + 0.5) / count
-            x = base.x + (top.x - base.x) * t
-            y = base.y + (top.y - base.y) * t
-            arrows.append((x, y, total_n / count, 0.0))
-
-    def line_for_wall(base, top, cpe, surface):
-        wall_area_m2 = result.inputs.bay_size_m * abs(top.y - base.y) / 1000.0
-        return wall_cpe_line_load_kn_m(result, cpe, wind_pressure, surface, wall_area_m2)
-
-    if left_wind:
-        if walls.get("left"):
-            add_column_load(left_base, left_top, line_for_wall(left_base, left_top, windward_cpe, "windward_wall"), +1.0)
-        if walls.get("right"):
-            add_column_load(right_base, right_top, line_for_wall(right_base, right_top, leeward_cpe, "leeward_wall"), +1.0)
-    else:
-        if walls.get("right"):
-            add_column_load(right_base, right_top, line_for_wall(right_base, right_top, windward_cpe, "windward_wall"), -1.0)
-        if walls.get("left"):
-            add_column_load(left_base, left_top, line_for_wall(left_base, left_top, leeward_cpe, "leeward_wall"), -1.0)
-    return arrows
-
-
-def apply_column_wind_cpi_loads(structure, left_base, left_top, right_base, right_top, result: WindCalculationResult, case: CpiCaseName, wind_pressure: str = "ultimate", cpe_case: Optional[CpeCaseName] = None) -> List[LoadArrow]:
-    """Apply Cpi-only wall pressure as a separate internal-pressure column load case."""
-    walls = wall_cladding(result.inputs)
-    if not (walls.get("left") or walls.get("right")):
-        return []
-
-    cpi = active_cpi_for_case(result, case, cpe_case)
-    line_kn_m = wall_cpi_line_load_kn_m(result, cpi, wind_pressure)
-    if abs(line_kn_m) < 1e-12:
-        return []
-
-    # Positive Cpi pushes outwards. Negative Cpi pulls inwards.
-    left_direction = -1.0 if cpi > 0 else +1.0
-    right_direction = +1.0 if cpi > 0 else -1.0
-    arrows: List[LoadArrow] = []
-
-    def add_column_load(base, top, direction: float, arrow_count: int = 5) -> None:
-        height_m = abs(top.y - base.y) / 1000.0
-        total_n = line_kn_m * height_m * 1000.0 * direction
-        if hasattr(structure, "add_uniform_global_line_load_between"):
-            column_groups = {
-                element.group
-                for element in structure.elements
-                if "COLUMN" in str(element.group).upper()
-            }
-            matched = structure.add_uniform_global_line_load_between(
-                base,
-                top,
-                fx_n_per_mm=line_kn_m * direction,
-                element_groups=column_groups,
-            )
-            if not matched:
-                raise ValueError("No column elements found for wall Cpi load.")
-        else:
-            structure.add_load(base.ux, total_n / 2.0)
-            structure.add_load(top.ux, total_n / 2.0)
-        count = max(2, arrow_count)
-        for i in range(count):
-            t = (i + 0.5) / count
-            x = base.x + (top.x - base.x) * t
-            y = base.y + (top.y - base.y) * t
-            arrows.append((x, y, total_n / count, 0.0))
-
-    if walls.get("left"):
-        add_column_load(left_base, left_top, left_direction)
-    if walls.get("right"):
-        add_column_load(right_base, right_top, right_direction)
-    return arrows
 
 
 if __name__ == "__main__":

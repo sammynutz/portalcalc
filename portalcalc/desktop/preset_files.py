@@ -306,16 +306,6 @@ class PresetFilesMixin:
             return self.save_preset(show_message=False)
         return response == QMessageBox.Discard
 
-    def save_default_inputs(self):
-        path = self.default_settings_path()
-        try:
-            with open(path, "w", encoding="utf-8") as file:
-                json.dump(self.collect_preset_data(), file, indent=2)
-        except OSError as exc:
-            QMessageBox.critical(self, "Save defaults failed", str(exc))
-            return
-        QMessageBox.information(self, "Defaults saved", f"Saved default inputs:\n{path}")
-
     def load_default_inputs(self, silent=False):
         path = self.default_settings_path()
         if not os.path.exists(path):
@@ -329,16 +319,3 @@ class PresetFilesMixin:
                 QMessageBox.critical(self, "Load defaults failed", str(exc))
             return False
         return True
-
-    def reset_default_inputs(self):
-        if self.factory_default_data:
-            self.apply_preset_data(self.factory_default_data)
-            self.generate_and_solve()
-        path = self.default_settings_path()
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except OSError as exc:
-            QMessageBox.critical(self, "Reset defaults failed", str(exc))
-            return
-        QMessageBox.information(self, "Defaults reset", "Default inputs have been reset to the factory defaults.")

@@ -95,60 +95,6 @@ class FoundationsCostingMixin:
             "status": "CHECK" if required_bearing_diameter_m * 1000.0 > diameter_mm + 1e-9 else "OK >4m",
         }
 
-    def foundation_design_from_reactions(self, structure, combinations, apply_combination_loads, foundation_nodes):
-        bearing_kpa = self.foundation_float_from_input(self.foundation_bearing_input, 150.0)
-        skin_friction_kpa = self.foundation_float_from_input(self.foundation_skin_friction_input, 15.0)
-        use_skin_friction_for_bearing = self.foundation_skin_bearing_checkbox.isChecked()
-        items = []
-        for label, node in foundation_nodes:
-            envelope = {
-                "compression_kn": 0.0,
-                "compression_combo": "-",
-                "uplift_kn": 0.0,
-                "uplift_combo": "-",
-                "shear_kn": 0.0,
-                "shear_combo": "-",
-                "moment_knm": 0.0,
-                "moment_combo": "-",
-            }
-            for combination in combinations:
-                apply_combination_loads(combination)
-                _, reactions, _, _ = self.solve_structure(structure)
-                ry_kn = reactions[node.uy] / 1000.0
-                rx_kn = reactions[node.ux] / 1000.0
-                mz_knm = reactions[node.rz] / 1_000_000.0
-                compression_kn = max(ry_kn, 0.0)
-                uplift_kn = max(-ry_kn, 0.0)
-                shear_kn = abs(rx_kn)
-                moment_knm = abs(mz_knm)
-                if combination.is_serviceability and compression_kn > envelope["compression_kn"]:
-                    envelope["compression_kn"] = compression_kn
-                    envelope["compression_combo"] = combination.name
-                if combination.is_ultimate and uplift_kn > envelope["uplift_kn"]:
-                    envelope["uplift_kn"] = uplift_kn
-                    envelope["uplift_combo"] = combination.name
-                if combination.is_ultimate and shear_kn > envelope["shear_kn"]:
-                    envelope["shear_kn"] = shear_kn
-                    envelope["shear_combo"] = combination.name
-                if combination.is_ultimate and moment_knm > envelope["moment_knm"]:
-                    envelope["moment_knm"] = moment_knm
-                    envelope["moment_combo"] = combination.name
-            design = self.design_pier_footing(
-                envelope["compression_kn"],
-                envelope["uplift_kn"],
-                bearing_kpa,
-                skin_friction_kpa,
-                use_skin_friction_for_bearing,
-            )
-            items.append({"label": label, "node": node.id, **envelope, **design})
-        return {
-            "bearing_kpa": bearing_kpa,
-            "skin_friction_kpa": skin_friction_kpa,
-            "use_skin_friction_for_bearing": use_skin_friction_for_bearing,
-            "diameters_mm": STANDARD_PIER_DIAMETERS_MM,
-            "items": items,
-        }
-
     def foundation_design_from_envelopes(self, reaction_envelopes):
         bearing_kpa = self.foundation_float_from_input(self.foundation_bearing_input, 150.0)
         skin_friction_kpa = self.foundation_float_from_input(self.foundation_skin_friction_input, 15.0)

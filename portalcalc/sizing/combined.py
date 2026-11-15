@@ -27,7 +27,7 @@ from portalcalc.bracing.analysis_desktop import prepare_context
 from portalcalc.bracing.design import DesignCriteria, auto_size, solve_selection
 from portalcalc.bracing.layout import BracingLayout
 from portalcalc.bracing.layout_search import find_layout, practical_seeds
-from portalcalc.bracing.restraint import OPTION, floor_candidates
+from portalcalc.bracing.restraint import OPTION
 from portalcalc.bracing.spacing import max_bay_spacing
 
 BRACE_GROUPS = ('roof_brace', 'wall_brace', 'end_brace')

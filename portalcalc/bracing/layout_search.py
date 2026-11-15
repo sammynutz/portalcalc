@@ -16,7 +16,7 @@ from portalcalc.bracing.design import (auto_size, solve_selection, candidate_nam
 from portalcalc.bracing.components import StrutPlan, StrutAssembly
 from portalcalc.bracing.layout import BracingLayout, canopy_bracing
 from portalcalc.bracing.policy import selection_score, family, eligible as policy_eligible
-from portalcalc.bracing.spacing import max_bay_spacing,spacing_assessment,repair_spacing,spacing_text
+from portalcalc.bracing.spacing import max_bay_spacing, spacing_assessment, repair_spacing
 
 
 class LayoutSearchCancelled(AnalysisError):

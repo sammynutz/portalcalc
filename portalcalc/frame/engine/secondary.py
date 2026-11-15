@@ -293,30 +293,6 @@ class SecondarySteelMixin:
             return 0.0
         return area * 1e-6 * 7850.0
 
-    def metroll_section_dimensions(self, section):
-        text = str(section or "").upper()
-        numbers = [float(value) for value in re.findall(r"\d+", text)]
-        depth_mm = numbers[0] if numbers else 150.0
-        thickness_mm = (numbers[1] / 10.0) if len(numbers) >= 2 else 1.9
-        flange_by_depth = {
-            150: 57.0,
-            200: 69.0,
-            250: 69.0,
-            300: 87.0,
-            350: 113.0,
-            400: 125.0,
-        }
-        depth_key = min(flange_by_depth, key=lambda value: abs(value - depth_mm))
-        flange_mm = flange_by_depth[depth_key]
-        return {
-            "section": str(section or ""),
-            "depth_mm": depth_mm,
-            "flange_width_mm": flange_mm,
-            "flange_under_mm": flange_mm,
-            "thickness_mm": thickness_mm,
-            "shape": "z" if "Z" in text and "C/Z" not in text else "c",
-        }
-
     def purlin_design_pressures(self, wind_inputs, tributary_area_m2=None, edge_zone=None, return_info=False, wind_pressure="ultimate",
                                 underside_cpi=None):
         """Net roof purlin pressures (upward, downward) in kPa.

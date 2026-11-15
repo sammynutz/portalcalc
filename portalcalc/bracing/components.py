@@ -389,12 +389,3 @@ def location_options(location, steel_profiles):
                                      "additional_steel", location))
     return options
 
-
-def plan_from_locations(locations, fallback, selected=None):
-    selected = selected or {}
-    members = {}
-    for location in locations:
-        options = location_options(location, [fallback])
-        choice = selected.get(location["id"], "existing_purlins")
-        members[location["id"]] = next((a for a in options if a.arrangement == choice), options[0])
-    return StrutPlan(members, fallback)

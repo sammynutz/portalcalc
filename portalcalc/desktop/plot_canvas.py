@@ -435,40 +435,6 @@ class PlotCanvas(FigureCanvasQTAgg):
             if len(right) > 1:
                 self.ax.plot([p[0] for p in right], [p[1] for p in right], linestyle="--", linewidth=1.3)
 
-    def vertical_load_bands(self, vertical_points):
-        if not vertical_points:
-            return []
-        points = sorted(vertical_points, key=lambda p: p[0])
-        xs = [p[0] for p in points]
-        ys = [p[1] for p in points]
-        x_span = max(xs) - min(xs)
-        y_span = max(ys) - min(ys)
-        max_gap = max(x_span * 0.12, 1200.0)
-        y_tol = max(y_span * 0.08, 500.0)
-        bands = []
-        current = []
-        last = None
-
-        for x, ybase, yoff in points:
-            sign = 1 if yoff >= ybase else -1
-            if last is None:
-                current = [(x, yoff)]
-            else:
-                last_x, last_ybase, last_sign = last
-                gap = abs(x - last_x)
-                base_jump = abs(ybase - last_ybase)
-                if sign != last_sign or gap > max_gap or base_jump > y_tol:
-                    if len(current) > 1:
-                        bands.append(current)
-                    current = [(x, yoff)]
-                else:
-                    current.append((x, yoff))
-            last = (x, ybase, sign)
-
-        if len(current) > 1:
-            bands.append(current)
-        return bands
-
     def plot_load_arrows(self, load_arrows, show_labels=False):
         arrows = self.combined_load_arrows(load_arrows) if show_labels else load_arrows
         label_arrows = show_labels and len(arrows) <= 30

@@ -176,40 +176,6 @@ def _parse_number_list(value, default: tuple[float, ...]) -> tuple[float, ...]:
     return tuple(numbers) if numbers else default
 
 
-def _parse_mesh_options(value, default: tuple[tuple[str, float, float, float], ...]) -> tuple[tuple[str, float, float, float], ...]:
-    if value is None:
-        return default
-    if not isinstance(value, str):
-        try:
-            options = []
-            for item in value:
-                label = str(item[0])
-                area = float(item[1])
-                diameter = float(item[2])
-                spacing = float(item[3]) if len(item) > 3 else 200.0
-                if label and area > 0.0 and diameter > 0.0 and spacing > 0.0:
-                    options.append((label, area, diameter, spacing))
-            return tuple(options) if options else default
-        except (TypeError, ValueError):
-            return default
-    options = []
-    for part in value.replace(";", ",").split(","):
-        tokens = [token.strip() for token in part.split(":")]
-        if len(tokens) not in {3, 4}:
-            continue
-        label, area_text, diameter_text = tokens[:3]
-        spacing_text = tokens[3] if len(tokens) == 4 else "200"
-        try:
-            area = float(area_text)
-            diameter = float(diameter_text)
-            spacing = float(spacing_text)
-        except ValueError:
-            continue
-        if label and area > 0.0 and diameter > 0.0 and spacing > 0.0:
-            options.append((label, area, diameter, spacing))
-    return tuple(options) if options else default
-
-
 def calculate_ka(internal_friction_angle_deg: float, backfill_slope_deg: float) -> float:
     phi = math.radians(float(internal_friction_angle_deg))
     beta = math.radians(float(backfill_slope_deg))
@@ -634,11 +600,6 @@ def design_storage_panel(results: "StorageLoadResults", inputs: StoragePanelDesi
             negative_face=negative,
         )
     return None
-
-
-def _storage_pressure_integral_kn_per_m(base_pressure_kpa: float, height_m: float, y_m: float) -> float:
-    y = min(max(y_m, 0.0), height_m)
-    return base_pressure_kpa * (height_m * y - y * y / 2.0) / max(height_m, 1e-9)
 
 
 def _storage_load_moment_integral_knm_per_m(base_pressure_kpa: float, height_m: float, y_m: float) -> float:
