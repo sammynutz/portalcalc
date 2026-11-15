@@ -19,7 +19,8 @@ os.environ['APPDATA'] = _appdata.name
 
 from portalcalc.frame.column_flybracing import FlybraceColumn, capture_case, extrema, girt_levels, segment_demand
 from portalcalc.member_checks import MemberActions, check_member, reference_buckling_moment_knm
-from portalcalc.desktop.main_window import MainWindow, Node, FrameElement2D, Structure2D
+from portalcalc.desktop.main_window import MainWindow
+from portalcalc.frame.solver import Node, FrameElement2D, Structure2D
 from PySide6.QtWidgets import QApplication
 
 

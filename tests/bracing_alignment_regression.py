@@ -25,7 +25,7 @@ class GeometryAndMullionTests(unittest.TestCase):
         self.assertIsNone(eave_tributary_width([(0,0),(3000,0)],(0,0),(1500,0)))
 
     def test_shared_mullion_actions_match_beam_statics_and_include_bracing_compression(self):
-        from portalcalc.desktop.main_window import ShapeCatalog
+        from portalcalc.frame.sections import ShapeCatalog
         p=ShapeCatalog(str(data_path("Shape_Catalog.xlsx"))).profile_by_name['250*12.5 SHS']
         r=mullion_profile_design(p,8000.,6000.,.7,.4,axial_force_kn=-25.)
         self.assertAlmostEqual(r['moment_knm'],.7*6*8**2/8)

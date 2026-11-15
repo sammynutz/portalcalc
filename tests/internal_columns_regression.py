@@ -17,7 +17,8 @@ _appdata = tempfile.TemporaryDirectory(prefix="portalcalc_columns_")
 os.environ["APPDATA"] = _appdata.name
 
 from PySide6.QtWidgets import QApplication, QPushButton, QTabWidget
-from portalcalc.desktop.main_window import MainWindow, internal_column_positions_mm
+from portalcalc.desktop.main_window import MainWindow
+from portalcalc.frame.common import internal_column_positions_mm
 from portalcalc.frame.future_canopy_design import geometry_basis
 
 

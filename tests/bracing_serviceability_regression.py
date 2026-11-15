@@ -22,7 +22,7 @@ from portalcalc.bracing.sizing_diagnostics import result_summary
 class StrengthModeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from portalcalc.desktop.main_window import ShapeCatalog
+        from portalcalc.frame.sections import ShapeCatalog
         cls.catalog=ShapeCatalog(str(data_path("Shape_Catalog.xlsx")))
 
     def test_il1_global_h80_is_separate_from_local_l150_and_other_importance_levels(self):
@@ -129,7 +129,8 @@ class StrengthModeWorkspaceTests(unittest.TestCase):
     def test_main_and_bracing_il1_h80_follow_overrides_preserve_local_limits_and_cache(self):
         os.environ['QT_QPA_PLATFORM']='offscreen';os.environ['PORTALCALC_LICENSE_ENFORCED']='0'
         from PySide6.QtWidgets import QApplication
-        from portalcalc.desktop.main_window import MainWindow,SERVICEABILITY_LIMIT_DEFAULTS
+        from portalcalc.desktop.main_window import MainWindow
+        from portalcalc.frame.common import SERVICEABILITY_LIMIT_DEFAULTS
         from portalcalc.bracing.analysis_desktop import prepare_context
         from bracing_analysis_regression import fixed_layout
         from portalcalc.desktop.bracing_workspace_ui import BracingAnalysisDialog

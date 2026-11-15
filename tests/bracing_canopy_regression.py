@@ -27,7 +27,7 @@ from portalcalc.wind import WindInputs, calculate_wind, free_roof_cpn, transvers
 
 def canopy_frame(g, left_mm=0., right_mm=0., pitch_deg=0., segments=2):
     """``frame(g)`` with cantilever rafter canopies off the eave nodes."""
-    from portalcalc.desktop.main_window import Node, FrameElement2D
+    from portalcalc.frame.solver import Node, FrameElement2D
     s = frame(g)
     profile = SimpleNamespace(A=1200., I_analysis=8e6, name="Canopy rafter")
     eaves = {'left': min((n for n in s.nodes if n.y > 1), key=lambda n: n.x),

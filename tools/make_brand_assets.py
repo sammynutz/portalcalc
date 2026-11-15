@@ -6,7 +6,7 @@ Letterforms follow the BOLT wordmark construction (22-unit strokes on a
 frame (mark "strike_pitch"). Tagline "BOLT STRUCTURAL ANALYSIS" is outlined
 Montserrat SemiBold.
 
-Usage: python make_brand_assets.py assets                  # final set
+Usage: python tools/make_brand_assets.py portalcalc/data/assets                  # final set
        python make_brand_assets.py <dir> options           # first-round comparison sheets
        python make_brand_assets.py <dir> strike_options    # bolt-through-frame variations
        python make_brand_assets.py <dir> big <mark> ...    # large icon previews
@@ -473,7 +473,7 @@ def derive_csb_logos(src, out_dir, width=640):
         os.path.join(out_dir, "csb_logo_white.png"))
 
 
-derive_csb_logos(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "CSB_logo.jpg"), OUT)
+derive_csb_logos(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "portalcalc", "data", "assets", "CSB_logo.jpg"), OUT)
 
 imgs = [Image.open(os.path.join(OUT, f"portalcalc_icon_{s}.png")).convert("RGBA")
         for s in (256, 128, 64, 48, 32, 24, 16)]

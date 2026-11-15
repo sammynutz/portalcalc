@@ -23,7 +23,7 @@ def geometry(**kwargs):
 
 
 def frame(g, fixed=False):
-    from portalcalc.desktop.main_window import Node, FrameElement2D, Structure2D
+    from portalcalc.frame.solver import Node, FrameElement2D, Structure2D
     s = Structure2D()
     profile = SimpleNamespace(A=1500., I_analysis=12e6, name="Benchmark section")
     points = [(0., 0.)] + [(x, g.roof_z(x)) for x in g.roof_stations] + [(g.span_mm, 0.)]
@@ -285,7 +285,7 @@ class MechanicsTests(unittest.TestCase):
             self.assertAlmostEqual(moment[0], -(1.2-.4)/2000*integral_h2, places=5)
 
     def test_unbraced_portal_sway_mechanism_can_be_stabilised_by_real_rod(self):
-        from portalcalc.desktop.main_window import Node, FrameElement2D, Structure2D
+        from portalcalc.frame.solver import Node, FrameElement2D, Structure2D
         structure = Structure2D()
         bottom, top = Node(1, 3000, 0), Node(2, 3000, 4000)
         for n in (bottom, top):
@@ -311,7 +311,7 @@ class MechanicsTests(unittest.TestCase):
         self.assertAlmostEqual(result["displacements_mm"][roof][0], expected_x, places=8)
 
     def test_interior_attachment_member_end_forces_include_physical_point_load(self):
-        from portalcalc.desktop.main_window import Node, FrameElement2D, Structure2D
+        from portalcalc.frame.solver import Node, FrameElement2D, Structure2D
         structure = Structure2D()
         a, b = Node(1, 0, 3000), Node(2, 6000, 3000)
         for n in (a, b):

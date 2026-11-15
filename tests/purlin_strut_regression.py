@@ -181,7 +181,8 @@ class SharedMechanicsTests(unittest.TestCase):
         # Synthetic ULS stress fixture, not a wind-design/combination example.
         import copy
         from types import SimpleNamespace
-        from portalcalc.desktop.main_window import ShapeCatalog, END_WALL_BRACING_SIZE_OPTIONS
+        from portalcalc.frame.sections import ShapeCatalog
+        from portalcalc.frame.common import END_WALL_BRACING_SIZE_OPTIONS
         from bracing_design_regression import DesignMechanicsTests
         from portalcalc.bracing.components import StrutPlan
         from portalcalc.bracing.design import auto_size, solve_selection
@@ -230,7 +231,7 @@ class SharedMechanicsTests(unittest.TestCase):
     def cost_trade_fixture(self):
         import copy
         from types import SimpleNamespace
-        from portalcalc.desktop.main_window import ShapeCatalog
+        from portalcalc.frame.sections import ShapeCatalog
         from bracing_design_regression import DesignMechanicsTests, rod
         from portalcalc.bracing.components import StrutPlan
         catalog = ShapeCatalog(str(data_path("Shape_Catalog.xlsx")))

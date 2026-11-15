@@ -25,7 +25,7 @@ def wire(price=100., ea=50000.):
 class PolicyMechanicsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from portalcalc.desktop.main_window import ShapeCatalog
+        from portalcalc.frame.sections import ShapeCatalog
         cls.catalog = ShapeCatalog(str(data_path("Shape_Catalog.xlsx")))
 
     def fixture(self, project='agricultural'):

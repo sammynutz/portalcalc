@@ -24,7 +24,8 @@ def rod(d):
 
 
 def fixture(length=24000., diaphragm=False):
-    from portalcalc.desktop.main_window import Node, FrameElement2D, Structure2D, ShapeCatalog
+    from portalcalc.frame.solver import Node, FrameElement2D, Structure2D
+    from portalcalc.frame.sections import ShapeCatalog
     g = LayoutGeometry.create(12000, length, 4000, 10, 'Gable', bay_mm=8000,
                               end_wall_stations_mm=[0, 6000, 12000])
     layout = BracingLayout(g)

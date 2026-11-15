@@ -44,7 +44,7 @@ class DesignMechanicsTests(unittest.TestCase):
         self.assertEqual(apex_tributary_widths([(0,0),(1200,0)],(0,0)),[])
     @classmethod
     def setUpClass(cls):
-        from portalcalc.desktop.main_window import ShapeCatalog
+        from portalcalc.frame.sections import ShapeCatalog
         cls.catalog = ShapeCatalog(str(data_path("Shape_Catalog.xlsx")))
 
     def test_adopted_brace_tension_is_09_gross_yield_connections_separate(self):

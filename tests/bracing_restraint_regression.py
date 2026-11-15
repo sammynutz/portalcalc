@@ -133,7 +133,7 @@ class SlackPlayAcceptanceTests(unittest.TestCase):
 
 class SwaySpringTests(unittest.TestCase):
     def test_resists_sway_not_spread(self):
-        from portalcalc.desktop.main_window import Node, FrameElement2D, Structure2D
+        from portalcalc.frame.solver import Node, FrameElement2D, Structure2D
         from types import SimpleNamespace
         profile = SimpleNamespace(A=3000., I_analysis=40e6, name='Fixture')
         s = Structure2D()

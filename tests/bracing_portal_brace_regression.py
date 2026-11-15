@@ -20,7 +20,7 @@ BEAM = Section('250 UB 31.4', 4010., 44.5e6)
 
 def independent_frame(height, bay, column, beam):
     """The same pinned-base portal built with main.Structure2D."""
-    from portalcalc.desktop.main_window import FrameElement2D, Node, Structure2D
+    from portalcalc.frame.solver import FrameElement2D, Node, Structure2D
     s = Structure2D()
     for i, (x, y) in enumerate(((0., 0.), (0., height), (bay, height), (bay, 0.))):
         s.add_node(Node(i+1, x, y))
@@ -190,7 +190,7 @@ class DesignTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from portalcalc.desktop.main_window import ShapeCatalog
+        from portalcalc.frame.sections import ShapeCatalog
         cls.catalog = ShapeCatalog(str(data_path("Shape_Catalog.xlsx")))
 
     def context(self):

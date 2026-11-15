@@ -58,7 +58,7 @@ class RoofLoadTests(unittest.TestCase):
         np.testing.assert_allclose(frame_strip_integrals(stations,[(0,24000,1.)]),[3000,7000,9000,5000])
 
     def test_distributed_load_recovery_matches_cantilever_statics(self):
-        from portalcalc.desktop.main_window import Node,FrameElement2D,Structure2D
+        from portalcalc.frame.solver import Node, FrameElement2D, Structure2D
         s=Structure2D();a,b=Node(1,0.,3000.),Node(2,6000.,3000.)
         for n in (a,b):s.add_node(n)
         for dof in (a.ux,a.uy,a.rz):s.add_support(dof)

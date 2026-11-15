@@ -132,7 +132,7 @@ def member_record(window, label, profile, envelope, group):
               for key, check in result.checks.items()]
     ratio, governing = result.governing_ratio, result.governing_check
     if group in CHORD_GROUPS:
-        from portalcalc.desktop.main_window import MAX_DOUBLED_CHORD_LENGTH_FRACTION
+        from portalcalc.frame.common import MAX_DOUBLED_CHORD_LENGTH_FRACTION
         extras = [window.doubled_chord_zone_ratio(profile, envelope, group),
                   (window.doubled_chord_length_fraction(group) / MAX_DOUBLED_CHORD_LENGTH_FRACTION, "Doubled chord length limit"),
                   window.web_assignment_chord_joint_ratio(profile, group)]
@@ -151,7 +151,7 @@ def connection_working(window, profile, chord_profile, context, check):
     web, chord = window.hollow_connection_dimensions(profile), window.hollow_connection_dimensions(chord_profile)
     if not web or not chord:
         return []
-    from portalcalc.desktop.main_window import WEB_CONNECTION_CFW_LEG_MM
+    from portalcalc.frame.common import WEB_CONNECTION_CFW_LEG_MM
     theta = min(max(float(context.get("branch_angle_deg") or 90), 15), 90)
     axial_ratio = max(float(context.get("chord_axial_ratio") or 0), 0)
     capacity_factor = max(.50, 1 - .35 * min(axial_ratio, 1))

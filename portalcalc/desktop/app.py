@@ -9,7 +9,8 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from portalcalc.app_metadata import BRAND_NAVY
-from portalcalc.desktop.main_window import MainWindow, app_icon, apply_brand_palette, create_startup_splash
+from portalcalc.desktop.main_window import MainWindow
+from portalcalc.desktop.branding import app_icon, apply_brand_palette, create_startup_splash
 from portalcalc.service.configurator_review import parse_review_arguments
 
 

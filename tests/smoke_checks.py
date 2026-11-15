@@ -15,12 +15,16 @@ from pathlib import Path
 # The solvers use small dense matrices, where multi-threaded BLAS costs more
 # than it saves (bracing_design_regression: 28 s single-threaded v 46 s) and
 # parallel steps would oversubscribe the CPU. Must be set before numpy loads;
-# main.py sets the same for the desktop app.
+# the portalcalc package sets the same on import.
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import numpy as np
+
+import portalcalc.frame.common
+import portalcalc.frame.sections
+import portalcalc.frame.solver
 
 
 @contextmanager
@@ -98,10 +102,9 @@ def run_reduced_optimizer_smoke_checks() -> None:
 
 
 def run_roof_udl_smoke_checks() -> None:
-    from portalcalc.desktop import main_window as main
     from portalcalc.loads import apply_roof_vertical_loads
 
-    profile = main.SectionProfile(
+    profile = portalcalc.frame.sections.SectionProfile(
         "TEST",
         "SHS",
         "SHS",
@@ -111,12 +114,12 @@ def run_roof_udl_smoke_checks() -> None:
         1.0e8,
         0.0,
     )
-    structure = main.Structure2D()
-    left = main.Node(1, 0.0, 0.0)
-    right = main.Node(2, 10000.0, 1000.0)
+    structure = portalcalc.frame.solver.Structure2D()
+    left = portalcalc.frame.solver.Node(1, 0.0, 0.0)
+    right = portalcalc.frame.solver.Node(2, 10000.0, 1000.0)
     structure.add_node(left)
     structure.add_node(right)
-    element = main.FrameElement2D(1, left, right, 200000.0, profile, "TOP")
+    element = portalcalc.frame.solver.FrameElement2D(1, left, right, 200000.0, profile, "TOP")
     structure.add_element(element)
     structure.add_support(left.ux)
     structure.add_support(left.uy)
@@ -445,14 +448,13 @@ def run_license_smoke_checks() -> None:
     assert math.isclose(stub_storage.rail_loads[0].rail_bending_moment_knm, 32.0, rel_tol=1e-9)
     assert math.isclose(stub_storage.rail_loads[0].direct_column_reaction_kn, 48.0, rel_tol=1e-9)
 
-    from portalcalc.desktop import main_window as main
     from dataclasses import replace
-    test_profile = main.SectionProfile("TEST", "UB", "I", 5000.0, 1e6, 2e8, 1e8, 0.0)
-    test_structure = main.Structure2D()
-    test_nodes = [main.Node(1, 0.0, 0.0), main.Node(2, 0.0, 3000.0)]
+    test_profile = portalcalc.frame.sections.SectionProfile("TEST", "UB", "I", 5000.0, 1e6, 2e8, 1e8, 0.0)
+    test_structure = portalcalc.frame.solver.Structure2D()
+    test_nodes = [portalcalc.frame.solver.Node(1, 0.0, 0.0), portalcalc.frame.solver.Node(2, 0.0, 3000.0)]
     for node in test_nodes:
         test_structure.add_node(node)
-    element = main.FrameElement2D(1, *test_nodes, 200000.0, test_profile, "LEFT_COLUMN")
+    element = portalcalc.frame.solver.FrameElement2D(1, *test_nodes, 200000.0, test_profile, "LEFT_COLUMN")
     test_structure.add_element(element)
     for dof in [test_nodes[0].ux, test_nodes[0].uy, test_nodes[1].ux]:
         test_structure.add_support(dof)
@@ -716,14 +718,15 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     os.environ["PORTALCALC_LICENSE_ENFORCED"] = "0"
     os.environ["APPDATA"] = tempfile.mkdtemp(prefix="portalcalc_smoke_appdata_")
 
-    from portalcalc.desktop import main_window as main
+    from PySide6.QtWidgets import QTabWidget
+    from portalcalc.desktop.main_window import MainWindow
     from portalcalc.loads import apply_roof_vertical_loads
 
     shorter_eave = {"value": 46.8, "height_mm": 6000.0}
     taller_eave = {"value": 46.9, "height_mm": 7980.0}
-    assert main.governing_height_deflection_item([shorter_eave, taller_eave]) is shorter_eave
+    assert portalcalc.frame.common.governing_height_deflection_item([shorter_eave, taller_eave]) is shorter_eave
 
-    top_stations = main.pitch_compensated_gable_top_stations(27000.0, 1300.0, 22.0, 24)
+    top_stations = portalcalc.frame.common.pitch_compensated_gable_top_stations(27000.0, 1300.0, 22.0, 24)
     assert math.isclose(top_stations[-1], 27000.0, abs_tol=1e-6)
     assert all(math.isclose(a + b, 27000.0, abs_tol=1e-6) for a, b in zip(top_stations, reversed(top_stations)))
     roof_tan = math.tan(math.radians(22.0))
@@ -746,9 +749,9 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
 
     app = QApplication.instance() or QApplication([])
 
-    window = main.MainWindow()
+    window = MainWindow()
     catalogue_chs = window.catalog.chs_profiles()
-    assert len(catalogue_chs) >= len(main.STRUCTURAL_CHS_C350L0_SIZES)
+    assert len(catalogue_chs) >= len(portalcalc.frame.sections.STRUCTURAL_CHS_C350L0_SIZES)
     chs_114 = window.catalog.get("114.3*4.8 CHS")
     assert chs_114 is not None
     assert chs_114.shape_type == "Circular Hollow Section"
@@ -784,7 +787,7 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     assert not hasattr(window, "sections_guided_optimise_button")
     assert not hasattr(window, "sections_ai_help_button")
     assert not hasattr(window, "start_structural_assistant_request")
-    assert all(tab.tabText(i) != "Structural Assistant" for tab in window.findChildren(main.QTabWidget) for i in range(tab.count()))
+    assert all(tab.tabText(i) != "Structural Assistant" for tab in window.findChildren(QTabWidget) for i in range(tab.count()))
     assert window.whats_new_action.text().replace("&", "") == "What's New"
     help_dialog = window.show_help_dialog("whats_new")
     assert window.help_tabs.count() == 3
@@ -815,14 +818,14 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     assert window.right_canopy_g_load_input.text() == "0.15"
     assert window.right_canopy_q_load_input.text() == "0.25"
     assert window.left_canopy_shallow_depth_input.text() == "300"
-    migrated_depth = main.canopy_depth_mm_from_preset(
+    migrated_depth = portalcalc.frame.common.canopy_depth_mm_from_preset(
         {"left_shallow_depth_mm": "300", "left_length_mm": "6000", "left_pitch_deg": "5"},
         "left",
         "Canopy",
         "0",
     )
     assert math.isclose(float(migrated_depth), 300.0 + math.tan(math.radians(5.0)) * 6000.0, rel_tol=1e-6)
-    assert main.canopy_depth_mm_from_preset(
+    assert portalcalc.frame.common.canopy_depth_mm_from_preset(
         {"left_shallow_depth_mm": "300"}, "left", "Lean-to", "0"
     ) == "300"
     window.left_canopy_type_combo.setCurrentText("Canopy")
@@ -1084,9 +1087,9 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     assert " kg/m)" in window.left_column_profile_combo.currentText()
     assert window.selected_profile(window.left_column_profile_combo) is not None
     selected_cap_label = window.crane_beam_pfc_cap_combo.currentText()
-    selected_cap_name = main.clean_profile_label(selected_cap_label)
-    assert selected_cap_name in main.CRANE_PFC_CAP_PROFILES
-    if main.CRANE_PFC_CAP_PROFILES[selected_cap_name] is None:
+    selected_cap_name = portalcalc.frame.common.clean_profile_label(selected_cap_label)
+    assert selected_cap_name in portalcalc.frame.common.CRANE_PFC_CAP_PROFILES
+    if portalcalc.frame.common.CRANE_PFC_CAP_PROFILES[selected_cap_name] is None:
         assert selected_cap_label == "No PFC cap"
     else:
         assert " kg/m)" in selected_cap_label
@@ -1785,15 +1788,15 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     assert (skin_bearing_pier["diameter_mm"], skin_bearing_pier["depth_m"]) <= (no_skin_bearing_pier["diameter_mm"], no_skin_bearing_pier["depth_m"])
     assert window.stock_length_m_for_cut(6.1) == 6.75
     assert window.stock_length_m_for_cut(20.1) == 40.0
-    test_structure = main.Structure2D()
-    test_base = main.Node(1, 0.0, 0.0)
-    test_mid = main.Node(2, 0.0, 4000.0)
-    test_eave = main.Node(3, 0.0, 7000.0)
+    test_structure = portalcalc.frame.solver.Structure2D()
+    test_base = portalcalc.frame.solver.Node(1, 0.0, 0.0)
+    test_mid = portalcalc.frame.solver.Node(2, 0.0, 4000.0)
+    test_eave = portalcalc.frame.solver.Node(3, 0.0, 7000.0)
     for node in [test_base, test_mid, test_eave]:
         test_structure.add_node(node)
     test_profile = window.selected_profile(window.left_column_profile_combo)
-    test_structure.add_element(main.FrameElement2D(1, test_base, test_mid, 200000.0, test_profile, "LEFT_COLUMN"))
-    test_structure.add_element(main.FrameElement2D(2, test_mid, test_eave, 200000.0, test_profile, "LEFT_COLUMN"))
+    test_structure.add_element(portalcalc.frame.solver.FrameElement2D(1, test_base, test_mid, 200000.0, test_profile, "LEFT_COLUMN"))
+    test_structure.add_element(portalcalc.frame.solver.FrameElement2D(2, test_mid, test_eave, 200000.0, test_profile, "LEFT_COLUMN"))
     test_structure.add_support(test_base.ux)
     test_structure.add_support(test_base.uy)
     test_structure.add_support(test_base.rz)
@@ -1807,12 +1810,12 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
 
     # Uniform wall-load benchmark: a pin-ended column must recover the full
     # member bending and curvature, not merely balance half the load at each end.
-    benchmark_structure = main.Structure2D()
-    benchmark_base = main.Node(1, 0.0, 0.0)
-    benchmark_top = main.Node(2, 0.0, 10000.0)
+    benchmark_structure = portalcalc.frame.solver.Structure2D()
+    benchmark_base = portalcalc.frame.solver.Node(1, 0.0, 0.0)
+    benchmark_top = portalcalc.frame.solver.Node(2, 0.0, 10000.0)
     benchmark_structure.add_node(benchmark_base)
     benchmark_structure.add_node(benchmark_top)
-    benchmark_element = main.FrameElement2D(
+    benchmark_element = portalcalc.frame.solver.FrameElement2D(
         1,
         benchmark_base,
         benchmark_top,
@@ -1859,12 +1862,12 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     # Roof area loads retain their horizontal-projection resultant but are
     # carried by the sloping chord as a true member UDL, including local
     # chord bending between panel points.
-    roof_structure = main.Structure2D()
-    roof_left = main.Node(1, 0.0, 0.0)
-    roof_right = main.Node(2, 10000.0, 1000.0)
+    roof_structure = portalcalc.frame.solver.Structure2D()
+    roof_left = portalcalc.frame.solver.Node(1, 0.0, 0.0)
+    roof_right = portalcalc.frame.solver.Node(2, 10000.0, 1000.0)
     roof_structure.add_node(roof_left)
     roof_structure.add_node(roof_right)
-    roof_element = main.FrameElement2D(
+    roof_element = portalcalc.frame.solver.FrameElement2D(
         1,
         roof_left,
         roof_right,
@@ -1906,12 +1909,12 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
 
     # Fixed-ended companion benchmark verifies that the same member-load
     # formulation recovers rigid-joint end moments and restrained curvature.
-    fixed_structure = main.Structure2D()
-    fixed_base = main.Node(1, 0.0, 0.0)
-    fixed_top = main.Node(2, 0.0, 10000.0)
+    fixed_structure = portalcalc.frame.solver.Structure2D()
+    fixed_base = portalcalc.frame.solver.Node(1, 0.0, 0.0)
+    fixed_top = portalcalc.frame.solver.Node(2, 0.0, 10000.0)
     fixed_structure.add_node(fixed_base)
     fixed_structure.add_node(fixed_top)
-    fixed_element = main.FrameElement2D(
+    fixed_element = portalcalc.frame.solver.FrameElement2D(
         1,
         fixed_base,
         fixed_top,
@@ -2014,7 +2017,7 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
         assert window.structure is not None
     window.apply_preset_data(saved_defaults)
     window.shs_cost_input.setText("bad")
-    assert window.costing_rate_from_input(window.shs_cost_input, "shs_rate_per_kg") == float(main.COSTING_DEFAULTS["shs_rate_per_kg"])
+    assert window.costing_rate_from_input(window.shs_cost_input, "shs_rate_per_kg") == float(portalcalc.frame.common.COSTING_DEFAULTS["shs_rate_per_kg"])
     window.shs_cost_input.setText(factory_costing["shs_rate_per_kg"])
     assert window.wall_girt_check["spacing_mm"] == window.actual_wall_girt_spacing_mm(
         float(window.eave_input.text()) * 1000.0,

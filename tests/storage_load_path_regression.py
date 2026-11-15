@@ -1,11 +1,10 @@
 """Independent storage statics and FE checks; no UI, licence or model writes.
 
 Usage: python tests/storage_load_path_regression.py
-The AST extraction executes the actual production frame and storage design
-methods without importing the desktop application or starting a calculation.
+It runs the production frame solver and storage design methods directly, without
+the desktop application or a full calculation.
 """
 import _bootstrap  # noqa: F401  (puts the repository root on sys.path)
-import ast
 from dataclasses import dataclass, replace
 import math
 from pathlib import Path
@@ -14,23 +13,20 @@ from types import SimpleNamespace
 import unittest
 import numpy as np
 
-MAIN_WINDOW_SOURCE = _bootstrap.ROOT / "portalcalc" / "desktop" / "main_window.py"
 from portalcalc.storage_loads import *
 from portalcalc.member_checks import SectionCheckProperties, MemberActions, check_member, E_STEEL_MPA
+from portalcalc.frame.engine.storage import StorageMixin
+from portalcalc.frame.sections import SectionProfile
+from portalcalc.frame.solver import FrameElement2D, Node, Structure2D
 
-tree = ast.parse(MAIN_WINDOW_SOURCE.read_text(encoding="utf-8-sig"))
-namespace = dict(globals())
-classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name in
-           {"Node", "FrameElement2D", "Structure2D", "SectionProfile"}]
-window = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MainWindow")
-methods = [n for n in window.body if isinstance(n, ast.FunctionDef) and n.name in
-           {"storage_rail_design_for_profile", "storage_stub_design_for_profile"}]
-host = ast.ClassDef(name="DesignHost", bases=[], keywords=[], body=methods, decorator_list=[])
-exec(compile(ast.fix_missing_locations(ast.Module(body=classes + [host], type_ignores=[])),
-             str(MAIN_WINDOW_SOURCE), "exec"), namespace)
-Node, FrameElement2D, Structure2D, SectionProfile, DesignHost = (
-    namespace[n] for n in ("Node", "FrameElement2D", "Structure2D", "SectionProfile", "DesignHost"))
-DesignHost.serviceability_limit_value = lambda self, name: 250.0
+
+class DesignHost(StorageMixin):
+    """The production storage rail/stub design methods, with a fixed deflection limit."""
+
+    def serviceability_limit_value(self, name):
+        return 250.0
+
+
 PROFILE = SectionProfile("200 UB", "UB", "I", 4000., 100000., 30e6, 3e6, 1e10,
                          Syp=300000., Szp=60000., depth=200., flange_width=100.,
                          flange_thickness=10., web_thickness=6.)
@@ -218,5 +214,5 @@ class LoadPathTests(unittest.TestCase):
 
 
 if __name__=="__main__":
-    print("Source:",MAIN_WINDOW_SOURCE)
+    print("Source:", StorageMixin.__module__)
     unittest.main(verbosity=2)

@@ -2,7 +2,8 @@
 import _bootstrap  # noqa: F401  (puts the repository root on sys.path)
 import copy
 import unittest
-from portalcalc.desktop.main_window import MainWindow, merge_web_member_demand
+from portalcalc.desktop.main_window import MainWindow
+from portalcalc.frame.common import merge_web_member_demand
 
 
 class WebForceEnvelopeTests(unittest.TestCase):

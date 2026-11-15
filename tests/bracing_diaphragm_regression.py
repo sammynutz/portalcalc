@@ -220,7 +220,7 @@ class DiaphragmMechanicsTests(unittest.TestCase):
 class DiaphragmDesignTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from portalcalc.desktop.main_window import ShapeCatalog
+        from portalcalc.frame.sections import ShapeCatalog
         cls.catalog=ShapeCatalog(str(data_path("Shape_Catalog.xlsx")))
 
     def fixture(self):
@@ -360,7 +360,7 @@ class CanopyDiaphragmTests(unittest.TestCase):
     """Open-canopy roof panels follow the main roof stressed-skin toggle."""
     @classmethod
     def setUpClass(cls):
-        from portalcalc.desktop.main_window import ShapeCatalog
+        from portalcalc.frame.sections import ShapeCatalog
         from bracing_canopy_regression import CanopyNetworkTests
         fixture=CanopyNetworkTests();fixture.setUp()
         cls.fixture=fixture;cls.g=fixture.g
