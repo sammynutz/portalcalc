@@ -56,7 +56,7 @@ def compile_sources(root: Path) -> None:
         py_compile.compile(str(root / name), doraise=True)
     for name in ("bracing_components.py", "bracing_component_ui.py", "bracing_mixed_sizing.py", "bracing_sizing_diagnostics.py", "bracing_components_regression.py", "bracing_schedule.py", "purlin_combined.py", "purlin_beam.py", "purlin_beam_design.py", "purlin_beam_ui.py", "purlin_beam_regression.py", 'purlin_shared_design.py', 'purlin_strut_tables.py', 'purlin_strut_regression.py', 'purlin_end_local.py', 'purlin_end_local_regression.py'):
         py_compile.compile(str(root / name), doraise=True)
-    for name in ["app_metadata.py", "main.py", "purlin_selection.py", "purlin_selection_regression.py", "computation_report.py", "computation_report_data.py", "computation_report_regression.py", "portalcalc_service.py", "portalcalc_headless.py", "configurator_review.py", "calculation_service_regression.py", "configurator_review_regression.py", "physics_optimiser_regression.py", "concept_3d.py", "costing.py", "elevation_drawings.py", "finishes.py", "member_checks.py", "loads.py", "wind.py", "end_wall.py", "bracing.py", "licensing.py", "reduced_optimizer.py", "license_server.py", "license_generator_app.py", "crane_beam.py", "storage_loads.py"]:
+    for name in ["app_metadata.py", "main.py", "purlin_selection.py", "purlin_selection_regression.py", "computation_report.py", "computation_report_data.py", "computation_report_regression.py", "portalcalc_service.py", "portalcalc_headless.py", "configurator_review.py", "calculation_service_regression.py", "configurator_review_regression.py", "physics_optimiser_regression.py", "costing.py", "member_checks.py", "loads.py", "wind.py", "end_wall.py", "bracing.py", "licensing.py", "reduced_optimizer.py", "license_server.py", "license_generator_app.py", "crane_beam.py", "storage_loads.py"]:
         py_compile.compile(str(root / name), doraise=True)
 
 
@@ -1081,97 +1081,6 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     assert "Lightest passing" in crane_report
     assert math.isclose(float(window.crane_beam_load_height_input.text()), 0.12, rel_tol=1e-9)
     assert window.collect_preset_data()["crane_beam"]["load_height_mm"] == "120"
-    assert all(combo.currentText() == "Monument" for combo in [
-        window.roof_finish_combo, window.wall_finish_combo, window.barge_finish_combo,
-        window.ridge_finish_combo, window.corner_trim_finish_combo, window.gutter_finish_combo,
-    ])
-    assert window.skylight_run_combo.isHidden()
-    window.skylight_count_combo.setCurrentText("Two per bay")
-    window.skylight_run_combo.setCurrentText("Half run")
-    assert not window.skylight_run_combo.isHidden()
-    concept_data = window.concept_3d_data()
-    assert concept_data["finishes"]["cladding_back"] == "Surfmist"
-    assert concept_data["finishes"]["show_slab"] is True
-    assert window.collect_preset_data()["finishes"]["show_slab"] is True
-    concept_mesh = window.concept_3d_dae(concept_data, return_mesh=True)
-    assert len(concept_mesh["vertices"]) < 400000
-    mesh_materials = {material for material, _ in concept_mesh["triangles"]}
-    assert {"roof_cladding", "wall_cladding", "cladding_back", "skylight", "gutter", "barge", "ridge_capping", "corner_trim"} <= mesh_materials
-    window.concept_3d_viewer.set_data(concept_data, concept_mesh)
-    assert len(window.concept_3d_viewer.transparent_triangle_data) > 0
-    slab_on_triangle_count = len(window.concept_3d_viewer.triangle_data)
-    window.show_slab_checkbox.setChecked(False)
-    slabless_data = window.concept_3d_data()
-    assert slabless_data["finishes"]["show_slab"] is False
-    window.concept_3d_viewer.set_data(slabless_data, concept_mesh)
-    assert len(window.concept_3d_viewer.triangle_data) < slab_on_triangle_count
-    window.show_slab_checkbox.setChecked(True)
-    window.concept_3d_viewer.set_data(concept_data, concept_mesh)
-    concept_dae = window.concept_3d_dae(concept_data)
-    assert "<COLLADA" in concept_dae
-    assert "<triangles" in concept_dae
-    assert 'name="Transparent Skylight"' in concept_dae
-    window.skylight_count_combo.setCurrentText("None")
-    assert window.skylight_run_combo.isHidden()
-    assert any((line.get("profile") or {}).get("name") for line in concept_data["frame_lines"])
-    from elevation_drawings import _elevation_titles, _roof_cladding_edges, export_elevation_pdf
-    assert _elevation_titles({"north_direction_in_section": "E"}) == {
-        "left": "SOUTH ELEVATION",
-        "right": "NORTH ELEVATION",
-        "front": "EAST ELEVATION",
-        "back": "WEST ELEVATION",
-    }
-    cladding_edges = _roof_cladding_edges(
-        {"roof_cladding_offset_m": 0.35, "roof_cladding_depth_m": 0.03, "roof_edge_overhang_m": 0.0},
-        [(0.0, 0.0), (1.0, 0.0)],
-    )
-    assert math.isclose(cladding_edges[0][2][1] - cladding_edges[0][0][1], 0.03, abs_tol=1e-9)
-    elevation_path = os.path.join(tempfile.gettempdir(), "portalcalc-smoke-elevations.pdf")
-    export_elevation_pdf(concept_data, elevation_path, {"project": "SMOKE TEST", "job_number": "TEST"})
-    assert os.path.getsize(elevation_path) > 1000
-    from PySide6.QtPdf import QPdfDocument
-    drawing_document = QPdfDocument()
-    assert drawing_document.load(elevation_path) == QPdfDocument.Error.None_
-    assert drawing_document.pageCount() == 4
-    ub_member_data = {
-        "title": "UB member export smoke",
-        "length_m": 1.0,
-        "z_positions": [0.0],
-        "nodes": [{"x": 0.0, "y": 0.0}, {"x": 0.0, "y": 3.0}],
-        "frame_lines": [{
-            "a": 0,
-            "b": 1,
-            "group": "LEFT_COLUMN",
-            "profile": {
-                "name": "250 UB smoke",
-                "group_name": "UB",
-                "shape_type": "Universal Beam",
-                "depth_mm": 250.0,
-                "flange_width_mm": 146.0,
-                "flange_thickness_mm": 10.9,
-                "web_thickness_mm": 6.1,
-            },
-        }],
-        "longitudinal_nodes": [],
-        "roof_indices": [],
-        "main_top_indices": [],
-        "wall_states": {},
-    }
-    ub_dae = window.concept_3d_dae(ub_member_data)
-    assert '<triangles material="steel-material" count="36">' in ub_dae
-    chs_member_data = copy.deepcopy(ub_member_data)
-    chs_member_data["title"] = "CHS member export smoke"
-    chs_member_data["frame_lines"][0]["profile"] = {
-        "name": chs_114.name,
-        "group_name": chs_114.group_name,
-        "shape_type": chs_114.shape_type,
-        "depth_mm": chs_114.depth,
-        "flange_width_mm": chs_114.flange_width,
-        "flange_thickness_mm": chs_114.flange_thickness,
-        "web_thickness_mm": chs_114.web_thickness,
-    }
-    chs_dae = window.concept_3d_dae(chs_member_data)
-    assert '<triangles material="steel-material" count="128">' in chs_dae
     assert window.bottom_profile_combo is window.top_profile_combo
     assert window.left_canopy_bottom_profile_combo is window.left_canopy_top_profile_combo
     assert window.right_canopy_bottom_profile_combo is window.right_canopy_top_profile_combo
@@ -1285,107 +1194,6 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     window.storage_front_wall_checkbox.setChecked(True)
     window.storage_back_wall_checkbox.setChecked(True)
     window.generate_and_solve()
-    storage_concept = window.concept_3d_data()
-    panel_height = storage_concept["storage"]["panel_height_m"]
-    assert storage_concept["storage"]["enabled"]
-    assert storage_concept["storage"]["centre_stub"]
-    assert storage_concept["storage"]["front_wall"]
-    assert storage_concept["storage"]["back_wall"]
-    assert math.isclose(storage_concept["cladding_back_offset_m"], 0.006, abs_tol=1e-9)
-    assert all(
-        segment["y1"] >= panel_height - 1e-9
-        for segment in storage_concept["wall_segments"]
-        if segment["label"] in {"Left wall", "Right wall"}
-    )
-    assert all(
-        girt["y"] >= panel_height - 1e-9
-        for girt in storage_concept["wall_girts"]
-        if girt["label"] in {"Left wall", "Right wall"}
-    )
-    storage_end_surfaces = [
-        surface for surface in storage_concept["end_wall_surfaces"]
-        if surface["label"].endswith(("front", "back"))
-    ]
-    assert storage_end_surfaces
-    assert all(math.isclose(surface["points"][0]["y"], panel_height, abs_tol=1e-9) for surface in storage_end_surfaces)
-    eave_purlins = [purlin for purlin in storage_concept["roof_purlins"] if purlin.get("eave_drop_m")]
-    assert len(eave_purlins) >= 2
-    assert all(math.isclose(purlin["eave_drop_m"], 0.035, abs_tol=1e-9) for purlin in eave_purlins)
-    assert all("normal_x" in purlin and "normal_y" in purlin for purlin in eave_purlins)
-    selected_end_mullion = (window.end_wall_mullion_design.get("selected") or {}).get("section")
-    assert storage_concept["end_mullion_profile"]["name"] == (selected_end_mullion or "200 UB 22.3")
-    assert math.isclose(
-        storage_concept["end_mullion_target_spacing_m"],
-        window.end_wall_mullion_design["target_spacing_mm"] / 1000.0,
-        rel_tol=1e-9,
-    )
-    assert math.isclose(
-        storage_concept["end_girt_spacing_m"],
-        (window.end_wall_girt_check or {}).get("spacing_mm", 1500.0) / 1000.0,
-        rel_tol=1e-9,
-    )
-    storage_mesh = window.concept_3d_dae(storage_concept, return_mesh=True)
-    storage_materials = {material for material, _ in storage_mesh["triangles"]}
-    assert {"storage_panel", "galvanised"} <= storage_materials
-    window.add_sliding_door()
-    window.sliding_door_wall_combo.setCurrentText("Left wall")
-    window.sliding_door_height_input.setText("5.2")
-    window.sliding_door_width_input.setText("6.4")
-    window.sliding_door_position_input.setText("3.0")
-    window.sliding_door_opening_combo.setCurrentText("Slide right")
-    window.sliding_door_tracks_combo.setCurrentText("Double")
-    window.sliding_door_count_input.setValue(4)
-    window.update_sliding_door_from_controls()
-    door_concept = window.concept_3d_data()
-    assert len(door_concept["sliding_doors"]) == 1
-    assert door_concept["sliding_doors"][0]["tracks"] == 2
-    assert door_concept["sliding_doors"][0]["door_count"] == 4
-    assert door_concept["sliding_door_vertical_profile"]["depth_mm"] == 150.0
-    assert door_concept["sliding_door_header_profile"]["name"] == "200 UB 22.3"
-    window.add_pa_door()
-    window.pa_door_wall_combo.setCurrentText("Right wall")
-    window.pa_door_height_input.setText("2.4")
-    window.pa_door_width_input.setText("1.0")
-    window.pa_door_position_input.setText("4.0")
-    window.pa_door_opening_combo.setCurrentText("Open right")
-    window.update_pa_door_from_controls()
-    door_concept = window.concept_3d_data()
-    assert len(door_concept["pa_doors"]) == 1
-    assert door_concept["pa_doors"][0]["wall"] == "Right wall"
-    assert door_concept["pa_doors"][0]["opening"] == "Open right"
-    assert window.collect_preset_data()["pa_doors"][0]["width_m"] == 1.0
-    door_mesh = window.concept_3d_dae(door_concept, return_mesh=True)
-    assert len(door_mesh["triangles"]) > len(storage_mesh["triangles"])
-    saved_doors = copy.deepcopy(window.collect_preset_data()["sliding_doors"])
-    window.set_sliding_doors([{
-        "wall": "Front wall",
-        "height_m": 4.8,
-        "width_m": 5.5,
-        "position_m": 2.5,
-        "opening": "Bi-parting",
-        "tracks": 2,
-        "door_count": 4,
-    }])
-    front_door_mesh = window.concept_3d_dae(window.concept_3d_data(), return_mesh=True)
-    assert len(front_door_mesh["triangles"]) > len(storage_mesh["triangles"])
-    window.set_sliding_doors([{
-        "wall": "Back wall",
-        "height_m": 4.8,
-        "width_m": 5.5,
-        "position_m": 2.5,
-        "opening": "Slide left",
-        "tracks": 1,
-        "door_count": 2,
-    }])
-    back_door_mesh = window.concept_3d_dae(window.concept_3d_data(), return_mesh=True)
-    assert len(back_door_mesh["triangles"]) > len(storage_mesh["triangles"])
-    window.set_sliding_doors([])
-    assert not window.sliding_doors
-    window.set_sliding_doors(saved_doors)
-    assert window.sliding_doors[0]["opening"] == "Slide right"
-    assert window.sliding_doors[0]["door_count"] == 4
-    window.remove_sliding_door()
-    window.remove_pa_door()
     window.storage_enabled_checkbox.setChecked(False)
     window.calculate_storage_load_report()
     window.left_column_length_adjust_input.setText("0.5")
@@ -1572,12 +1380,6 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     assert window.derived_frame_type_label.text() == "3 Sided"
     window.apply_preset_data(saved_preset_data)
 
-    concept_data = window.concept_3d_data()
-    concept_html = window.concept_3d_html(concept_data)
-    assert concept_data["bay_count"] >= 1
-    assert concept_data["frame_lines"]
-    assert "Drag to orbit" in concept_html
-    assert "const data =" in concept_html
     assert window.wind_reduction_input.parent() is None
     assert window.eave_x_spring_input.isHidden()
     assert window.base_x_spring_input.isHidden()
@@ -1878,13 +1680,6 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     )
     outward_node, deep_node = sorted([deep_web.start, deep_web.end], key=lambda node: node.x)
     assert outward_node.y > deep_node.y
-    canopy_concept = window.concept_3d_data()
-    canopy_junction = window.concept_main_top_nodes[0]
-    assert not any(
-        abs(float(purlin["x"]) * 1000.0 - canopy_junction.x) < 1e-3
-        and abs(float(purlin["y"]) * 1000.0 - canopy_junction.y) < 1e-3
-        for purlin in canopy_concept["roof_purlins"]
-    )
     assert "wind model   : AS/NZS B.5 free roof, windward, empty under" in window.results_box.toPlainText()
     assert "Cpn net" in window.results_box.toPlainText()
     assert any(abs(arrow[2]) > 1e-9 for arrow in window.load_arrows)
