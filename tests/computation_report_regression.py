@@ -21,6 +21,14 @@ from portalcalc.reports.computation_report import export_computation_pdf
 from portalcalc.reports.computation_report_data import input_digest
 
 
+def applicable_combinations(window):
+    """The combinations the solve checks: crane combinations only apply when a crane is entered."""
+    from portalcalc.crane_beam import crane_case
+    if window.crane_rating_active_from_ui():
+        return list(window.load_combinations)
+    return [c for c in window.load_combinations if crane_case(c.crane_position) is None]
+
+
 class ComputationReportRegression(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -54,7 +62,7 @@ class ComputationReportRegression(unittest.TestCase):
         current = w.auto_size_overall_ratio(w.active_auto_size_group_specs())
         self.assertAlmostEqual(current[0], self.before_ratio[0], places=9)
         self.assertEqual(current[1:], self.before_ratio[1:])
-        self.assertEqual(len(self.data["cases"]), len(w.load_combinations))
+        self.assertEqual(len(self.data["cases"]), len(applicable_combinations(w)))
         case = next(c for c in self.data["cases"] if c["name"] == w.load_combination_combo.currentText())
         np.testing.assert_allclose([n["ux_mm"] for n in case["nodes"]], [w.displacements[n.ux] for n in w.structure.nodes], atol=1e-9)
         self.assertAlmostEqual(sum(n["fy_kn"] for n in case["nodes"]), float(np.sum(w.force_vector[1::3])) / 1000, places=8)
@@ -83,7 +91,7 @@ class ComputationReportRegression(unittest.TestCase):
             inputs["display"]["second_order_analysis"] = True
             window.apply_preset_data(inputs)
             data = window.capture_computation_report({"project": "Connected roof and storage"})
-            self.assertEqual(len(data["cases"]), len(window.load_combinations) * 4)
+            self.assertEqual(len(data["cases"]), len(applicable_combinations(window)) * 4)
             for case in data["cases"]:
                 self.assertIn(case["name"].rsplit("[", 1)[-1].rstrip("]"), {"No storage", "Storage left", "Storage right", "Storage both"})
                 self.assertEqual(case["analysis"]["type"], "second_order")

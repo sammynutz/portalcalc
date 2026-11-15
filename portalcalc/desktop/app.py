@@ -39,6 +39,20 @@ def main():
             smoke_path.with_suffix(".error.txt").write_text(str(exc), encoding="utf-8")
             raise SystemExit(1)
 
+    if "--packaged-worker-smoke-test" in sys.argv[1:]:
+        # Start the optimiser's worker processes from this EXE and write what happened.
+        import json
+        from pathlib import Path
+        from portalcalc.bracing.parallel import worker_probe
+        worker_path = Path(sys.argv[sys.argv.index("--packaged-worker-smoke-test") + 1]).resolve()
+        try:
+            probe = worker_probe()
+        except Exception as exc:
+            probe = {"ran_in_workers": False, "fallback_error": repr(exc)}
+        worker_path.write_text(json.dumps(probe, indent=1), encoding="utf-8")
+        ok = probe.get("ran_in_workers") and probe.get("context_received") and probe.get("results_in_order")
+        raise SystemExit(0 if ok else 1)
+
     if "--packaged-smoke-test" in sys.argv[1:]:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         packaged_smoke_app = QApplication([sys.argv[0]])

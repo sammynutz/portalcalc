@@ -82,6 +82,32 @@ def size_cost_task(context, task):
     return (result['design']['estimated_cost'], sized) if result['design']['passes'] else None
 
 
+def probe_task(context, task):
+    """(process id, context token, task): used to confirm worker processes start and receive the context."""
+    return os.getpid(), context.get('token'), task
+
+
+def worker_probe(tasks=4):
+    """Start the pool and report whether real worker processes answered.
+
+    Used by the packaged-build check: in a frozen app a worker re-launches the EXE,
+    so this proves the launcher hands control to the worker instead of opening the app.
+    """
+    with Runner({'token': 'portalcalc'}, tasks) as runner:
+        results = runner.map(probe_task, range(tasks))
+        failed = runner.failed
+    pids = sorted({pid for pid, _, _ in results})
+    return {
+        'workers_requested': runner.workers,
+        'worker_pids': pids,
+        'parent_pid': os.getpid(),
+        'ran_in_workers': failed is None and os.getpid() not in pids and runner.workers > 1,
+        'context_received': all(token == 'portalcalc' for _, token, _ in results),
+        'results_in_order': [task for _, _, task in results] == list(range(tasks)),
+        'fallback_error': None if failed is None else repr(failed),
+    }
+
+
 def _run(function, task):
     return function(_CONTEXT, task)
 

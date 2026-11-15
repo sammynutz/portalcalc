@@ -108,6 +108,20 @@ if ($reportProcess.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $reportSmokeP
     throw "PortalCalc packaged computation-report export failed; inspect $reportSmokeRoot"
 }
 
+# The frame + bracing optimiser starts worker processes by re-launching the EXE.
+# Confirm real workers answer; otherwise the optimiser silently runs one at a time.
+$workerSmokePath = Join-Path $reportSmokeRoot "workers.json"
+$workerProcess = Start-Process `
+    -FilePath (Join-Path $PWD "dist\PortalCalc\PortalCalc.exe") `
+    -ArgumentList @("--packaged-worker-smoke-test", "`"$workerSmokePath`"") `
+    -WorkingDirectory (Join-Path $PWD "dist\PortalCalc") `
+    -WindowStyle Hidden `
+    -Wait `
+    -PassThru
+if ($workerProcess.ExitCode -ne 0) {
+    throw "PortalCalc packaged optimiser worker check failed; inspect $workerSmokePath"
+}
+
 New-Item -ItemType Directory -Force -Path "dist\PortalCalc\presets" | Out-Null
 Copy-Item -LiteralPath "portalcalc\data\presets\factory_defaults.json" -Destination "dist\PortalCalc\presets\factory_defaults.json" -Force
 
