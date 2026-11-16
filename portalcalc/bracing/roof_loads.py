@@ -11,6 +11,7 @@ import json
 
 import numpy as np
 
+from portalcalc.frame.solver import apply_eave_strip_loads
 from portalcalc.loads import (BasicRoofLoads, RoofLoadPlacement, apply_roof_vertical_loads_in_zones,
                    apply_structure_self_weight)
 from portalcalc.wind import (low_pitch_cpe_values, SIDE_WALL_CPE_BANDS, area_reduction_factor, action_combination_factors,
@@ -63,6 +64,28 @@ def add_normal_line_load(structure, element, outward_n_mm):
     sign = 1. if dx >= 0 else -1.
     structure.add_uniform_global_line_load(element, -sign*dz/element.length()*outward_n_mm,
                                            sign*dx/element.length()*outward_n_mm)
+
+
+def apply_eave_strips(structure, eave_strips, walls_only=False):
+    """Envelope outside the frame lines, carried to the eave nodes as the 2D frame does.
+
+    The portal's top chord nodes sit below the eave pitching point and inside
+    the wall cladding line. ``eave_strips`` (the 2D frame's
+    ``eave_node_basis_record['strips']``) gives, per side, the wall height above
+    the node and the roof length beyond the column centreline; the line loads
+    already on the column top and the eave end of the roof are extended over
+    them (frame.solver.apply_eave_strip_loads).
+
+    ``walls_only`` is for wind: the 2D frame applies roof wind as point loads,
+    which its strips do not extend, so only the wall strip applies.
+    """
+    if not eave_strips:
+        return
+    loads = dict(structure.element_uniform_loads)
+    if walls_only:
+        columns = {e.id for e in structure.elements if 'COLUMN' in e.group.upper()}
+        loads = {key: value for key, value in loads.items() if key in columns}
+    apply_eave_strip_loads(structure, eave_strips, [(loads, 1.0)])
 
 
 def frame_strip_integrals(stations, segments, reverse=False):
@@ -164,13 +187,16 @@ def buffer_cases(crane, gravity):
             for label, frame, sign in (('front stops', 0, -1.), ('back stops', last, 1.))]
 
 
-def building_roof_cases(base_cases, portal, geometry, wind_inputs, source, snow_service_kpa=0., crane=None):
+def building_roof_cases(base_cases, portal, geometry, wind_inputs, source, snow_service_kpa=0., crane=None,
+                        eave_strips=None):
     """Expand end-wind cases to G/Q and coincident G + normal-wind cases.
 
     The existing end-wall pressures and friction are retained. The two roof
     external branches use Table 5.3(A) crosswind (R) bands, measured from the
     physical windward building end, with d=building length. Local Table 5.6
-    patches remain separate purlin bending checks.
+    patches remain separate purlin bending checks. ``eave_strips`` adds the
+    roof and wall outside the frame lines to every portal load (see
+    ``apply_eave_strips``).
     """
     g = geometry
     structure = copy.deepcopy(portal.structure)
@@ -202,6 +228,7 @@ def building_roof_cases(base_cases, portal, geometry, wind_inputs, source, snow_
                     if kpa:
                         apply_roof_vertical_loads_in_zones(structure,part['nodes'],kpa*width/1000,'Both',0.,100.,
                                                            element_groups={part['group']})
+            apply_eave_strips(structure,eave_strips)
             if gf:
                 apply_structure_self_weight(structure,structure.elements,1.)
             destination.append(_snapshot(structure))
@@ -269,6 +296,7 @@ def building_roof_cases(base_cases, portal, geometry, wind_inputs, source, snow_
                             structure.add_uniform_global_line_load(e,-side_line,0.)
                         elif abs(x-tops[-1].x)<1. and wind_inputs.right_wall_clad:
                             structure.add_uniform_global_line_load(e,side_line,0.)
+                apply_eave_strips(structure,eave_strips,walls_only=True)
                 normal.append(_snapshot(structure))
             for gf in ((.9,1.2) if base['level']=='ULS' else (0.,1.)):
                 case = copy.deepcopy(base)
@@ -280,7 +308,7 @@ def building_roof_cases(base_cases, portal, geometry, wind_inputs, source, snow_
                 cases.append(case)
 
     from portalcalc.bracing.side_wind import side_wind_cases
-    transverse_cases=side_wind_cases(portal,g,wind_inputs,gravity,widths,source=source)
+    transverse_cases=side_wind_cases(portal,g,wind_inputs,gravity,widths,source=source,eave_strips=eave_strips)
     cases.extend(transverse_cases)
     if crane:
         cases.extend(crane_cases(structure, crane, gravity, live))

@@ -122,9 +122,28 @@ def _patch_normal(structure, element, origin, bands, q_width, factor, internal, 
         apply_element_patch(structure,element,ta,tb,nx*outward,nz*outward,equivalents)
 
 
-def side_wind_cases(portal, geometry, inputs, gravity, widths, source=None):
+def _wall_strip_targets(tops, eave_strips):
+    """Per side: the eave node and the height of wall cladding above it.
+
+    The eave is the cladding pitching point, above the top chord node, so the
+    wall pressure on that height reaches the frame at the eave node. This is
+    the wall part of the 2D frame's eave strips (frame.solver.apply_eave_strip_loads).
+    The 2D frame applies roof wind as point loads, which its strips do not
+    extend, so there is no roof wind strip here either.
+    """
+    targets={}
+    nodes=[n for e in tops for n in (e.start,e.end)]
+    for strip in eave_strips or ():
+        node=next((n for n in nodes if abs(n.x-strip['x'])<1e-6 and abs(n.y-strip['y'])<1e-6),None)
+        if node is not None and strip['wall_mm']>1e-9:
+            targets[strip['side'].lower()]={'node':node,'wall_mm':float(strip['wall_mm'])}
+    return targets
+
+
+def side_wind_cases(portal, geometry, inputs, gravity, widths, source=None, eave_strips=None):
     g=geometry;structure=copy.deepcopy(portal.structure)
     tops=[e for e in structure.elements if e.group=='TOP']
+    strip_targets=_wall_strip_targets(tops,eave_strips)
     origin=min(n.x for e in tops for n in (e.start,e.end))
     apex_x=max((n for e in tops for n in (e.start,e.end)),key=lambda n:n.y).x-origin
     canopies=canopy_parts(structure,source)
@@ -199,7 +218,7 @@ def side_wind_cases(portal, geometry, inputs, gravity, widths, source=None):
                             tangent=(1. if not right else -1.)*q*.01*width/1000
                             apply_element_patch(structure,e,ta,tb,sign*dx/e.length()*tangent,
                                                 sign*dz/e.length()*tangent,equivalents)
-                    walls=[]
+                    walls=[];strips=[]
                     for side,x,clad in [('left',0.,inputs.left_wall_clad),('right',g.span_mm,inputs.right_wall_clad)]:
                         if not clad:
                             continue
@@ -211,11 +230,17 @@ def side_wind_cases(portal, geometry, inputs, gravity, widths, source=None):
                         for e in structure.elements:
                             if 'COLUMN' in e.group.upper() and abs((e.start.x+e.end.x)/2-origin-x)<1.:
                                 structure.add_uniform_global_line_load(e,(-1. if side=='left' else 1.)*outward,0.)
+                        if side in strip_targets:
+                            # Wall cladding above the eave node, to the pitching point.
+                            fx=(-1. if side=='left' else 1.)*outward*strip_targets[side]['wall_mm']
+                            structure.add_load(strip_targets[side]['node'].ux,fx)
+                            strips.append({'side':side,'wall_mm':strip_targets[side]['wall_mm'],'fx_n':fx})
                         walls.append({'face':side+'_wall','cpe':cp,'external_factor':factor,
                                       'net_inward_kpa':q*(cp*factor-cpi*kci)})
                     normal.append(_snapshot(structure,equivalents))
                     frame_evidence.append({'index':index,'tributary_width_mm':float(width),
-                                           'roof_external_factor':roof_factor,'walls':walls})
+                                           'roof_external_factor':roof_factor,'walls':walls,
+                                           **({'eave_wall_strips':strips} if strips else {})})
                 peaks={face:max((p for a,b,p in bands),key=abs) for face,bands in ends.items()}
                 for gf in g_factors:
                     label=(f'{gf:g}G + Wu' if level=='ULS' else 'G + Ws' if gf else 'Ws')

@@ -352,7 +352,16 @@ def prepare_context(window, allow_unconfigured=False):
     # Roof stations, then each canopy's outer edge (the canopy-edge strut line).
     points = [(left.x+x, g.roof_z(x)) for x in g.roof_stations] + [(tip.x, tip.y) for _,_,_,tip in canopies]
     portal = PortalReduction(structure, points)
-    wind_inputs = window.wind_inputs_from_ui(g.span_mm, g.pitch_deg, g.eave_mm)
+    # Wind acts on the building envelope, as in the 2D frame: its outside width and the
+    # eave pitching point, not the column centrelines and the (lower) top chord node.
+    # The roof and wall outside the frame lines reach the portals as eave strips.
+    eave_basis = getattr(window, "eave_node_basis_record", None) or {}
+    try:
+        envelope_width_mm = float(window.span_input.text())*1000.
+    except (AttributeError, TypeError, ValueError):
+        envelope_width_mm = g.span_mm
+    wind_inputs = window.wind_inputs_from_ui(envelope_width_mm, g.pitch_deg, eave_basis.get("eave_mm", g.eave_mm))
+    eave_strips = copy.deepcopy(eave_basis.get("strips") or [])
     source = copy.deepcopy(window.collect_preset_data())
     from portalcalc.bracing.spacing import max_bay_spacing
     spacing_limit=max_bay_spacing({'source_preset':source})
@@ -360,7 +369,8 @@ def prepare_context(window, allow_unconfigured=False):
     from portalcalc.bracing.roof_loads import building_roof_cases
     crane = crane_racking_setup(window, structure, g)
     cases, roof_load_basis = building_roof_cases(cases,portal,g,wind_inputs,source,
-                                                window.snow_loads_from_ui()['service_kpa'], crane=crane)
+                                                window.snow_loads_from_ui()['service_kpa'], crane=crane,
+                                                eave_strips=eave_strips)
     crane_basis = None if crane is None else {key: copy.deepcopy(value) for key, value in crane.items()
                                               if key != 'portal_actions'}
     profile = (window.end_wall_mullion_design or {}).get("selected") or {}
