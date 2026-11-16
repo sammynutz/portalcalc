@@ -340,16 +340,37 @@ def shear_capacity_kn(section: SectionCheckProperties) -> float:
     return PHI_STEEL * vv
 
 
-def check_member(section: SectionCheckProperties, actions: MemberActions) -> MemberCheckResult:
-    result = MemberCheckResult(section_name=section.name)
+def member_capacities(section: SectionCheckProperties, actions: MemberActions) -> tuple:
+    """Capacities that depend only on the section and the restraint lengths.
 
+    (phi Nc, hollow local compression info, phi Nt, phi Ms, alpha_s, phi Vv). They use
+    ``actions`` for its effective lengths and kt/kl/kr only, not for its forces or
+    moment modifier, so one result serves every load case on the same member segment
+    (pass it to ``check_member``).
+    """
     nc = member_compression_capacity_kn(section, actions)
     local_compression = hollow_local_compression_capacity_info(section)
     if local_compression is not None:
         nc = min(nc, local_compression["capacity_kn"])
     nt = tension_capacity_kn(section)
-    mb = bending_capacity_knm(section, actions)
+    ms = section_moment_capacity_knm(section)
+    alpha_s = bending_slenderness_reduction(ms, reference_buckling_moment_knm(section, actions))
     vv = shear_capacity_kn(section)
+    return nc, local_compression, nt, ms, alpha_s, vv
+
+
+def check_member(section: SectionCheckProperties, actions: MemberActions, capacities: Optional[tuple] = None) -> MemberCheckResult:
+    """Capacity checks for one member under one set of actions.
+
+    ``capacities`` is an optional ``member_capacities(section, actions)`` result for the
+    same section, effective lengths and kt/kl/kr, to avoid recomputing it per load case.
+    """
+    result = MemberCheckResult(section_name=section.name)
+
+    nc, local_compression, nt, ms, alpha_s, vv = (
+        capacities if capacities is not None else member_capacities(section, actions))
+    # phi Mb, capped at phi Ms (bending_capacity_knm).
+    mb = min(ms, max(actions.moment_modifier, 0.0) * alpha_s * ms)
 
     result.checks["compression"] = CapacityCheck(
         "Compression", actions.compression_kn, nc, safe_ratio(actions.compression_kn, nc), "kN",

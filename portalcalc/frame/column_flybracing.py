@@ -7,7 +7,7 @@ The receiving girt and effective lateral/twist restraint remain design assumptio
 from dataclasses import asdict, fields
 import math
 
-from portalcalc.member_checks import MemberActions, MemberCheckResult, check_member
+from portalcalc.member_checks import MemberActions, MemberCheckResult, check_member, member_capacities
 
 
 COLUMN_GROUPS = {'LEFT_COLUMN', 'RIGHT_COLUMN', 'LEFT_LEAN_COLUMN', 'RIGHT_LEAN_COLUMN'}
@@ -142,12 +142,17 @@ class FlybraceColumn:
             self.demands[demand_key] = [(case['name'], segment_demand(case, low, high))
                                          for case in self.basis['cases']]
         checks = []
+        # Every load case on this segment has the same section and restraint
+        # lengths, so the capacities are worked out once and only the demands change.
+        capacities = None
         for name, demand in self.demands[demand_key]:
             actions = MemberActions(**{k: v for k, v in demand.items() if k != 'quarter_moments_knm'},
                                     effective_length_y_mm=high-low,
                                     effective_length_z_mm=self.basis['in_plane_length_mm'],
                                     ltb_length_mm=high-low)
-            result = check_member(section, actions)
+            if capacities is None:
+                capacities = member_capacities(section, actions)
+            result = check_member(section, actions, capacities)
             checks.append((result, actions, {'combo': name, 'from_mm': low, 'to_mm': high,
                                             'am': actions.moment_modifier,
                                             'quarter_moments_knm': demand['quarter_moments_knm']}))

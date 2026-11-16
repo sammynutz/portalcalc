@@ -24,6 +24,18 @@ All notable PortalCalc desktop releases should be recorded here.
 - **Removed: 3D Concept view, Export 3D Concept and Export Drawing Set.**
   - The Doors/Finishes tab went with them: sliding doors, PA doors, colours, skylights and the slab toggle only fed the 3D view and drawings.
   - Roof profile stays, on a new Cladding tab, because the 3D bracing wind loads use it for roof friction drag. Older presets still load; their door and colour entries are ignored.
+- **Changes 3D bracing results. The 3D model's loads now match the 2D frame's.**
+  - The 3D model already used the 2D frame's lowered top chord nodes, but took its wind pressures from the node height and centreline span, and left out the envelope outside the frame lines.
+  - Wind pressures now come from the building envelope (cladding width and eave height), as in 2D.
+  - The eave strips are carried to the eave nodes as in 2D: the wall strip (node up to the pitching point) for wind, and the wall and roof strips for dead and live load.
+  - Factory defaults: 3D and 2D sway now agree within 0.7%. The restraint and transverse SLS regression tests that compare the two pass again.
+- **Optimise frame + bracing together is about three times faster. No change to results.**
+  - Factory defaults on a 32-core machine: about 2 minutes, was 6 min 48 s. Best design, bracing frontier, 3D points and every searched pair are identical.
+  - The 2D frame is sized for every bracing restraint level at the same time, each in its own worker process (up to 16), instead of one after another on one core. The frame + bracing pair checks run in workers the same way.
+  - Column flybrace checks work out a section's capacities once per segment instead of once per load case (2D auto-size about 12% faster).
+  - Cancel stops the workers at once (about 0.1 s) instead of waiting for the running sizings.
+  - The "frames sized" table in the optimiser report is listed in order of restraint.
+  - The packaged-build check now also proves a worker process can run the windowless engine.
 
 - **Changes Optimise results. Matched columns on symmetric buildings, a paired column sway repair and a better depth sweep.**
   - **Matched columns.** On a symmetric building Optimise keeps the left and right columns the same section. Symmetric means a gable roof, the same supports and column length adjustments, the same canopy/lean-to each side (type, size, frame, loads) and internal columns mirrored about mid-span; wind, cladding and openings may differ (`columns_should_match`).

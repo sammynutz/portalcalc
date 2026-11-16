@@ -200,8 +200,11 @@ class ProgressTests(unittest.TestCase):
         report.phase('frame')          # an earlier phase never moves the bar back
         fractions = [f for _, f in seen]
         self.assertEqual(fractions, sorted(fractions))
-        self.assertAlmostEqual(seen[1][1], .165)
-        self.assertAlmostEqual(seen[4][1], .33+(.4+.3)*.23)
+        # Positions follow the phase boundaries, whatever they are retimed to.
+        frame_start, frame_end = fs.PHASES['frame'][2:]
+        bracing_start, bracing_end = fs.PHASES['bracing'][2:]
+        self.assertAlmostEqual(seen[1][1], frame_start+.5*(frame_end-frame_start))
+        self.assertAlmostEqual(seen[4][1], bracing_start+(.4+.3)*(bracing_end-bracing_start))
         self.assertTrue(seen[1][0].startswith('Step 1 of 4: Sizing the unrestrained 2D frame\nhalf'))
 
     def test_message_only_callbacks_still_work(self):
@@ -236,7 +239,8 @@ class ProgressTests(unittest.TestCase):
             report.size_frame(window, '2D')
         finally:
             fs.shared._size_frame = original
-        self.assertEqual(seen, [.56, .56, .5867, .72, .72, .88])
+        start, end = fs.PHASES['floor'][2:]
+        self.assertEqual(seen, [round(start+f*(end-start), 4) for f in (0., 0., 1/12, .5, .5, 1.)])
         self.assertIsNone(window.optimisation_progress_listener)
 
 

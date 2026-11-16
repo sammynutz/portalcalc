@@ -16,7 +16,9 @@ gives each frame (k, kN/mm on the mean eave movement).
    than member sizes: on factory defaults the restrained optimum also deepens
    the truss and re-sizes the webs, which a quick check of lighter members
    cannot reproduce. Each frame is sized for the bracing's restraint less a
-   margin, which allows for the recheck with the re-sized frame.
+   margin, which allows for the recheck with the re-sized frame. The frames
+   for all the frontier's restraint levels are independent, so they are sized
+   at once in worker processes (``parallel.frame_task``).
 3. Bound. Frame cost should not rise with more restraint, so sizing the
    frame once at the stiffest frontier bracing gives a floor. A bracing
    option whose cost plus that floor cannot beat the best verified total is
@@ -57,13 +59,17 @@ ROD_STEPS = ((0, 0), (1, 0), (0, 1), (1, 1), (2, 2))
 SIZING_MARGIN = .05   # frames are sized for the delivered restraint / (1 + margin)
 MAX_GIRDER_LAYOUTS = 4
 
-# Share of the progress bar for each step, from a factory-default run (61 s):
-# unrestrained 2D 20 s, 3D options 14 s, floor-frame 2D 21 s, pairs + workspace 6 s.
+# Frames for the frontier's restraint levels are sized at once, each in its own
+# worker process on a windowless engine (parallel.frame_task): one per core, up to this many.
+FRAME_WORKERS = 16
+
+# Share of the progress bar for each step, from a factory-default run (2026-11-16, 32 cores):
+# unrestrained 2D 35 s, 3D options 27 s, restrained frames (9 at once) 45 s, pairs + workspace 30 s.
 PHASES = {
-    'frame': (1, 'Sizing the unrestrained 2D frame', 0., .33),
-    'bracing': (2, 'Checking bracing options in 3D', .33, .56),
-    'floor': (3, 'Sizing the lightest 2D frame (stiffest bracing)', .56, .88),
-    'pairs': (4, 'Checking frame + bracing pairs', .88, 1.),
+    'frame': (1, 'Sizing the unrestrained 2D frame', 0., .26),
+    'bracing': (2, 'Checking bracing options in 3D', .26, .46),
+    'floor': (3, 'Sizing the 2D frame for each bracing restraint', .46, .78),
+    'pairs': (4, 'Checking frame + bracing pairs', .78, 1.),
 }
 STEP_COUNT = len(PHASES)
 AUTO_SIZE_STEPS = 12   # Optimise (run_physics_structure_optimisation) reports steps 1-12
@@ -458,13 +464,62 @@ def _optimise(window, *, progress=None):
                 window.trial_sway_restraint_kn_mm = None
             return frames[key]
 
+        checked = {}   # (frame sized-for, option name) -> verify_pair row, checked ahead in worker processes
+
         def verify(frame, option):
             in_pairs()
             report.phase('pairs')
             report(f"Checking {option['option']}\nwith the frame sized for {frame['sized_for_kn_mm']:.3f} kN/mm",
                    pairs_share(.35)[0])
             counts['bracing_3d'] += 1
+            ready = checked.get((frame['sized_for_kn_mm'], option['option']))
+            if ready is not None:
+                return dict(ready)
             return verify_pair(window, frame, option, criteria, candidates)
+
+        # Each restraint level's frame is the 2D auto-size of the same baseline with
+        # that restraint: independent of the others, so they are all sized now, at
+        # once, in worker processes. The search below then finds them ready.
+        targets = {}
+        for option in options:
+            if option['restraint'] > 0.:
+                target = option['restraint']/(1+SIZING_MARGIN)
+                targets.setdefault(round(target, 6), target)
+        if len(targets) > 1:
+            report.phase('floor')
+            with parallel.Runner({'baseline': baseline}, len(targets), max_workers=FRAME_WORKERS) as runner:
+                sized = runner.map(
+                    parallel.frame_task, list(targets.values()),
+                    lambda done, total: report(f'{total} frames, one per bracing restraint level: {done} sized', done/total))
+            for (key, target), outcome in zip(targets.items(), sized):
+                counts['frame_auto_size'] += 1
+                state = outcome.pop('state')
+                frames[key] = (None if not (outcome['verified'] and outcome['acceptable']) else
+                               {**outcome, 'sized_for_kn_mm': target, 'state': state})
+
+            # The pair checks the search may ask for are independent as well: each
+            # restores its frame's captured state before checking. Check them ahead,
+            # together; the search then makes the same decisions from ready results.
+            restrained = [p for p in options if p['restraint'] > 0.]
+            frame_of = lambda option: frames.get(round(option['restraint']/(1+SIZING_MARGIN), 6))
+            floor = frame_of(restrained[-1])
+            unrestrained_cost = incumbent.get('frame_cost')
+            trusted = floor is None or unrestrained_cost is None or floor['cost'] <= unrestrained_cost+.005
+            pairs_ahead = {}
+            for option in restrained:
+                for frame in ((floor,) if trusted else ()) + (frame_of(option),):
+                    if frame is not None:
+                        pairs_ahead.setdefault((frame['sized_for_kn_mm'], option['option']), (frame, option))
+            if len(pairs_ahead) > 1:
+                in_pairs()
+                report.phase('pairs')
+                with parallel.Runner({'criteria': criteria, 'candidates': candidates}, len(pairs_ahead),
+                                     max_workers=FRAME_WORKERS) as runner:
+                    rows_ahead = runner.map(
+                        parallel.pair_task, list(pairs_ahead.values()),
+                        lambda done, total: report(f'{total} frame + bracing pairs: {done} checked', .7*done/total))
+                checked.update(zip(pairs_ahead, rows_ahead))
+                pairs['at'] = .7
 
         best, rows = search(options, frame_for, verify, incumbent)
         report.phase('pairs')

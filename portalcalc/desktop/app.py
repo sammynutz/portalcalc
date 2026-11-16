@@ -50,7 +50,8 @@ def main():
         except Exception as exc:
             probe = {"ran_in_workers": False, "fallback_error": repr(exc)}
         worker_path.write_text(json.dumps(probe, indent=1), encoding="utf-8")
-        ok = probe.get("ran_in_workers") and probe.get("context_received") and probe.get("results_in_order")
+        ok = all(probe.get(key) for key in ("ran_in_workers", "context_received", "results_in_order",
+                                            "engine_solved_in_worker", "qt_in_worker"))
         raise SystemExit(0 if ok else 1)
 
     if "--packaged-smoke-test" in sys.argv[1:]:

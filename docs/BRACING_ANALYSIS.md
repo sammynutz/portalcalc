@@ -527,6 +527,16 @@ run in worker processes (`portalcalc/bracing/parallel.py`, up to 8; set
 optimiser must keep its code under `if __name__ == '__main__':`, because each
 worker imports the calling script.
 
+Steps 3 and 4 use workers too. Each frame sizing depends only on the
+unrestrained sizing and its restraint, and each pair check only on its frame
+and bracing option, so the frames for every frontier restraint level are sized
+at the same time (`parallel.frame_task`, up to 16 workers, each on its own
+windowless engine) and the pair checks the search may ask for are run ahead
+(`parallel.pair_task`). The search then proceeds in the order above and reads
+those answers, so the result is the same as sizing and checking one at a time.
+If workers cannot start, everything runs in the main process. Cancel stops the
+workers immediately.
+
 The unrestrained frame with the cheapest bracing is always a valid starting
 answer. Bracing uses the workspace's own setup from the saved 3D settings
 (per-location strut plans, rope ratings/prices, angles, brace policy) and is
