@@ -75,6 +75,51 @@ class LayoutSearchTests(unittest.TestCase):
         self.assertEqual(c['layout'].to_dict(), before)
         self.assertFalse(raised.exception.evidence['trials'][0]['adopted'])
 
+    def test_installed_purlin_bending_stop_is_named_and_reported_by_every_search(self):
+        """No strut option can relieve an installed purlin overstressed in roof bending
+        alone; the stop and the layout search say so instead of 'no passing layout'."""
+        from types import SimpleNamespace
+        from portalcalc.bracing.sizing_diagnostics import stop_for_strut
+        def stop(bending_ratio):
+            row = {'case': 'ULS / Front to back / 0.9G + W', 'mode': 'PRELIMINARY assigned-load axial + table-reference envelope',
+                   'ratio': bending_ratio+.127, 'axial_kn': -7.75, 'beam_role': 'roof', 'section': 'C/Z 200 19',
+                   'reference_envelope_ratio': bending_ratio, 'governing_beam_case': 'ULS outward / End local RC1 / Front / patch 0 m',
+                   'governing_local_pressure': {'region': 'RC1', 'kl': 3.0}}
+            ident = 'strut/bay/1/line/0'
+            initial = {'analysis_layout': {'geometry': {'span_mm': 30850.}},
+                       'section_checks': {ident: {'section': '1 existing C/Z 200 19', 'case_checks': [row]}}}
+            assembly = SimpleNamespace(name='1 existing C/Z 200 19', location={
+                'id': ident, 'bay': 1, 'line': 0, 'x_mm': 0., 'purlin': {'basis_key': 'TEST'}})
+            return stop_for_strut(initial, initial, assembly, [])
+        from portalcalc.bracing.layout_search import _common_stop
+        overstressed = stop(1.53)
+        d = overstressed.diagnostic
+        self.assertEqual((d['constraint'], d['location'], d['local_pressure_region']),
+                         ('installed_purlin_bending', 'Bay 2, left eave', 'RC1'))
+        self.assertAlmostEqual(d['bending_ratio'], 1.53)
+        axial = stop(.9)   # bending within the reference: an ordinary strut stop
+        self.assertIsNone(axial.diagnostic['constraint'])
+        self.assertIsNone(axial.diagnostic['bending_ratio'])
+        self.assertAlmostEqual(axial.diagnostic['axial_kn'], -7.75)
+
+        c, s, pool, criteria, rates = self.fixture()
+        for search in (find_layout, find_practical_layout):
+            with self.subTest(search=search.__name__), \
+                 mock.patch('portalcalc.bracing.layout_search.auto_size', side_effect=overstressed):
+                with self.assertRaises(LayoutSearchStopped) as raised:
+                    search(c, s, pool, criteria, rates, max_trials=2)
+                trials = raised.exception.evidence['trials']
+                self.assertTrue(trials)
+                self.assertTrue(all(t['stop_constraint'] == 'installed_purlin_bending' and
+                                    t['stop_location'] == 'Bay 2, left eave' for t in trials))
+                self.assertEqual(str(raised.exception), _common_stop(raised.exception.evidence))
+            with self.subTest(search=search.__name__, stop='other'), \
+                 mock.patch('portalcalc.bracing.layout_search.auto_size', side_effect=axial):
+                with self.assertRaises(LayoutSearchStopped) as raised:
+                    search(c, s, pool, criteria, rates, max_trials=2)
+                self.assertTrue(all('stop_constraint' not in t for t in raised.exception.evidence['trials']))
+                self.assertIsNone(_common_stop(raised.exception.evidence))
+
     def test_diaphragms_cannot_rescue_blocked_conventional_wall_load_paths(self):
         c, s, pool, criteria, rates = self.fixture()
         blocked = {p for p in c['layout'].panels if p.startswith(('left_wall/', 'right_wall/'))}

@@ -381,6 +381,19 @@ class UiBuildMixin:
         wind_snow_layout.addRow("North direction in section view", self.wind_orientation_selector)
         wind_snow_layout.addRow("Wall enclosure", self.envelope_plan_selector)
         wind_snow_layout.addRow("Derived frame type", self.derived_frame_type_label)
+        # Table 5.6 roof local pressure regions for the purlin checks (2D, canopy
+        # edge purlins and the 3D end patches). On by default; any switched off
+        # is stated in the report as a user override.
+        local_pressure_row = QWidget()
+        local_pressure_layout = QHBoxLayout(local_pressure_row)
+        local_pressure_layout.setContentsMargins(0, 0, 0, 0)
+        for region, name in self.LOCAL_PRESSURE_CHECKBOXES:
+            checkbox = QCheckBox(region)
+            checkbox.setChecked(True)
+            setattr(self, name, checkbox)
+            local_pressure_layout.addWidget(checkbox)
+        local_pressure_layout.addStretch(1)
+        wind_snow_layout.addRow("Purlin local pressure (Kl)", local_pressure_row)
         self.frame_load_basis_combo = QComboBox()
         for label, basis in FRAME_LOAD_BASIS_OPTIONS:
             self.frame_load_basis_combo.addItem(label, basis)
@@ -1270,6 +1283,10 @@ class UiBuildMixin:
         self.right_support_combo.currentTextChanged.connect(lambda _: self.refresh_settings_menu_checks())
         self.eave_x_restraint_combo.currentTextChanged.connect(lambda _: self.update_eave_restraint_visibility())
         self.longitudinal_bracing_enabled_checkbox.toggled.connect(lambda _: self.generate_and_solve())
+        self.local_pressure_ra1_checkbox.toggled.connect(lambda _: self.generate_and_solve())
+        self.local_pressure_ra2_checkbox.toggled.connect(lambda _: self.generate_and_solve())
+        self.local_pressure_rc1_checkbox.toggled.connect(lambda _: self.generate_and_solve())
+        self.local_pressure_rc2_checkbox.toggled.connect(lambda _: self.generate_and_solve())
         self.longitudinal_wall_sides_combo.currentTextChanged.connect(lambda _: self.generate_and_solve())
         self.roof_brace_size_combo.currentTextChanged.connect(lambda _: self.generate_and_solve())
         self.wall_brace_size_combo.currentTextChanged.connect(lambda _: self.generate_and_solve())
@@ -1367,6 +1384,10 @@ class UiBuildMixin:
             "derived_frame_type_label": "Frame enclosure classification derived from the selected wall states.",
             "wind_case_combo": "Single wind case shown in the load display. Design envelopes still check all generated wind combinations.",
             "wind_reduction_input": "Additional multiplier applied to calculated wind pressure. Use 1.0 unless a justified project-specific factor applies.",
+            "local_pressure_ra1_checkbox": "AS/NZS 1170.2 Table 5.6 RA1 (Kl 1.5, within a of a roof edge) on purlin checks. Untick only as a deliberate override; the report states it.",
+            "local_pressure_ra2_checkbox": "AS/NZS 1170.2 Table 5.6 RA2 (Kl 2.0, within a/2 of a roof edge) on purlin checks. Untick only as a deliberate override; the report states it.",
+            "local_pressure_rc1_checkbox": "AS/NZS 1170.2 Table 5.6 RC1 (Kl 3.0, roof corners below 10 degrees pitch) on purlin end-bay checks. Untick only as a deliberate override; the report states it.",
+            "local_pressure_rc2_checkbox": "AS/NZS 1170.2 Table 5.6 RC2 (Kl 3.0, ridge at 10 degrees pitch and over) on purlin end-bay checks. Untick only as a deliberate override; the report states it.",
             "purlin_span_type_combo": "Purlin support arrangement used to select capacity data from the adopted manufacturer tables.",
             "wall_girt_span_type_combo": "Wall-girt support arrangement used for manufacturer-table selection.",
             "g_load_input": "Main-roof permanent area load in kPa. Downward loading is handled internally.",

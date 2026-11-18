@@ -99,15 +99,15 @@ def roof_arrows(nodes, case, scale):
 def roof_cpi_arrows(nodes, line_kn_m):
     arrows = []
     for n1, n2 in zip(nodes[:-1], nodes[1:]):
-        total_n = line_kn_m * math.hypot((n2.x - n1.x) / 1000, (n2.y - n1.y) / 1000) * 1000.0
+        intensity_n_m = line_kn_m * 1000.0
         nx, ny = roof_outward_normal(n1, n2)
-        arrows.append(((n1.x + n2.x) / 2, (n1.y + n2.y) / 2 + 800, total_n * nx, total_n * ny))
+        arrows.append(((n1.x + n2.x) / 2, (n1.y + n2.y) / 2 + 800, intensity_n_m * nx, intensity_n_m * ny))
     return arrows
 
 
 def column_arrows(base, top, signed_kn_m):
-    total_n = signed_kn_m * abs(top.y - base.y) / 1000.0 * 1000.0
-    return [(base.x + (top.x - base.x) * t, base.y + (top.y - base.y) * t, total_n / 5, 0.0)
+    intensity_n_m = signed_kn_m * 1000.0
+    return [(base.x + (top.x - base.x) * t, base.y + (top.y - base.y) * t, intensity_n_m, 0.0)
             for t in ((i + 0.5) / 5 for i in range(5))]
 
 

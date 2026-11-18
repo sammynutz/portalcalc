@@ -185,6 +185,8 @@ class PresetsMixin:
                 "bottom_chord": self.top_profile_combo.currentText(),
                 "purlin_span_type": self.purlin_span_type_combo.currentText(),
                 "extra_purlin_rows": int(getattr(self, "extra_purlin_rows", 0)),
+                **({"optimiser_purlin_rows": int(self.optimiser_purlin_rows)}
+                   if int(getattr(self, "optimiser_purlin_rows", 0) or 0) > 0 else {}),
                 "wall_girt_span_type": self.wall_girt_span_type_combo.currentText(),
                 "webs_posts": self.web_profile_combo.currentText(),
                 "left_canopy_top_chord": self.left_canopy_top_profile_combo.currentText(),
@@ -317,6 +319,10 @@ class PresetsMixin:
                 "single_wind_case": self.wind_case_combo.currentText(),
                 "building_length_m": self.building_length_input.text(),
                 "additional_pressure_factor": self.wind_reduction_input.text(),
+                # Saved only when a region is off, so existing presets are unchanged.
+                **({"local_pressure_regions": {region: region in self.local_pressure_regions_from_ui()
+                                               for region, _ in self.LOCAL_PRESSURE_CHECKBOXES}}
+                   if self.local_pressure_regions_off() else {}),
             },
             "display": {
                 "diagram_view": self.result_combo.currentText(),
@@ -341,6 +347,13 @@ class PresetsMixin:
                 "auto_web_profile_assignments": self.auto_web_profile_assignments,
                 "auto_web_joint_doubler_sides": self.auto_web_joint_doubler_sides,
             })
+        elif (getattr(self, "_panel_count_override", None) is not None
+              and self.frame_system_combo.currentText() == "Truss"
+              and int(self._panel_count_override) != getattr(self, "_default_main_panel_count", None)):
+            # A main truss panel count held for this design (chosen by Optimise or
+            # Check panels) other than the geometry's default: saved so the design
+            # reopens with the same truss. The calculation service reads the same field.
+            data["calculation_service"] = {"main_truss_panel_count": int(self._panel_count_override)}
         return data
 
     def set_combo_text_if_present(self, combo, value):
@@ -422,6 +435,7 @@ class PresetsMixin:
         self._suppress_panel_topology_search = bool(self.future_canopy_design)
         if not self.future_canopy_design:
             self._panel_count_override = None
+            self._held_main_panel_count = self._held_main_panel_key = None
         previous_defer_solve = getattr(self, "_defer_generate_and_solve", False)
         self._defer_generate_and_solve = True
         self._deferred_generate_and_solve = False
@@ -581,6 +595,11 @@ class PresetsMixin:
             self.extra_purlin_rows = max(0, int(sections.get("extra_purlin_rows", getattr(self, "extra_purlin_rows", 0))))
         except (TypeError, ValueError):
             self.extra_purlin_rows = 0
+        try:
+            added = int(sections.get("optimiser_purlin_rows", 0) or 0)
+        except (TypeError, ValueError):
+            added = 0
+        self.optimiser_purlin_rows = min(max(added, 0), self.extra_purlin_rows)
         self.update_extra_purlin_rows_label()
         self.set_combo_text_if_present(self.wall_girt_span_type_combo, sections.get("wall_girt_span_type"))
         self.set_combo_text_if_present(self.web_profile_combo, sections.get("webs_posts"))
@@ -772,6 +791,11 @@ class PresetsMixin:
         self.building_length_input.setText(str(wind.get("building_length_m", self.building_length_input.text())))
         self.apply_bays_from_preset(geometry, loads, wind)
         self.wind_reduction_input.setText(str(wind.get("additional_pressure_factor", self.wind_reduction_input.text())))
+        # Presets without the key have every region on.
+        regions = wind.get("local_pressure_regions") or {}
+        for region, name in self.LOCAL_PRESSURE_CHECKBOXES:
+            if getattr(self, name, None) is not None:
+                getattr(self, name).setChecked(bool(regions.get(region, True)))
         self.update_derived_frame_type_label()
 
         display = data.get("display", {})
@@ -816,6 +840,17 @@ class PresetsMixin:
             self.auto_web_assignment_basis = {
                 group: self.web_assignment_basis_signature(group) for group in selections["assignments"]
             }
+        else:
+            saved_count = (data.get("calculation_service") or {}).get("main_truss_panel_count")
+            if saved_count is not None and self.frame_system_combo.currentText() == "Truss":
+                # Hold the saved panel count while the inputs are unchanged, as
+                # after Optimise or Check panels (generate_and_solve's topology cache).
+                self._panel_count_override = int(saved_count)
+                self._panel_topology_cache_signature = self.panel_topology_input_signature()
+                self._panel_topology_cache_count = int(saved_count)
+                # A saved count is a chosen one (only counts other than the default are saved).
+                self._held_main_panel_count = int(saved_count)
+                self._held_main_panel_key = self.held_panel_count_key()
         del preset_signal_blockers
         self._defer_generate_and_solve = previous_defer_solve
         if not previous_defer_solve:

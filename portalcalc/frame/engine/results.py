@@ -863,6 +863,43 @@ class ResultsMixin:
             "component": "Ws",
         }
 
+    def purlin_end_zone_lines(self, end_zone, purlin_check):
+        """Section-checks text for the gable-end local pressure end zones (purlins/roof.py)."""
+        span_type = purlin_check.get("span_type", "")
+        name = lambda section: self.metroll_section_display(section, span_type)
+        lines = ["", "PURLIN END ZONES - GABLE-END LOCAL PRESSURE (PRELIMINARY)",
+                 f"Status: {end_zone.get('status', 'NOT CHECKED')}"
+                 + (f" - {end_zone['message']}" if end_zone.get("message") else ""),
+                 f"Table 5.6 regions applied: {', '.join(end_zone.get('regions', [])) or 'none'}; "
+                 "RA1 a x a, RA2 a/2 x a/2, RC1 a/2 x a/2 at the corners (CSB local pressure calculator basis).",
+                 end_zone.get("basis", "")]
+        labels = {"field": "Field rows (RA1/RA2 at the gable ends)", "corner": "Corner rows (RC1/RC2 at the corners)"}
+        for key, zone in (end_zone.get("zones") or {}).items():
+            rows = ", ".join(f"{count} {kind}" for kind, count in (zone.get("rows_by_2d_zone") or {}).items())
+            governing = zone.get("governing") or {}
+            change = "; ".join(f"{name(base)} -> {name(end)}" for base, end in (zone.get("end_sections") or {}).items()
+                               if end != base)
+            lines.append(f"{labels.get(key, key)}: {zone.get('rows', 0)} rows ({rows}); plain UC "
+                         f"{zone.get('base_ratio', 0.0):.3f}; adopted UC {zone.get('ratio', 0.0):.3f} ({zone.get('status')})")
+            if zone.get("end_bays"):
+                lines.append(f"  End zone: {zone['end_bays']} bay(s) at each end, {zone['end_length_mm'] / 1000:.2f} m "
+                             f"in total per row: {change or 'no change'}; +{zone.get('extra_kg', 0.0):.0f} kg")
+            if governing.get("case"):
+                lines.append(f"  Governing: {governing['case']}, bay {governing.get('bay', 0) + 1}, "
+                             f"row {governing.get('row_x_mm', 0.0) / 1000:.2f} m from the left eave")
+            infill = zone.get("infill")
+            if infill:
+                lines.append(f"  Corner infills: {infill['per_corner']} per corner over {infill['bays']} end bay(s), "
+                             f"single span, {name(infill['section']) if infill.get('section') else '-'}; UC "
+                             f"{infill.get('ratio', 0.0):.3f} ({infill.get('status')}); {infill.get('kg', 0.0):.0f} kg")
+        comparison = (purlin_check.get("profile_selection") or {}).get("end_zone_comparison") or []
+        if len(comparison) > 1:
+            lines.append("Profile comparison including end zones:")
+            for row in comparison:
+                lines.append(f"- {row['profile']}: {row['base_kg']:.0f} kg + end zones {row['end_zone_extra_kg']:.0f} kg "
+                             f"= {row['total_kg']:.0f} kg ({row['status']})")
+        return lines
+
     def update_section_checks_text(
         self,
         left_column_profile,
@@ -1465,6 +1502,14 @@ class ResultsMixin:
                 f"Local wind ULS up/down {purlin_check['local_wind_upward_kpa']:.3f}/{purlin_check['local_wind_downward_kpa']:.3f} kPa, Ws up/down {purlin_check['local_wind_service_upward_kpa']:.3f}/{purlin_check['local_wind_service_downward_kpa']:.3f} kPa",
                 f"Local inward ULS basis: max(1.2G+1.5Q = {purlin_check['inward_gravity_uls_kpa']:.3f} kPa, 1.2G+Wd = {purlin_check['local_inward_wind_uls_kpa']:.3f} kPa)",
             ])
+            end_zone = purlin_check.get("end_zone")
+            if end_zone:
+                lines.extend(self.purlin_end_zone_lines(end_zone, purlin_check))
+            if purlin_check.get("local_pressure_regions_off"):
+                lines.append(
+                    "USER OVERRIDE: AS/NZS 1170.2 Table 5.6 local pressure regions switched off for all purlin checks "
+                    f"(main roof, canopy edge purlins, 3D end patches): {', '.join(purlin_check['local_pressure_regions_off'])}. "
+                    "This is not the Standard's basis.")
             if local_match.get("status") == "OK":
                 lines.extend([
                     f"Local matched section: "
@@ -1725,7 +1770,7 @@ class ResultsMixin:
                     f"{s['side'].lower()} wall {s['wall_mm']:.0f} mm, roof {s['roof_mm']:.0f} mm" for s in strips))
         if truss_external_depth is not None and truss_centreline_depth is not None:
             results.append(
-                f"Truss depth: {truss_external_depth:.1f} mm outside-to-outside "
+                f"Truss depth: {truss_external_depth:.1f} mm outside-to-outside, square to the chords "
                 f"({truss_centreline_depth:.1f} mm chord centreline depth)"
             )
         if left_canopy_length > 0.0 or right_canopy_length > 0.0:

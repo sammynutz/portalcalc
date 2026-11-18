@@ -541,6 +541,8 @@ def apply_crane_actions(structure, nodes, crane_portal, crane_position, servicea
     column centreline (+X on the left column, -X on the right), so it carries
     an eccentric moment.
     """
+    from portalcalc.loads import PointLoadArrow  # local: loads.py imports this module
+
     actions, _ = crane_column_actions(crane_portal, crane_position, serviceability, g_factor)
     arrows = []
     for side in ("left", "right"):
@@ -551,8 +553,8 @@ def apply_crane_actions(structure, nodes, crane_portal, crane_position, servicea
         if abs(vertical_n) > 1e-9:
             structure.add_load(node.uy, -vertical_n)
             structure.add_load(node.rz, eccentricity_mm * -vertical_n)
-            arrows.append((node.x + eccentricity_mm, node.y, 0.0, -vertical_n))
+            arrows.append(PointLoadArrow(node.x + eccentricity_mm, node.y, 0.0, -vertical_n))
         if abs(lateral_n) > 1e-9:
             structure.add_load(node.ux, lateral_n)
-            arrows.append((node.x, node.y, lateral_n, 0.0))
+            arrows.append(PointLoadArrow(node.x, node.y, lateral_n, 0.0))
     return arrows

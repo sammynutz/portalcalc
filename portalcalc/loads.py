@@ -9,7 +9,29 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 
-LoadArrow = Tuple[float, float, float, float]  # x, y, fx, fy in model units / N
+# Load diagram arrows: (x, y, fx, fy) with x, y in mm. Line loads (the usual
+# case) carry their intensity in N/m, so the diagram reads kN/m. Concentrated
+# forces (crane wheels, storage rail reactions, lumped eave-strip resultants)
+# are built with PointLoadArrow, whose fx, fy are in N and read as kN.
+LoadArrow = Tuple[float, float, float, float]
+
+
+class PointLoadArrow(tuple):
+    """A load arrow that is a concentrated force (N), not a line load (N/m)."""
+
+    unit = "kN"
+
+    def __new__(cls, x, y, fx, fy):
+        return super().__new__(cls, (x, y, fx, fy))
+
+    def __reduce__(self):
+        return (PointLoadArrow, tuple(self))
+
+
+def arrow_unit(arrow) -> str:
+    return getattr(arrow, "unit", "kN/m")
+
+
 STEEL_DENSITY_KG_M3 = 7850.0
 GRAVITY_M_S2 = 9.81
 
@@ -395,7 +417,8 @@ def apply_roof_vertical_loads_in_zones(
             structure.add_load(n2.uy, tributary_load_n / 2)
         mx = loaded_center_sum / loaded_width_mm
         my = (n1.y + n2.y) / 2
-        load_arrows.append((mx, my + 800, 0, tributary_load_n))
+        # Display intensity: kN/m of plan width, carried as N/m.
+        load_arrows.append((mx, my + 800, 0, roof_load_kn_per_m * 1000.0))
     return load_arrows
 
 
@@ -425,7 +448,7 @@ def apply_wall_horizontal_loads(structure, base_node, top_node, wall_load_kn_per
         # Plot-only collectors intentionally receive arrows without analysis loads.
         structure.add_load(base_node.ux, total_load_n / 2)
         structure.add_load(top_node.ux, total_load_n / 2)
-    return [(top_node.x, (base_node.y + top_node.y) / 2, total_load_n, 0)]
+    return [(top_node.x, (base_node.y + top_node.y) / 2, wall_load_kn_per_m * 1000.0 * direction, 0)]
 
 
 def apply_structure_self_weight(structure, elements, g_factor: float, steel_density_kg_m3: float = STEEL_DENSITY_KG_M3) -> LoadApplicationResult:
@@ -450,7 +473,9 @@ def apply_structure_self_weight(structure, elements, g_factor: float, steel_dens
 
         mx = (element.start.x + element.end.x) / 2.0
         my = (element.start.y + element.end.y) / 2.0
-        result.arrows.append((mx, my + 450, 0.0, factored_weight_n))
+        if length_mm > 1e-9:
+            # Display intensity: kN/m along the member, carried as N/m.
+            result.arrows.append((mx, my + 450, 0.0, factored_weight_n / (length_mm / 1000.0)))
 
     result.unfactored_self_weight_kn = total_unfactored_n / 1000.0
     result.summary_lines.extend(

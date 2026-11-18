@@ -485,6 +485,9 @@ def prepare_context(window, allow_unconfigured=False):
     return {
         "layout": layout, "nominal_layout": saved.to_dict(), "nominal_geometry": nominal, "portal": portal, "cases": cases,
         'roof_load_basis': roof_load_basis,
+        # Table 5.6 regions the user switched off (purlin checks only); absent when all are on.
+        **({'local_pressure_regions_off': regions_off}
+           if (regions_off := getattr(window, 'local_pressure_regions_off', list)()) else {}),
         'max_braced_bay_spacing':spacing_limit,
         "roof_brace": copy.deepcopy(window.selected_brace_size(window.roof_brace_size_combo)),
         "wall_brace": copy.deepcopy(window.selected_brace_size(window.wall_brace_size_combo)),
@@ -909,6 +912,8 @@ def analyse_context(context, strut_profile, end_post_profile, reuse_cases=None):
         'mullion_basis':copy.deepcopy(context.get('mullion_basis')),
         'global_sls_basis':copy.deepcopy(context.get('global_sls_basis')),
         'roof_load_basis':copy.deepcopy(context.get('roof_load_basis')),
+        **({'local_pressure_regions_off': list(context['local_pressure_regions_off'])}
+           if context.get('local_pressure_regions_off') else {}),
         "schema": "portalcalc.fixed-bracing-analysis.v1", "status": "SOLVED_DEMANDS_ONLY",
         "created_utc": datetime.now(timezone.utc).isoformat(), "elapsed_seconds": time.perf_counter()-start,
         "source_hash": context["source_hash"], "source_preset": context["source_preset"],

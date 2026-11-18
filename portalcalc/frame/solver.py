@@ -4,6 +4,8 @@ import math
 
 import numpy as np
 
+from portalcalc.loads import PointLoadArrow
+
 
 # ==========================================================
 # NODE
@@ -45,6 +47,29 @@ class FrameElement2D:
         self.analysis_i_factor = max(float(analysis_i_factor), 1e-9)
         self.I = profile.I_analysis * self.analysis_i_factor
         self.group = group
+        # Rigid end zones (mm along the element), e.g. a chord's length inside
+        # the column it frames into. Only the length between them bends or
+        # stretches; the nodes stay where they are.
+        self.rigid_start = 0.0
+        self.rigid_end = 0.0
+
+    def set_rigid_ends(self, start_mm=0.0, end_mm=0.0):
+        L = self.length()
+        start_mm, end_mm = max(float(start_mm), 0.0), max(float(end_mm), 0.0)
+        if start_mm + end_mm >= 0.9 * L:
+            raise ValueError(f"Rigid end zones ({start_mm:.0f} + {end_mm:.0f} mm) leave no flexible length "
+                             f"on a {L:.0f} mm member.")
+        self.rigid_start, self.rigid_end = start_mm, end_mm
+
+    def flexible_length(self):
+        return self.length() - self.rigid_start - self.rigid_end
+
+    def rigid_arm_matrix(self):
+        """Local end DOFs at the nodes -> local DOFs at the ends of the flexible length."""
+        H = np.eye(6)
+        H[1, 2] = self.rigid_start
+        H[4, 5] = -self.rigid_end
+        return H
 
     def length(self):
         dx = self.end.x - self.start.x
@@ -64,7 +89,8 @@ class FrameElement2D:
         large share of a 2D solve. The arrays are read-only because they are
         shared between calls.
         """
-        key = (self.start.x, self.start.y, self.end.x, self.end.y, self.E, self.A, self.I)
+        key = (self.start.x, self.start.y, self.end.x, self.end.y, self.E, self.A, self.I,
+               self.rigid_start, self.rigid_end)
         cached = self.__dict__.get("_matrix_cache")
         if cached is None or cached[0] != key:
             transform = self._build_transformation_matrix()
@@ -95,12 +121,12 @@ class FrameElement2D:
         ])
 
     def _build_local_stiffness(self):
-        L = self.length()
+        L = self.flexible_length()
         E = self.E
         A = self.A
         I = self.I
 
-        return np.array([
+        k = np.array([
             [ A*E/L,           0,              0, -A*E/L,           0,              0],
             [ 0,      12*E*I/L**3,   6*E*I/L**2,       0, -12*E*I/L**3,   6*E*I/L**2],
             [ 0,       6*E*I/L**2,     4*E*I/L,       0,  -6*E*I/L**2,     2*E*I/L],
@@ -108,13 +134,23 @@ class FrameElement2D:
             [ 0,     -12*E*I/L**3,  -6*E*I/L**2,       0,  12*E*I/L**3,  -6*E*I/L**2],
             [ 0,       6*E*I/L**2,     2*E*I/L,       0,  -6*E*I/L**2,     4*E*I/L]
         ])
+        if self.rigid_start or self.rigid_end:
+            H = self.rigid_arm_matrix()
+            k = H.T @ k @ H
+        return k
 
     def global_stiffness(self):
         T = self.transformation_matrix()
         return T.T @ self.local_stiffness() @ T
 
     def local_geometric_stiffness(self, axial_tension_n):
-        L = self.length()
+        if self.rigid_start or self.rigid_end:
+            H = self.rigid_arm_matrix()
+            return H.T @ self._geometric_stiffness(axial_tension_n, self.flexible_length()) @ H
+        return self._geometric_stiffness(axial_tension_n, self.length())
+
+    @staticmethod
+    def _geometric_stiffness(axial_tension_n, L):
         if L <= 1e-9 or abs(axial_tension_n) <= 1e-9:
             return np.zeros((6, 6))
         n = axial_tension_n / (30.0 * L)
@@ -157,9 +193,33 @@ class FrameElement2D:
         raise ValueError("Element line load must have two or four components.")
 
     def equivalent_nodal_load_local(self, uniform_local_load=None):
-        """Exact consistent nodal forces/couples for a linear element load."""
+        """Exact consistent nodal forces/couples for a linear element load.
+
+        With rigid end zones, the load on the flexible length is carried to the
+        nodes through the rigid arms, and the load on each rigid zone goes
+        straight to its node as a force and a couple.
+        """
+        if not (self.rigid_start or self.rigid_end):
+            return self._flexible_nodal_load(self.load_components(uniform_local_load), self.length())
         qx1, qy1, qx2, qy2 = self.load_components(uniform_local_load)
-        L = self.length()
+        L, a, b = self.length(), self.rigid_start, self.rigid_end
+        gx, gy = (qx2 - qx1) / L, (qy2 - qy1) / L
+        at = lambda q1, g, x: q1 + g * x  # noqa: E731
+        flexible = (at(qx1, gx, a), at(qy1, gy, a), at(qx1, gx, L - b), at(qy1, gy, L - b))
+        f = self.rigid_arm_matrix().T @ self._flexible_nodal_load(flexible, L - a - b)
+        # Start zone 0..a, couple about the start node.
+        f[0] += a * (qx1 + at(qx1, gx, a)) / 2.0
+        f[1] += a * (qy1 + at(qy1, gy, a)) / 2.0
+        f[2] += qy1 * a**2 / 2.0 + gy * a**3 / 3.0
+        # End zone L-b..L, couple about the end node.
+        f[3] += b * (at(qx1, gx, L - b) + qx2) / 2.0
+        f[4] += b * (at(qy1, gy, L - b) + qy2) / 2.0
+        f[5] += -qy2 * b**2 / 2.0 + gy * b**3 / 3.0
+        return f
+
+    @staticmethod
+    def _flexible_nodal_load(components, L):
+        qx1, qy1, qx2, qy2 = components
         return np.array([
             L * (2.0 * qx1 + qx2) / 6.0,
             L * (7.0 * qy1 + 3.0 * qy2) / 20.0,
@@ -199,7 +259,21 @@ class FrameElement2D:
         """Interpolate displacement, including uniform-load curvature between nodes."""
         t = min(max(float(t), 0.0), 1.0)
         local = self.local_displacements(global_displacements)
-        L = self.length()
+        if self.rigid_start or self.rigid_end:
+            L, a, b = self.length(), self.rigid_start, self.rigid_end
+            x = t * L
+            if x <= a:
+                return local[0], local[1] + local[2] * x
+            if x >= L - b:
+                return local[3], local[4] + local[5] * (x - L)
+            qx1, qy1, qx2, qy2 = self.load_components(uniform_local_load)
+            gx, gy = (qx2 - qx1) / L, (qy2 - qy1) / L
+            flexible_load = (qx1 + gx * a, qy1 + gy * a, qx1 + gx * (L - b), qy1 + gy * (L - b))
+            return self._flexible_displacement(self.rigid_arm_matrix() @ local, (x - a) / (L - a - b),
+                                               L - a - b, flexible_load)
+        return self._flexible_displacement(local, t, self.length(), self.load_components(uniform_local_load))
+
+    def _flexible_displacement(self, local, t, L, load):
         x = t * L
         u = (1.0 - t) * local[0] + t * local[3]
         n1 = 1.0 - 3.0 * t**2 + 2.0 * t**3
@@ -207,7 +281,7 @@ class FrameElement2D:
         n3 = 3.0 * t**2 - 2.0 * t**3
         n4 = L * (-t**2 + t**3)
         v = n1 * local[1] + n2 * local[2] + n3 * local[4] + n4 * local[5]
-        qx1, qy1, qx2, qy2 = self.load_components(uniform_local_load)
+        qx1, qy1, qx2, qy2 = load
         # Particular solution is zero at both ends (and has zero end slopes
         # for bending). Retain the curvature between the FE nodes.
         u += (qx1 * x * (L - x) / 2.0 + (qx2 - qx1) * x * (L**2 - x**2) / (6.0 * L)) / (self.E * self.A)
@@ -331,7 +405,7 @@ def apply_eave_strip_loads(structure, strips, weighted_loads):
             continue
         structure.add_load(node.ux, fx)
         structure.add_load(node.uy, fy)
-        arrows.append((node.x, node.y, fx, fy))
+        arrows.append(PointLoadArrow(node.x, node.y, fx, fy))
     return arrows
 
 

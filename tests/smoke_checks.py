@@ -1294,7 +1294,10 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     assert window.top_profile_combo.currentIndex() == saved_top_index
     top_chord_depth = window.profile_depth_mm(window.selected_profile(window.top_profile_combo))
     bottom_chord_depth = window.profile_depth_mm(window.selected_profile(window.bottom_profile_combo))
-    expected_truss_centreline_depth = float(window.depth_input.text()) - 0.5 * top_chord_depth - 0.5 * bottom_chord_depth
+    # Outside depth square to the chords; the nodes are that far apart / cos(pitch) vertically.
+    expected_truss_centreline_depth = (
+        float(window.depth_input.text()) - 0.5 * top_chord_depth - 0.5 * bottom_chord_depth
+    ) / math.cos(math.radians(float(window.pitch_input.text())))
     main_top_nodes = window.concept_main_top_nodes
     bottom_chord_nodes = {
         node
@@ -1600,6 +1603,9 @@ def run_ui_smoke_checks(quick: bool = False) -> None:
     window.generate_and_solve()
     window.left_canopy_type_combo.setCurrentText("Canopy")
     window.left_canopy_length_input.setText("3")
+    # As the length field's editingFinished does: deep end = 300 mm + roof fall
+    # (outside-to-outside, so the chords still clear each other at the tip).
+    window.update_canopy_depth_from_geometry("left")
     window.left_canopy_eave_height_input.setText("5")
     window.generate_and_solve()
     assert window.left_canopy_deflection_check_label in window.deflection_hover_overlays

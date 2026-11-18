@@ -4,6 +4,39 @@ All notable PortalCalc desktop releases should be recorded here.
 
 ## Unreleased
 
+- **Roof purlins: gable-end local pressure end zones in the 2D design. Changes purlin sections and costs.**
+  - Every roof purlin row is now checked over its actual lapped run (the bay spans and laps) under the AS/NZS 1170.2 Table 5.6 patches at each gable end, as the 3D bracing check already did. Patch sizes follow the CSB Purlin & Girt Loads calculator: RA1 a x a, RA2 a/2 x a/2, RC1 a/2 x a/2 at the corners (RC1 was a long along the purlin in the 3D check; corrected there too). RC2 (pitch 10 degrees and over) is unchanged.
+  - Where a patch fails, the purlins in the first one or two bays at each end are made thicker (same profile, so laps still work), and corner rows may instead get single-span infill purlins in the end bays. The lightest passing arrangement is kept, and the profile choice compares total weight including the end zones.
+  - The costing lists the end-zone lengths and corner infills as their own items; the section checks text has a "PURLIN END ZONES" block.
+  - Job 52195: 200 Z stays; field rows 200 24 in two end bays, corner rows 200 24 in one end bay, +1.64 t. Factory defaults: +192 kg.
+- **Switches for each roof local pressure region (RA1, RA2, RC1, RC2).** In Wind / snow, all on by default. A region switched off is left out of the 2D purlin check, the end zones and the 3D bracing check, and the report states it as a user override of Table 5.6. Saved in the preset only when one is off.
+- **Lapped purlin runs of more than five spans are accepted by the 3D check** (they were refused against the 5-span table reference). When every bracing layout trial stops on the same installed purlin failing in roof bending, Optimise frame + bracing now says so, naming the purlin, its bending ratio and the local pressure region.
+
+- **Regional wind speeds now follow AS/NZS 1170.2:2021. Changes wind results in every region.**
+  - V_R is calculated from the Table 3.1(A) formulas (unrounded) at the AS/NZS 1170.0 Table F2 return period: 100, 500, 1000 or 2500 years for importance levels 1 to 4, and 200 years for importance level 1 in cyclonic regions B2, C and D. Serviceability uses 25 years in every region.
+  - The climate change multiplier Mc (Table 3.3) is applied: 1.05 in B2, C and D, 1.0 elsewhere. It replaces the 2011 Fc/Fd factors, which were folded into the old table.
+  - Region B1, IL2 was 60 m/s; it is now 56.58 m/s (it matches SpaceGass). Serviceability was 37 m/s for every region; B1 is now 39.32 m/s, C 46.62 m/s and D 53.08 m/s (× Mc).
+  - The computation report shows Mc in the design wind speed line.
+- **Optimise trials extra purlin rows on chord-governed trusses.**
+  - When the truss chords limit the design (a chord governs, or a chord needs member-strength doublers), Optimise runs again from the same starting design with one more purlin row per slope, and with two only if one saved money. It keeps the cheapest verified run; the purlins are in the costing. Rows are spread evenly along each slope, as the manual rows are.
+  - The purlins set the top chord's out-of-plane length (and the bottom chord's, at twice the spacing). Factory defaults: one extra row, $35,236 -> $33,945, with 65×3 SHS chords instead of 75×4.
+  - The user's own extra rows are a minimum. Rows Optimise added are saved separately (`sections.optimiser_purlin_rows`) and taken off at the start of the next Optimise, so it decides again; changing the rows by hand makes them all the user's. The purlin rows label shows how many Optimise added.
+  - Optimise takes up to three times as long on buildings where the trial runs. The frame + bracing optimise sizes its frames the same way, so each frame it sizes may carry its own row count into the 3D check.
+
+- **Truss chords are rigid inside the columns. Changes results for every truss frame.**
+  - The top and bottom chords land on the column flanges, so the half column depth between the column centreline node and the flange is now rigid in the analysis (as SpaceGass's rigid member offsets model it). Only the chord beyond the flange bends and stretches; nodes, members, loads and checks are otherwise unchanged, and the chord moment is still reported at the column centreline (the larger value).
+  - Job 26-CSB3287 (30.85 m, 530UB82 columns): right column moment 486.9 -> 489.6 kNm; SpaceGass 512.5. The remaining difference is SpaceGass's 3D bracing (about 8 kNm) and its roof load past the cladding line to a ~0.5 m eave overhang (about 6 kNm).
+  - Rafter frames, internal columns and canopy chords are unchanged.
+
+- **Truss depth is measured square to the chords, and canopy trusses use outside-to-outside depth. Changes results for pitched trusses and canopies.**
+  - Main truss: the outside depth less half of each chord is now the distance square to the chords. On a pitched roof the bottom chord nodes sit that distance ÷ cos(pitch) below the top chord nodes (before: that distance vertically). At 7.5°, a 1500 mm truss with 65 mm chords goes from 1435 to 1447 mm vertically between nodes.
+  - Canopy and lean-to trusses: the depth input was used as the node-to-node depth. It is now outside-to-outside like the main truss. Lean-to (parallel chords): square to the chords. Canopy (sloping top, flat bottom): measured vertically at the deep end.
+  - A canopy or lean-to depth that leaves no room between the chord centrelines is reported as an input error.
+
+- **Frame diagram: hover read-out, and the load diagram reads in kN/m. No change to calculation results.**
+  - Hovering over the 2D diagram shows the value at that point: M, V and N on the force diagrams, dx and dy on the deflected shape, the load on the load diagram, and member or node details on the geometry view.
+  - Load diagram arrows were a mix of units: roof wind was kN/m, but roof dead/live and Cpi were the total on each roof panel, and wall wind was a fifth of the column total. Coincident arrows were then added together. Every line load is now its intensity in kN/m. Point loads (crane wheels, storage rail reactions, eave-strip resultants) stay in kN, are labelled kN, are never added to kN/m arrows, and are scaled separately on the diagram.
+
 - **Source restructure for BOLT. No change to calculation results.**
   - The flat scripts are now the `portalcalc` package, with `tests/`, `docs/` and `tools/` beside it. `main.py` is a small launcher.
   - The 19,000-line main window file is split into a Qt-free frame engine (`portalcalc/frame/engine/`) and desktop UI modules (`portalcalc/desktop/`). The engine reaches the UI only through the hooks in `engine/host.py`.
@@ -29,6 +62,11 @@ All notable PortalCalc desktop releases should be recorded here.
   - Wind pressures now come from the building envelope (cladding width and eave height), as in 2D.
   - The eave strips are carried to the eave nodes as in 2D: the wall strip (node up to the pitching point) for wind, and the wall and roof strips for dead and live load.
   - Factory defaults: 3D and 2D sway now agree within 0.7%. The restraint and transverse SLS regression tests that compare the two pass again.
+- **Changes 2D and 3D results. Roof wind on the eave roof strips.**
+  - The roof strip from the column centreline out to the cladding line carried roof gravity but no roof wind. It now takes the wind too: external pressure (or the free-roof net coefficient), and internal pressure, at the end roof zone's value, applied at the eave node normal to the end roof panel. A side whose canopy or lean-to roof starts at the eave node is unchanged (the attachment carries that roof).
+  - The 3D bracing model applies the same strips, so the two models stay matched.
+  - Typical effect: foundation uplift about 3% higher on a 36 m span; member forces change by under 0.3%. The strip loads are not drawn as load arrows.
+  - Factory defaults Optimise: $35,036 -> $35,216 (310UB32 columns with 65x3 SHS chords, was 250UB25.7 with 75x4 SHS). Left canopy snapshot building: $41,585 -> $41,817.
 - **Optimise frame + bracing together is about three times faster. No change to results.**
   - Factory defaults on a 32-core machine: about 2 minutes, was 6 min 48 s. Best design, bracing frontier, 3D points and every searched pair are identical.
   - The 2D frame is sized for every bracing restraint level at the same time, each in its own worker process (up to 16), instead of one after another on one core. The frame + bracing pair checks run in workers the same way.
@@ -36,6 +74,10 @@ All notable PortalCalc desktop releases should be recorded here.
   - Cancel stops the workers at once (about 0.1 s) instead of waiting for the running sizings.
   - The "frames sized" table in the optimiser report is listed in order of restraint.
   - The packaged-build check now also proves a worker process can run the windowless engine.
+  - Frame + bracing pairs are checked ahead only where the search can use them: none when restraint does not make the frame cheaper, and none for options whose bracing cost plus the least frame cost cannot beat the best total. A 21 m three-sided building: about 135 s, was 190-260 s.
+- **Fixed: a saved design lost its truss panel count.** Optimise and Check panels can choose a main truss panel count other than the default (e.g. 40 instead of 24, which lets lighter chords pass). It was not saved, so the design reopened at the default count and could fail (a 50x3 SHS chord design: 2.26 instead of 0.96). Presets now save the held count (`calculation_service.main_truss_panel_count`, the field the calculation service already reads, only when it differs from the default) and restore it.
+  - A chosen panel count is now kept through input changes (sections, depth, loads...) until the span, roof shape or frame system changes (`hold_main_panel_count`). The default count still follows the truss depth.
+  - Optimise frame + bracing sized the frame for each bracing restraint at the default panel count even when the unrestrained frame used a chosen one, so restrained frames could look dearer than they are (on the 21 m example: $34,452 at 24 panels against $33,842 at 40, so "Restraint does not reduce the frame"). They now keep the chosen count.
 
 - **Changes Optimise results. Matched columns on symmetric buildings, a paired column sway repair and a better depth sweep.**
   - **Matched columns.** On a symmetric building Optimise keeps the left and right columns the same section. Symmetric means a gable roof, the same supports and column length adjustments, the same canopy/lean-to each side (type, size, frame, loads) and internal columns mirrored about mid-span; wind, cladding and openings may differ (`columns_should_match`).

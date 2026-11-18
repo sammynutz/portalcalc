@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 import math
 import numpy as np
 
+from portalcalc.loads import PointLoadArrow
+
 
 @dataclass
 class StorageLoadInputs:
@@ -868,7 +870,7 @@ def apply_storage_loads_to_columns(
     for rail, node, direction, base_y_mm, segments in planned:
         load_n = rail.rail_reaction_kn * factor * 1000.0 * direction
         structure.add_load(node.ux, load_n)
-        arrows.append((node.x, node.y, load_n, 0.0))
+        arrows.append(PointLoadArrow(node.x, node.y, load_n, 0.0))
         if rail.rail_load_type == "centre_point" and rail.direct_column_reaction_kn > 0.0:
             height_mm = rail.tributary_height_m * 1000.0
             direct_load_n = rail.direct_column_reaction_kn * factor * 1000.0 * direction
@@ -877,7 +879,7 @@ def apply_storage_loads_to_columns(
                 qa = q0 * (1.0-(element.start.y-base_y_mm)/height_mm)
                 qb = q0 * (1.0-(element.end.y-base_y_mm)/height_mm)
                 structure.add_linear_global_line_load(element, fx_start=qa, fx_end=qb)
-            arrows.append((node.x, base_y_mm+height_mm/3.0, direct_load_n, 0.0))
+            arrows.append(PointLoadArrow(node.x, base_y_mm+height_mm/3.0, direct_load_n, 0.0))
     return arrows
 
 

@@ -505,8 +505,17 @@ def _optimise(window, *, progress=None):
             floor = frame_of(restrained[-1])
             unrestrained_cost = incumbent.get('frame_cost')
             trusted = floor is None or unrestrained_cost is None or floor['cost'] <= unrestrained_cost+.005
+            # Only the pairs the search can ask for: its stop rule and its bound
+            # (bracing + least frame cost must beat the incumbent; the best total
+            # only falls during the search, so this keeps every pair it checks).
+            least = floor and floor['cost']
+            if not trusted:
+                probe = frame_of(restrained[0])
+                least = None if probe is None or probe['cost'] >= unrestrained_cost-.005 else probe['cost']
             pairs_ahead = {}
             for option in restrained:
+                if least is None or option['bracing_cost']+least >= incumbent['total']:
+                    continue
                 for frame in ((floor,) if trusted else ()) + (frame_of(option),):
                     if frame is not None:
                         pairs_ahead.setdefault((frame['sized_for_kn_mm'], option['option']), (frame, option))
@@ -559,11 +568,12 @@ def _panel_count(window):
 
 def _keep_panel_count(window):
     """Let ordinary solves after the run keep the adopted truss panel count
-    while the inputs are unchanged (as a manually checked panel count is)."""
+    (as a manually checked panel count is; see hold_main_panel_count)."""
     count = _panel_count(window)
     if count is not None and getattr(window, 'frame_system_combo', None) is not None \
             and window.frame_system_combo.currentText() == 'Truss':
         window._panel_count_override = count
+        window.hold_main_panel_count(count)
         window._panel_topology_cache_signature = window.panel_topology_input_signature()
         window._panel_topology_cache_count = count
 

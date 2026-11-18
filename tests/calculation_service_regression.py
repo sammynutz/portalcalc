@@ -39,10 +39,27 @@ BASELINE_INPUT_DIGEST = "d27bc5545310f2dfaa95b316d3e595b28291d737fd535297412eda9
 # autoSize re-baselined 2026-11-14: matched columns on symmetric buildings, the
 # paired column sway repair and a per-depth column step-down in the depth sweep:
 # $35,036 at 1250 mm (250UB25.7 columns, 75x4 SHS chords, 50x2.5 SHS webs), ~50 s.
+# autoSize re-baselined 2026-11-16: roof wind now also acts on the eave roof strips
+# (column centreline to cladding line). $35,216: 310UB32 columns, 65x3 SHS chords,
+# BOTTOM Combined 0.9897. checkSpecified is unchanged.
+# autoSize re-baselined 2026-11-17: regional wind speeds now from AS/NZS 1170.2:2021
+# Table 3.1(A) formulas (Region A IL2 Vr 45 -> 44.98, SLS 37 -> 37.28 m/s).
+# 310UB32 columns, 75x4 SHS chords, 40x2.5 SHS webs, TOP Combined 0.9954.
+# checkSpecified is unchanged.
+# autoSize re-baselined 2026-11-17 again: Optimise's purlin row trial adopts one
+# extra purlin row per slope ($35,236 -> $33,945): 310UB32 columns, 65x3 SHS
+# chords, 50x2 SHS webs at 950 mm, TOP Combined 0.9530. checkSpecified is unchanged.
+# checkSpecified re-baselined 2026-11-17: truss depth is measured square to the
+# chords, so on the 7.5 deg roof the bottom chord nodes sit (D - t/2 - b/2)/cos
+# below the top chord nodes. BOTTOM Doubled chord zone 1.7757 -> 1.7564.
+# autoSize is unchanged.
+# Re-baselined 2026-11-18: truss chords are rigid over the half column depth
+# inside the columns. checkSpecified BOTTOM 1.7564 -> 1.7773 (webs 50x2 ->
+# 40x2 SHS); autoSize keeps its sections, TOP Combined 0.9530 -> 0.9477.
 BASELINE = {
     "checkSpecified": {
         "verified": False,
-        "ratio": 1.7757243784557766,
+        "ratio": 1.7772723529309138,
         "group": "BOTTOM",
         "check": "Doubled chord zone",
         "sections": {
@@ -50,20 +67,20 @@ BASELINE = {
             "right_column": "310 UB 40.4 (40.9 kg/m)",
             "top_chord": "65*3 SHS (5.7 kg/m)",
             "bottom_chord": "65*3 SHS (5.7 kg/m)",
-            "webs_posts": "50*2 SHS (2.9 kg/m)",
+            "webs_posts": "40*2 SHS (2.3 kg/m)",
         },
     },
     "autoSize": {
         "verified": True,
-        "ratio": 0.9785580786202903,
+        "ratio": 0.9477489392148009,
         "group": "TOP",
         "check": "Combined",
         "sections": {
-            "left_column": "250 UB 25.7 (25.7 kg/m)",
-            "right_column": "250 UB 25.7 (25.7 kg/m)",
-            "top_chord": "75*4 SHS (8.5 kg/m)",
-            "bottom_chord": "75*4 SHS (8.5 kg/m)",
-            "webs_posts": "50*2.5 SHS (3.6 kg/m)",
+            "left_column": "310 UB 32.0 (32.0 kg/m)",
+            "right_column": "310 UB 32.0 (32.0 kg/m)",
+            "top_chord": "65*3 SHS (5.7 kg/m)",
+            "bottom_chord": "65*3 SHS (5.7 kg/m)",
+            "webs_posts": "50*2 SHS (2.9 kg/m)",
         },
     },
 }

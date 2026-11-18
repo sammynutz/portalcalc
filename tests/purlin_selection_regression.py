@@ -78,6 +78,67 @@ class RoofIntegrationTests(unittest.TestCase):
         cls.window.close()
         cls.temp.cleanup()
 
+    def test_gable_end_zones_pass_cost_every_metre_and_follow_the_switches(self):
+        from portalcalc.frame.engine import secondary
+        w = self.window
+        def roof_items():
+            return [i for i in w.costing_summary["purlin_items"] if i["label"].startswith("Roof")
+                    and i["label"] != "Roof corner infills"]
+        self.assertTrue(secondary.ROOF_END_ZONES_ACTIVE)
+        try:
+            w.generate_and_solve()
+            end_zone = w.purlin_check["end_zone"]
+            self.assertEqual(end_zone["status"], "OK")
+            for zone in end_zone["zones"].values():
+                self.assertLessEqual(zone["ratio"], 1.0 + 1e-9)
+                self.assertEqual(zone["rows"], sum(zone["rows_by_2d_zone"].values()))
+            rows = len(w.purlin_layout.points)
+            self.assertEqual(sum(z["rows"] for z in end_zone["zones"].values()), rows)
+            # Every roof row is costed over the full length exactly once, base or end zone.
+            length_m = float(w.building_length_input.text())
+            self.assertAlmostEqual(sum(i["total_m"] for i in roof_items()), rows * length_m, places=6)
+            with_zones = sum(i["kg"] for i in w.costing_summary["purlin_items"] if i["label"].startswith("Roof"))
+            for name in ("local_pressure_ra1_checkbox", "local_pressure_ra2_checkbox",
+                         "local_pressure_rc1_checkbox", "local_pressure_rc2_checkbox"):
+                getattr(w, name).setChecked(False)
+            w.generate_and_solve()
+            off = w.purlin_check["end_zone"]
+            self.assertEqual(off["regions"], [])
+            self.assertEqual(off["extra_kg"], 0.0)
+            without = sum(i["kg"] for i in w.costing_summary["purlin_items"] if i["label"].startswith("Roof"))
+            self.assertLessEqual(without, with_zones)
+        finally:
+            for name in ("local_pressure_ra1_checkbox", "local_pressure_ra2_checkbox",
+                         "local_pressure_rc1_checkbox", "local_pressure_rc2_checkbox"):
+                getattr(w, name).setChecked(True)
+        w.generate_and_solve()
+        self.assertEqual(w.purlin_check["end_zone"]["status"], "OK")
+
+    def test_local_pressure_switches_reach_the_purlin_check_and_round_trip(self):
+        import copy
+        w = self.window
+        on = copy.deepcopy(w.collect_preset_data())
+        self.assertNotIn("local_pressure_regions", on["wind"])        # all on: preset unchanged
+        self.assertNotIn("local_pressure_regions_off", w.purlin_check)
+        self.assertGreater(w.purlin_check["local_pressure_factor"], 1.0)
+        try:
+            w.local_pressure_ra1_checkbox.setChecked(False)
+            w.local_pressure_ra2_checkbox.setChecked(False)
+            w.generate_and_solve()
+            self.assertEqual(w.purlin_check["local_pressure_factor"], 1.0)
+            self.assertEqual(w.purlin_check["local_pressure_regions_off"], ["RA1", "RA2"])
+            saved = copy.deepcopy(w.collect_preset_data())
+            self.assertEqual(saved["wind"]["local_pressure_regions"],
+                             {"RA1": False, "RA2": False, "RC1": True, "RC2": True})
+            w.apply_preset_data(on)                                     # a preset without the key: all on
+            self.assertEqual(w.local_pressure_regions_from_ui(), ("RA1", "RA2", "RC1", "RC2"))
+            w.apply_preset_data(saved)
+            self.assertEqual(w.local_pressure_regions_off(), ["RA1", "RA2"])
+        finally:
+            w.apply_preset_data(on)
+            w.generate_and_solve()
+        self.assertNotIn("local_pressure_regions_off", w.purlin_check)
+
     def test_actual_tables_all_span_types_and_zone_capacities(self):
         from portalcalc.loads import BasicRoofLoads
         w = self.window
@@ -97,9 +158,15 @@ class RoofIntegrationTests(unittest.TestCase):
                 generals = w.match_metroll_purlin(span_type, 8000, result["outward_kn_m"], result["inward_strength_kn_m"], result["inward_service_kn_m"], include_candidates=True)["passing_candidates"]
                 locals = w.match_metroll_purlin(span_type, 8000, result["local_outward_kn_m"], result["local_inward_strength_kn_m"], result["local_inward_service_kn_m"], include_candidates=True)["passing_candidates"]
                 selection = result["profile_selection"]
-                minimum = min(selection["general_rows"] * a["area_mm2"] + selection["edge_rows_total"] * b["area_mm2"]
-                              for a, b in itertools.product(generals, locals) if profile_key(a["section"]) == profile_key(b["section"]))
-                self.assertAlmostEqual(selection["weighted_area_mm2"], minimum)
+                def lightest(profile=None):
+                    return min(selection["general_rows"] * a["area_mm2"] + selection["edge_rows_total"] * b["area_mm2"]
+                               for a, b in itertools.product(generals, locals)
+                               if profile_key(a["section"]) == profile_key(b["section"])
+                               and profile in (None, profile_key(a["section"])))
+                # The end zones may move the roof to a heavier-in-plan profile that is lighter
+                # overall; within the chosen profile the two thicknesses are still the lightest.
+                self.assertAlmostEqual(selection["weighted_area_mm2"], lightest(profile_key(normal["section"])))
+                self.assertGreaterEqual(selection["weighted_area_mm2"], lightest() - 1e-9)
                 self.assertNotIn("passing_candidates", normal)
                 self.assertNotIn("passing_candidates", local)
 
@@ -112,7 +179,7 @@ class RoofIntegrationTests(unittest.TestCase):
         self.assertIn("same profile, independently selected thicknesses", report)
         roof_report = report.split("PURLIN CHECK\n", 1)[1].split("WALL GIRT CHECK\n", 1)[0]
         self.assertNotIn("deepest section within 5%", roof_report)
-        items = [item for item in w.costing_summary["purlin_items"] if item["label"].startswith("Roof")]
+        items = [item for item in w.costing_summary["purlin_items"] if item["label"] in ("Roof general", "Roof edge/local")]
         for item in items:
             match = result["match"] if item["label"] == "Roof general" else result["local_match"]
             self.assertEqual(item["section"], match["section"])

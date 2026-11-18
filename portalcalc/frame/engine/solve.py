@@ -17,6 +17,7 @@ from portalcalc.frame.common import (
     internal_column_positions_mm,
     mm_from_metres_text,
     pitch_compensated_gable_top_stations,
+    truss_centreline_vertical_depth,
     PURLIN_DEPTH_DEFAULT_MM,
 )
 from portalcalc.frame.solver import apply_eave_strip_loads, FrameElement2D, Node, Structure2D
@@ -40,6 +41,7 @@ from portalcalc.storage_loads import (
 from portalcalc.wind import (
     action_combination_factors,
     add_roof_panel_pressure,
+    roof_outward_normal,
     apply_roof_cpi_to_top_nodes,
     calculate_wind,
     CPE_CASE_OPTIONS,
@@ -118,6 +120,14 @@ def _wind_interval_load_kn(strips, start_m, end_m, scale):
     return total_kn
 
 
+def _wind_line_at_end(strips, total_m, at_start, scale):
+    """kN/m of the wind strip at the start (s = 0) or end (s = total) of a roof path."""
+    for a, b, q_kn_m in (strips if at_start else reversed(list(strips))):
+        if (a <= 1e-9 < b) if at_start else (a < total_m - 1e-9 <= b + 1e-9):
+            return q_kn_m * scale
+    return 0.0
+
+
 def _cumulative_roof_distances(nodes):
     distances = [0.0]
     for n1, n2 in zip(nodes[:-1], nodes[1:]):
@@ -174,7 +184,7 @@ def _add_vertical_line_load_to_nodes(target_structure, nodes, line_kn_m):
         total_n = line_kn_m * panel_len_m * 1000.0
         target_structure.add_load(n1.uy, total_n / 2.0)
         target_structure.add_load(n2.uy, total_n / 2.0)
-        arrows.append(((n1.x + n2.x) / 2.0, (n1.y + n2.y) / 2.0 + 800.0, 0.0, total_n))
+        arrows.append(((n1.x + n2.x) / 2.0, (n1.y + n2.y) / 2.0 + 800.0, 0.0, line_kn_m * 1000.0))
     return arrows
 
 
@@ -325,7 +335,7 @@ def _add_horizontal_line_load(
         t = (i + 0.5) / count
         x = base.x + (top.x - base.x) * t
         y = base.y + (top.y - base.y) * t
-        arrows.append((x, y, total_n / count, 0.0))
+        arrows.append((x, y, line_kn_m * 1000.0 * direction, 0.0))
     return arrows
 
 
@@ -576,9 +586,35 @@ class SolveMixin:
                 "purlin_mm": purlin, "purlin_source": purlin_source, "top_chord_depth_mm": top_chord_depth_mm,
                 "column_offsets_mm": offsets, "inset_mm": inset, "drop_mm": drop}
 
+    def held_panel_count_key(self):
+        """What a chosen main truss panel count was chosen for: span, roof shape, frame system."""
+        return (self.span_input.text().strip(), self.current_roof_shape(), self.frame_system_combo.currentText())
+
+    def hold_main_panel_count(self, count):
+        """Keep a deliberately chosen main truss panel count (Check panels, Optimise
+        frame + bracing, a saved preset) through later input changes, until the
+        span, roof shape or frame system changes. The geometry's default count
+        is not held, so it keeps following the truss depth."""
+        if count is None or self.frame_system_combo.currentText() != "Truss"                 or int(count) == getattr(self, "_default_main_panel_count", None):
+            self._held_main_panel_count = None
+            self._held_main_panel_key = None
+            return
+        self._held_main_panel_count = int(count)
+        self._held_main_panel_key = self.held_panel_count_key()
+
+    def held_main_panel_count(self):
+        """The held panel count, or None (dropped once its span/roof/frame system changes)."""
+        count = getattr(self, "_held_main_panel_count", None)
+        if count is not None and getattr(self, "_held_main_panel_key", None) != self.held_panel_count_key():
+            self._held_main_panel_count = self._held_main_panel_key = None
+            return None
+        return count
+
     def panel_topology_input_signature(self):
         """Stable input signature excluding hidden calculated web outputs."""
         data = copy.deepcopy(self.collect_preset_data())
+        if isinstance(data, dict) and not data.get("future_canopy_design"):
+            data.pop("calculation_service", None)   # the held panel count is the output, not an input
         sections = data.get("sections", {}) if isinstance(data, dict) else {}
         for key in ("webs_posts", "left_canopy_webs_posts", "right_canopy_webs_posts"):
             sections.pop(key, None)
@@ -689,6 +725,7 @@ class SolveMixin:
 
             self._panel_topology_cache_signature = signature or self.panel_topology_input_signature()
             self._panel_topology_cache_count = chosen["panel_count"]
+            self.hold_main_panel_count(chosen["panel_count"])
             saving = base_result["cost"] - chosen["cost"]
             if chosen["panel_count"] == current_count:
                 report = (
@@ -779,7 +816,9 @@ class SolveMixin:
         if cache_matches:
             self._panel_count_override = int(self._panel_topology_cache_count)
         elif allow_topology_search:
-            self._panel_count_override = None
+            # Inputs changed: a chosen panel count is kept (hold_main_panel_count);
+            # otherwise the geometry's default count is used.
+            self._panel_count_override = self.held_main_panel_count()
             self.panel_topology_search_report = ""
 
         self._generate_and_solve_once()
@@ -972,6 +1011,12 @@ class SolveMixin:
         right_lean_column_profile = self.selected_profile(self.right_lean_column_profile_combo)
         top_chord_depth = self.profile_depth_mm(top_profile)
         bottom_chord_depth = self.profile_depth_mm(bottom_profile)
+
+        def canopy_centreline_vertical_depth(outside_depth, side_pitch, is_lean_to, side_top, side_bottom):
+            return truss_centreline_vertical_depth(
+                outside_depth, side_pitch, self.profile_depth_mm(side_top), self.profile_depth_mm(side_bottom),
+                parallel=is_lean_to)
+
         truss_centreline_depth = depth if is_rafter else depth - 0.5 * top_chord_depth - 0.5 * bottom_chord_depth
         if not is_rafter and truss_centreline_depth <= 0.0:
             self.results_box.setText(
@@ -984,6 +1029,26 @@ class SolveMixin:
         right_has_lean_to = right_has_canopy and right_canopy_type == "Lean-to"
         left_canopy_is_rafter = left_has_canopy and self.canopy_side_is_rafter("left")
         right_canopy_is_rafter = right_has_canopy and self.canopy_side_is_rafter("right")
+        # Canopy truss depths are outside-to-outside: the chord centrelines must
+        # still clear the roof fall (canopy) or each other (lean-to).
+        for side_label, addition_type, length_mm, pitch_deg, deep_depth_mm, side_is_rafter, side_top, side_bottom in [
+            ("Left", left_canopy_type, left_canopy_length, left_canopy_pitch, left_canopy_shallow_depth,
+             left_canopy_is_rafter, left_canopy_top_profile, left_canopy_bottom_profile),
+            ("Right", right_canopy_type, right_canopy_length, right_canopy_pitch, right_canopy_shallow_depth,
+             right_canopy_is_rafter, right_canopy_top_profile, right_canopy_bottom_profile),
+        ]:
+            if length_mm <= 0.0 or side_is_rafter:
+                continue
+            is_lean = str(addition_type).lower().startswith("lean")
+            centreline = canopy_centreline_vertical_depth(deep_depth_mm, pitch_deg, is_lean, side_top, side_bottom)
+            fall = 0.0 if is_lean else abs(math.tan(math.radians(pitch_deg)) * length_mm)
+            if centreline <= fall:
+                self.results_box.setText(
+                    f"Input error: {side_label.lower()} {'lean-to' if is_lean else 'canopy'} truss depth "
+                    f"({deep_depth_mm:.0f} mm outside-to-outside) leaves no depth between the chord centrelines"
+                    + (f" over the {fall:.0f} mm roof level difference." if fall > 0.0 else ".")
+                )
+                return
         left_lean_outer_wall_clad = left_lean_outer_wall_clad and left_has_lean_to
         right_lean_outer_wall_clad = right_lean_outer_wall_clad and right_has_lean_to
         left_lean_wall_states = {key: bool(value) and left_has_lean_to for key, value in left_lean_wall_states.items()}
@@ -1030,6 +1095,8 @@ class SolveMixin:
                     panels_per_side += 1
                 panels_per_side = max(2, panels_per_side)
                 num_panels = panels_per_side * 2
+            # The geometry's own count: a preset saves a held count only when it differs.
+            self._default_main_panel_count = num_panels
             panel_override = getattr(self, "_panel_count_override", None)
             if panel_override is not None:
                 try:
@@ -1044,11 +1111,14 @@ class SolveMixin:
         panel = span / num_panels
         panel_widths = [panel] * num_panels
         top_panel_stations = [panel * index for index in range(num_panels + 1)]
-        web_angle = 0.0 if is_rafter else math.degrees(math.atan(truss_centreline_depth / panel))
+        # Truss depth is measured square to the (parallel) chords. The bottom
+        # chord nodes sit this far below the top chord nodes, vertically.
+        truss_vertical_depth = 0.0 if is_rafter else truss_centreline_depth / math.cos(math.radians(pitch))
+        web_angle = 0.0 if is_rafter else math.degrees(math.atan(truss_vertical_depth / panel))
         if not is_rafter and roof_shape == "Gable":
-            top_panel_stations = pitch_compensated_gable_top_stations(span, truss_centreline_depth, pitch, num_panels)
+            top_panel_stations = pitch_compensated_gable_top_stations(span, truss_vertical_depth, pitch, num_panels)
             roof_slope_tan = math.tan(math.radians(pitch))
-            web_angle = math.degrees(math.atan(truss_centreline_depth / (panel * (1.0 + roof_slope_tan ** 2))))
+            web_angle = math.degrees(math.atan(truss_vertical_depth / (panel * (1.0 + roof_slope_tan ** 2))))
 
         self.panel_label.setText(f"{panel:.0f} mm")
         self.web_angle_label.setText(f"{web_angle:.1f}°")
@@ -1078,7 +1148,7 @@ class SolveMixin:
                                           top_chord_depth, early_purlin_check, early_girt_check)
         frame_eave = node_basis["node_mm"]
         self.eave_node_basis_record = node_basis
-        if frame_eave <= 0.0 or (not is_rafter and frame_eave - truss_centreline_depth <= 0.0):
+        if frame_eave <= 0.0 or (not is_rafter and frame_eave - truss_vertical_depth <= 0.0):
             self.results_box.setText(
                 f"Input error: the top chord node ({frame_eave:.0f} mm, from the {eave:.0f} mm eave pitching point) "
                 "leaves no column below the truss.")
@@ -1111,7 +1181,7 @@ class SolveMixin:
                 local_x = panel_stations[index]
                 x = left_column_offset + local_x
                 roof_y = roof_line_y(local_x, frame_eave)
-                node = Node(node_id, x, roof_y - truss_centreline_depth)
+                node = Node(node_id, x, roof_y - truss_vertical_depth)
                 structure.add_node(node)
                 bottom_nodes.append(node)
                 node_id += 1
@@ -1373,12 +1443,15 @@ class SolveMixin:
             pitch_drop = math.tan(math.radians(side_pitch))
             outer_top_y = anchor_top.y - pitch_drop * length_mm
             is_lean_to = str(canopy_type).lower().startswith("lean")
+            side_outside_depth = side_depth
+            side_depth = canopy_centreline_vertical_depth(
+                side_depth, side_pitch, is_lean_to, side_top_profile, side_bottom_profile)
             if is_lean_to:
                 bottom_y = anchor_top.y - side_depth
             else:
                 bottom_y = max(anchor_top.y, outer_top_y) - side_depth
             target_canopy_web_angle_deg = 50.0
-            target_canopy_panel = max(side_depth, 50.0) / math.tan(math.radians(target_canopy_web_angle_deg))
+            target_canopy_panel = max(side_outside_depth, 50.0) / math.tan(math.radians(target_canopy_web_angle_deg))
             canopy_panels = max(4, round(length_mm / max(target_canopy_panel, 1.0)))
             if canopy_panels % 2 != 0:
                 canopy_panels += 1
@@ -1461,6 +1534,32 @@ class SolveMixin:
         if not is_rafter:
             for i in range(len(bottom_chord_nodes) - 1):
                 add_element(bottom_chord_nodes[i], bottom_chord_nodes[i + 1], "BOTTOM", bottom_profile)
+
+            # The chords land on the column flanges: model the half column depth
+            # between the column centreline node and the flange as rigid
+            # (as SpaceGass's rigid member offsets do). Horizontal arm = D/2.
+            column_arms = {
+                (round(node.x, 6), round(node.y, 6)): self.column_half_width_for_span_offset(profile)
+                for node, profile in (
+                    (top_nodes[0], left_column_profile),
+                    (left_column_bottom_chord_node, left_column_profile),
+                    (top_nodes[-1], right_column_profile),
+                    (right_column_bottom_chord_node, right_column_profile),
+                )
+            }
+
+            def column_arm(node):
+                return column_arms.get((round(node.x, 6), round(node.y, 6)), 0.0)
+
+            for element in structure.elements:
+                if element.group not in ("TOP", "BOTTOM"):
+                    continue
+                along = element.length() / max(abs(element.end.x - element.start.x), 1e-9)
+                limit = 0.45 * element.length()
+                start_arm = min(column_arm(element.start) * along, limit)
+                end_arm = min(column_arm(element.end) * along, limit)
+                if start_arm or end_arm:
+                    element.set_rigid_ends(start_arm, end_arm)
 
             def warren_web_top_node_for_bottom_x(x):
                 for i, (b1, b2) in enumerate(zip(main_truss_panel_bottom_nodes[:-1], main_truss_panel_bottom_nodes[1:])):
@@ -1881,6 +1980,35 @@ class SolveMixin:
                 return "RIGHT_CANOPY_TOP"
             return None
 
+        def eave_roof_strip_has_canopy(strip):
+            """A canopy/lean-to roof starting at the eave node carries that roof (as apply_eave_strip_loads)."""
+            group = f"{strip['side']}_CANOPY_TOP"
+            return any(element.group == group and any(abs(node.x - strip["x"]) < 1e-6 and abs(node.y - strip["y"]) < 1e-6
+                                                       for node in (element.start, element.end))
+                       for element in structure.elements)
+
+        def apply_roof_eave_strip_wind(target_structure, nodes, start_kn_m, end_kn_m):
+            """Roof wind on the eave strips: the roof from the column centreline out
+            to the cladding line, which the eave strips already carry for roof
+            gravity (apply_eave_strip_loads). Applied at the eave node, normal to
+            the end roof panel, at that panel's wind line load (kN/m, positive
+            outward). Only where the path ends at a main-roof eave node. Not drawn
+            as load arrows (the single-load views show no eave strips)."""
+            if len(nodes) < 2:
+                return
+            for strip in eave_strips:
+                at_start = strip["side"] == "LEFT"
+                end, inner = (nodes[0], nodes[1]) if at_start else (nodes[-1], nodes[-2])
+                line_kn_m = start_kn_m if at_start else end_kn_m
+                if (strip["roof_mm"] <= 1e-9 or not line_kn_m or abs(end.x - strip["x"]) > 1e-6
+                        or abs(end.y - strip["y"]) > 1e-6 or eave_roof_strip_has_canopy(strip)):
+                    continue
+                total_n = line_kn_m * strip["roof_mm"]   # kN/m x mm = N
+                nx, ny = roof_outward_normal(inner, end)
+                if abs(nx) > 0.0:
+                    target_structure.add_load(end.ux, total_n * nx)
+                target_structure.add_load(end.uy, total_n * ny)
+
         def apply_roof_wind_strips_to_nodes(target_structure, nodes, strips, wind_result, wind_pressure):
             scale = wind_pressure_scale(wind_result, wind_pressure)
             distances = _cumulative_roof_distances(nodes)
@@ -1908,6 +2036,9 @@ class SolveMixin:
                 display_n_per_m = (total_kn / panel_len) * 1000.0
                 arrows.append(((n1.x + n2.x) / 2.0, (n1.y + n2.y) / 2.0 + 800.0,
                                display_n_per_m * nx, display_n_per_m * ny))
+            apply_roof_eave_strip_wind(target_structure, nodes,
+                                       _wind_line_at_end(strips, distances[-1], True, scale),
+                                       _wind_line_at_end(strips, distances[-1], False, scale))
             return arrows
 
         def canopy_wind_model(side_key):
@@ -1973,14 +2104,19 @@ class SolveMixin:
         def apply_main_roof_free_roof_cpn(target_structure, wind_result, cpe_case, wind_pressure):
             scale = wind_pressure_scale(wind_result, wind_pressure)
             arrows = []
+            lines = []
             for n1, n2 in zip(top_nodes[:-1], top_nodes[1:]):
                 mid_x = (n1.x + n2.x) / 2.0
                 values = main_roof_free_roof_values(wind_result, mid_x, cpe_case)
                 if values is None:
+                    lines.append(0.0)
                     continue
                 _, frame_cpn = values
                 line_kn_m = frame_cpn * wind_result.wu_kn_m2 * scale * wind_result.inputs.bay_size_m
+                lines.append(line_kn_m)
                 arrows.extend(_add_normal_line_load_to_nodes(target_structure, [n1, n2], line_kn_m))
+            if lines:
+                apply_roof_eave_strip_wind(target_structure, top_nodes, lines[0], lines[-1])
             return arrows
 
         def apply_canopy_wind_cpe(target_structure, wind_result, cpe_case, wind_pressure):
@@ -2476,6 +2612,10 @@ class SolveMixin:
                         wind_pressure,
                     )
                 )
+                # The same line load as apply_roof_cpi_to_top_nodes, on the eave strips.
+                cpi_line_kn_m = (main_cpi * wind_result.wu_kn_m2 * wind_pressure_scale(wind_result, wind_pressure)
+                                 * internal_pressure_factor(wind_result, main_cpi) * wind_result.inputs.bay_size_m)
+                apply_roof_eave_strip_wind(target_structure, top_nodes, cpi_line_kn_m, cpi_line_kn_m)
             for side_key, canopy_nodes in [
                 ("left", left_canopy_top_nodes),
                 ("right", right_canopy_top_nodes),
@@ -2694,7 +2834,9 @@ class SolveMixin:
                     panel_len_m = math.hypot((n2.x - n1.x) / 1000, (n2.y - n1.y) / 1000)
                     total_n = line_kn_m * panel_len_m * 1000.0
                     nx, ny = add_roof_panel_pressure(target_structure, n1, n2, total_n)
-                    arrows.append(((n1.x + n2.x) / 2, (n1.y + n2.y) / 2 + 800, total_n * nx, total_n * ny))
+                    arrows.append(((n1.x + n2.x) / 2, (n1.y + n2.y) / 2 + 800,
+                                   line_kn_m * 1000.0 * nx, line_kn_m * 1000.0 * ny))
+                apply_roof_eave_strip_wind(target_structure, top_nodes, line_kn_m, line_kn_m)
             for side, line in case.canopy_cpi_kn_m.get(combination.cpi_case, {}).items():
                 nodes, group = canopy_members[side]
                 if len(nodes) >= 2:

@@ -131,6 +131,9 @@ def result_summary(result):
                             for c in run.get('cases',[]) if c.get('loads',{}).get('local_pressure')})
     if local_regions:
         lines.append('Purlin roof-bending checks include Table 5.6 end patches: '+', '.join(local_regions)+'. Applied bracing wind loads are unchanged.')
+    if result.get('local_pressure_regions_off'):
+        headline.append('USER OVERRIDE: Table 5.6 local pressure regions switched off for purlin checks: '
+                        +', '.join(result['local_pressure_regions_off'])+'. Not the AS/NZS 1170.2 basis.')
     return {'text': '\n'.join(headline+lines), 'headline': '\n'.join(headline), 'detail': '\n'.join(lines),
             'movement_text': movement, 'member_counts': counts,
             'failed_members': failed, 'wall_panel_counts': faces, 'retained_inputs': retained}
@@ -241,7 +244,23 @@ def stop_for_strut(initial_result, current_result, assembly, failures):
     primary = primary or max((r for r in rows if r["ratio"] is not None), key=lambda r:r["ratio"], default={})
     reason = primary.get("mode", "No candidate satisfies the current capacity/stiffness constraints")
     force = primary.get("axial_kn", primary.get("tension_kn"))
-    if "tension rating required" in reason.lower():
+    # The installed roof purlin overstressed by roof bending alone: every strut
+    # option keeps it, so no added member or brace change can pass this check.
+    bending = max((r for r in rows if r.get("beam_role") == "roof" and (r.get("reference_envelope_ratio") or 0.) > 1),
+                  key=lambda r: r["reference_envelope_ratio"], default=None)
+    constraint = None
+    if bending is not None:
+        constraint = "installed_purlin_bending"
+        target, column = "purlin", 7
+        local = bending.get("governing_local_pressure") or {}
+        patch = (f", {local['region']} end-zone local pressure Kl {local['kl']:g}" if local.get("region") else "")
+        title = (f"the installed {bending['section']} roof purlin is overstressed in roof bending alone "
+                 f"(bending UC {bending['reference_envelope_ratio']:.3f}; {bending.get('governing_beam_case', bending['case'])}{patch})")
+        action = ("No added strut, purlin or brace change can relieve this: every strut option keeps the installed purlin "
+                  "carrying its roof load. A heavier installed purlin is needed on this roof line. The 2D purlin selection "
+                  "and this 3D check treat end-zone local pressure differently; review the purlin for this case.")
+        suffix = ""
+    elif "tension rating required" in reason.lower():
         target, column = "purlin", 3
         title = "purlin tensile capacity Nt / source is missing or does not match"
         action = "Components / ratings > Purlin axial ratings: select Calculated member capacity, or enter valid Declared Nt kN and its source for the current basis."
@@ -253,10 +272,13 @@ def stop_for_strut(initial_result, current_result, assembly, failures):
         target, column = "purlin", 7
         title = reason
         action = "Review the member's case checks and rejected alternatives below; revise the applicable ratings, arrangement or layout."
-    if primary.get("ratio") is not None and primary["ratio"] > 1:
-        title += f" (UC {primary['ratio']:.3f})"
-    suffix = f" ({abs(force):.3f} kN {'tension' if force >= 0 else 'compression'})" if force is not None else ""
-    diagnostic = {"status": "STOPPED_NO_ADOPTION", "member": identifier, "location": label,
+    if constraint is None:
+        if primary.get("ratio") is not None and primary["ratio"] > 1:
+            title += f" (UC {primary['ratio']:.3f})"
+        suffix = f" ({abs(force):.3f} kN {'tension' if force >= 0 else 'compression'})" if force is not None else ""
+    diagnostic = {"status": "STOPPED_NO_ADOPTION", "member": identifier, "location": label, "constraint": constraint,
+                  "bending_ratio": bending["reference_envelope_ratio"] if bending else None,
+                  "local_pressure_region": ((bending or {}).get("governing_local_pressure") or {}).get("region"),
                   "section": original.get("section", assembly.name), "reason": title,
                   "screening_section": evaluation.get("section", assembly.name),
                   "case": primary.get("case", "-"), "axial_kn": force, "action": action,

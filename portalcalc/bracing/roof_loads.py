@@ -76,8 +76,7 @@ def apply_eave_strips(structure, eave_strips, walls_only=False):
     already on the column top and the eave end of the roof are extended over
     them (frame.solver.apply_eave_strip_loads).
 
-    ``walls_only`` is for wind: the 2D frame applies roof wind as point loads,
-    which its strips do not extend, so only the wall strip applies.
+    ``walls_only`` extends only the column (wall) loads.
     """
     if not eave_strips:
         return
@@ -296,7 +295,8 @@ def building_roof_cases(base_cases, portal, geometry, wind_inputs, source, snow_
                             structure.add_uniform_global_line_load(e,-side_line,0.)
                         elif abs(x-tops[-1].x)<1. and wind_inputs.right_wall_clad:
                             structure.add_uniform_global_line_load(e,side_line,0.)
-                apply_eave_strips(structure,eave_strips,walls_only=True)
+                # Wall and roof wind on the eave strips, as the 2D frame applies them.
+                apply_eave_strips(structure,eave_strips)
                 normal.append(_snapshot(structure))
             for gf in ((.9,1.2) if base['level']=='ULS' else (0.,1.)):
                 case = copy.deepcopy(base)

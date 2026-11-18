@@ -5,6 +5,7 @@ import re
 from dataclasses import replace
 
 from portalcalc.frame.sections import PurlinLayout
+from portalcalc.purlins import tables as purlin_tables
 from portalcalc.wind import (
     action_combination_factors,
     active_cpi_for_case,
@@ -14,10 +15,18 @@ from portalcalc.wind import (
     external_pressure_factor,
     internal_pressure_factor,
     local_pressure_dimension_a,
+    local_pressure_region_enabled,
     open_canopy_cpi,
+    ROOF_LOCAL_PRESSURE_REGIONS,
     roof_local_pressure_factor,
     wind_pressure_scale,
 )
+
+
+# Step 3 of docs/SECONDARY_MEMBERS_PLAN.md: gable-end purlin end zones (thicker
+# end-bay gauges and corner infills). On since 2026-11-18; the per-region local
+# pressure switches in the wind inputs still turn individual patches off.
+ROOF_END_ZONES_ACTIVE = True
 
 
 class SecondarySteelMixin:
@@ -45,13 +54,12 @@ class SecondarySteelMixin:
             return f"{text} ({rows} {suffix}{extra})"
         return text
 
+    # Capacity-table helpers live in purlins/tables.py; these keep the old names.
     def bridging_row_count(self, label):
-        match = re.search(r"B(\d+)", str(label or "").upper())
-        return int(match.group(1)) if match else 0
+        return purlin_tables.bridging_row_count(label)
 
     def purlin_depth_from_section(self, section):
-        numbers = [float(value) for value in re.findall(r"\d+", section or "")]
-        return numbers[0] if numbers else 0.0
+        return purlin_tables.section_depth_mm(section)
 
     @staticmethod
     def metroll_section_display(section, span_type):
@@ -63,55 +71,13 @@ class SecondarySteelMixin:
         return re.sub(r"^(?:C\s*/\s*Z|C|Z)\s*", f"{prefix} ", text, flags=re.IGNORECASE).strip()
 
     def recommended_purlin_bridging_spacing_mm(self, section):
-        depth = self.purlin_depth_from_section(section)
-        if depth <= 0.0:
-            return 0.0
-        return 3000.0 if depth <= 150.0 else 4000.0
+        return purlin_tables.recommended_bridging_spacing_mm(section)
 
     def minimum_purlin_bridging_rows(self, section, span_mm):
-        max_spacing = self.recommended_purlin_bridging_spacing_mm(section)
-        if max_spacing <= 0.0 or span_mm <= 0.0:
-            return 0
-        return max(0, math.ceil(span_mm / max_spacing) - 1)
+        return purlin_tables.minimum_bridging_rows(section, span_mm)
 
     def bridged_strength_capacity(self, row, section, span_mm, demand_kn_m):
-        values = row.get("strength_by_bridging_kn_m") or {}
-        if not values:
-            label = row.get("strength_bridging", "-")
-            capacity = row.get("strength_capacity_kn_m", 0.0)
-            rows = self.bridging_row_count(label)
-            max_spacing = self.recommended_purlin_bridging_spacing_mm(section)
-            return {
-                "capacity": capacity,
-                "label": label,
-                "rows": rows,
-                "minimum_rows": self.minimum_purlin_bridging_rows(section, span_mm),
-                "max_spacing_mm": max_spacing,
-                "max_bay_mm": max_spacing * (rows + 1) if max_spacing > 0.0 else 0.0,
-            }
-        minimum_rows = self.minimum_purlin_bridging_rows(section, span_mm)
-        options = [
-            (self.bridging_row_count(label), label, capacity)
-            for label, capacity in values.items()
-            if self.bridging_row_count(label) >= minimum_rows
-        ]
-        if not options:
-            options = [
-                (self.bridging_row_count(label), label, capacity)
-                for label, capacity in values.items()
-            ]
-        options.sort(key=lambda item: (item[0], item[1]))
-        passing = [item for item in options if demand_kn_m <= item[2] + 1e-9]
-        rows, label, capacity = passing[0] if passing else max(options, key=lambda item: item[2])
-        max_spacing = self.recommended_purlin_bridging_spacing_mm(section)
-        return {
-            "capacity": capacity,
-            "label": label,
-            "rows": rows,
-            "minimum_rows": minimum_rows,
-            "max_spacing_mm": max_spacing,
-            "max_bay_mm": max_spacing * (rows + 1) if max_spacing > 0.0 else 0.0,
-        }
+        return purlin_tables.bridged_strength_capacity(row, section, span_mm, demand_kn_m)
 
     def actual_wall_girt_spacing_mm(self, eave_height_mm, wind_region, bottom_girt_height_mm=300.0):
         max_spacing = self.wall_girt_spacing_mm(wind_region)
@@ -131,6 +97,8 @@ class SecondarySteelMixin:
 
     def adjust_extra_purlin_rows(self, delta):
         self.extra_purlin_rows = max(0, int(getattr(self, "extra_purlin_rows", 0)) + int(delta))
+        # A manual change makes every extra row the user's own minimum.
+        self.optimiser_purlin_rows = 0
         self.update_extra_purlin_rows_label()
         self.generate_and_solve()
 
@@ -138,7 +106,11 @@ class SecondarySteelMixin:
         if not getattr(self, "extra_purlin_rows_label", None):
             return
         rows = int(getattr(self, "extra_purlin_rows", 0))
-        self.extra_purlin_rows_label.setText(f"Manual extra roof purlin rows per slope: {rows}")
+        added = min(int(getattr(self, "optimiser_purlin_rows", 0) or 0), rows)
+        text = f"Extra roof purlin rows per slope: {rows}"
+        if added:
+            text += f" ({added} added by Optimise)"
+        self.extra_purlin_rows_label.setText(text)
         if getattr(self, "remove_purlin_row_button", None):
             self.remove_purlin_row_button.setEnabled(rows > 0)
 
@@ -226,72 +198,13 @@ class SecondarySteelMixin:
         return PurlinLayout(unique_points, max(spacings or [mid_limit]), end_limit, mid_limit)
 
     def purlin_capacity_row(self, table, section, span_mm):
-        for profile in table.get("profiles", []):
-            if profile.get("section") != section:
-                continue
-            rows = profile.get("rows", [])
-            if not rows:
-                return None
-            if span_mm <= rows[0].get("span_mm", 0.0):
-                return dict(rows[0])
-            if span_mm > rows[-1].get("span_mm", 0.0) + 1e-9:
-                return None
-            for lower, upper in zip(rows[:-1], rows[1:]):
-                lower_span = lower.get("span_mm", 0.0)
-                upper_span = upper.get("span_mm", 0.0)
-                if lower_span <= span_mm <= upper_span + 1e-9:
-                    if abs(upper_span - lower_span) <= 1e-9:
-                        return dict(upper)
-                    ratio = (span_mm - lower_span) / (upper_span - lower_span)
-                    result = {"span_mm": span_mm, "interpolated": abs(span_mm - lower_span) > 1e-9 and abs(span_mm - upper_span) > 1e-9}
-                    for key, lower_value in lower.items():
-                        if key == "span_mm":
-                            continue
-                        upper_value = upper.get(key)
-                        if isinstance(lower_value, (int, float)) and isinstance(upper_value, (int, float)):
-                            result[key] = lower_value + (upper_value - lower_value) * ratio
-                        elif key == "strength_by_bridging_kn_m" and isinstance(lower_value, dict) and isinstance(upper_value, dict):
-                            values = {}
-                            for bridge_key in sorted(set(lower_value).intersection(upper_value)):
-                                values[bridge_key] = lower_value[bridge_key] + (upper_value[bridge_key] - lower_value[bridge_key]) * ratio
-                            if values:
-                                result[key] = values
-                                result["strength_bridging"] = max(values, key=values.get)
-                    return result
-        return None
+        return purlin_tables.capacity_row(table, section, span_mm)
 
     def metroll_section_area_mm2(self, section):
-        areas = {
-            "C/Z 150 12": 354.0,
-            "C/Z 150 15": 442.0,
-            "C/Z 150 19": 561.0,
-            "C/Z 150 24": 708.0,
-            "C/Z 200 12": 444.0,
-            "C/Z 200 15": 555.0,
-            "C/Z 200 19": 713.0,
-            "C/Z 200 24": 900.0,
-            "C/Z 250 15": 638.0,
-            "C/Z 250 19": 808.0,
-            "C/Z 250 24": 1020.0,
-            "C/Z 300 19": 998.0,
-            "C/Z 300 24": 1260.0,
-            "C/Z 300 30": 1575.0,
-            "C/Z 350 19": 1207.0,
-            "C/Z 350 24": 1524.0,
-            "C/Z 350 30": 1905.0,
-        }
-        if section in areas:
-            return areas[section]
-        numbers = [float(value) for value in re.findall(r"\d+", section or "")]
-        if len(numbers) >= 2:
-            return numbers[0] * numbers[1] / 10.0
-        return float("inf")
+        return purlin_tables.section_area_mm2(section)
 
     def metroll_section_weight_kg_m(self, section):
-        area = self.metroll_section_area_mm2(section)
-        if not math.isfinite(area):
-            return 0.0
-        return area * 1e-6 * 7850.0
+        return purlin_tables.section_weight_kg_m(section)
 
     def purlin_design_pressures(self, wind_inputs, tributary_area_m2=None, edge_zone=None, return_info=False, wind_pressure="ultimate",
                                 underside_cpi=None):
@@ -394,130 +307,8 @@ class SecondarySteelMixin:
         return max_outward_kpa, max_inward_kpa, max_inward_service_kpa
 
     def match_metroll_purlin(self, span_type, span_mm, outward_kn_m, inward_strength_kn_m, inward_service_kn_m, *, include_candidates=False):
-        if not self.metroll_tables:
-            return {"status": "NOT CHECKED", "message": "Metroll capacity table cache not found."}
-        table_ids = {
-            "Single span": ("1A", "1B"),
-            "Double span": ("2A", "2B"),
-            "Continuous lapped": ("5A", "5B"),
-        }.get(span_type)
-        if table_ids is None:
-            return {"status": "NOT CHECKED", "message": f"Unsupported purlin span type: {span_type}"}
-        outward_table = self.metroll_tables["tables"].get(table_ids[0])
-        inward_table = self.metroll_tables["tables"].get(table_ids[1])
-        if not outward_table or not inward_table:
-            return {"status": "NOT CHECKED", "message": f"Missing Metroll tables {table_ids[0]} / {table_ids[1]}."}
-        first_profile = outward_table["profiles"][0]
-        last_span = first_profile["rows"][-1]["span_mm"] if first_profile.get("rows") else 0.0
-        if span_mm > last_span:
-            return {"status": "NOT OK", "message": f"Bay span {span_mm:.0f} mm exceeds table maximum {last_span:.0f} mm."}
-
-        passing = []
-        candidates = []
-        for outward_profile in outward_table.get("profiles", []):
-            section = outward_profile.get("section")
-            outward_row = self.purlin_capacity_row(outward_table, section, span_mm)
-            inward_row = self.purlin_capacity_row(inward_table, section, span_mm)
-            if not outward_row or not inward_row:
-                continue
-            outward_choice = self.bridged_strength_capacity(outward_row, section, span_mm, outward_kn_m)
-            inward_choice = self.bridged_strength_capacity(inward_row, section, span_mm, inward_strength_kn_m)
-            outward_capacity = outward_choice["capacity"]
-            inward_strength_capacity = inward_choice["capacity"]
-            inward_service_capacity = inward_row["service_l150_capacity_kn_m"]
-            outward_bridging = outward_choice["label"]
-            inward_bridging = inward_choice["label"]
-            bridging_rows = max(outward_choice["rows"], inward_choice["rows"])
-            minimum_bridging_rows = max(outward_choice["minimum_rows"], inward_choice["minimum_rows"])
-            max_bridging_spacing_mm = max(outward_choice["max_spacing_mm"], inward_choice["max_spacing_mm"])
-            max_bridged_bay_mm = max_bridging_spacing_mm * (bridging_rows + 1) if max_bridging_spacing_mm > 0.0 else 0.0
-            capped_by_double = False
-            if span_type == "Single span":
-                double_outward_row = self.purlin_capacity_row(self.metroll_tables["tables"].get("2A", {}), section, span_mm)
-                double_inward_row = self.purlin_capacity_row(self.metroll_tables["tables"].get("2B", {}), section, span_mm)
-                if double_outward_row:
-                    double_outward_choice = self.bridged_strength_capacity(double_outward_row, section, span_mm, outward_kn_m)
-                    capped_by_double = capped_by_double or double_outward_choice["capacity"] < outward_capacity
-                    if double_outward_choice["capacity"] < outward_capacity:
-                        outward_bridging = double_outward_choice["label"]
-                        bridging_rows = max(bridging_rows, double_outward_choice["rows"])
-                    outward_capacity = min(outward_capacity, double_outward_choice["capacity"])
-                if double_inward_row:
-                    double_inward_choice = self.bridged_strength_capacity(double_inward_row, section, span_mm, inward_strength_kn_m)
-                    capped_by_double = capped_by_double or double_inward_choice["capacity"] < inward_strength_capacity
-                    capped_by_double = capped_by_double or double_inward_row["service_l150_capacity_kn_m"] < inward_service_capacity
-                    if double_inward_choice["capacity"] < inward_strength_capacity:
-                        inward_bridging = double_inward_choice["label"]
-                        bridging_rows = max(bridging_rows, double_inward_choice["rows"])
-                    inward_strength_capacity = min(inward_strength_capacity, double_inward_choice["capacity"])
-                    inward_service_capacity = min(inward_service_capacity, double_inward_row["service_l150_capacity_kn_m"])
-                max_bridged_bay_mm = max_bridging_spacing_mm * (bridging_rows + 1) if max_bridging_spacing_mm > 0.0 else 0.0
-            section_numbers = [float(value) for value in re.findall(r"\d+", section or "")]
-            depth_mm = section_numbers[0] if section_numbers else 0.0
-            thickness_tenths_mm = section_numbers[1] if len(section_numbers) > 1 else float("inf")
-            candidate = {
-                "section": section,
-                "area_mm2": self.metroll_section_area_mm2(section),
-                "depth_mm": depth_mm,
-                "thickness_tenths_mm": thickness_tenths_mm,
-                "span_row_mm": outward_row["span_mm"],
-                "outward_capacity_kn_m": outward_capacity,
-                "inward_strength_capacity_kn_m": inward_strength_capacity,
-                "inward_service_capacity_kn_m": inward_service_capacity,
-                "outward_bridging": outward_bridging,
-                "inward_bridging": inward_bridging,
-                "bridging_rows": bridging_rows,
-                "minimum_bridging_rows": minimum_bridging_rows,
-                "max_bridging_spacing_mm": max_bridging_spacing_mm,
-                "max_bridged_bay_mm": max_bridged_bay_mm,
-                "capped_by_double_span": capped_by_double,
-                "outward_ratio": outward_kn_m / outward_capacity if outward_capacity > 1e-12 else float("inf"),
-                "inward_strength_ratio": inward_strength_kn_m / inward_strength_capacity if inward_strength_capacity > 1e-12 else float("inf"),
-                "inward_service_ratio": inward_service_kn_m / inward_service_capacity if inward_service_capacity > 1e-12 else float("inf"),
-            }
-            candidates.append(candidate)
-            if (
-                outward_kn_m <= outward_capacity + 1e-9
-                and inward_strength_kn_m <= inward_strength_capacity + 1e-9
-                and inward_service_kn_m <= inward_service_capacity + 1e-9
-            ):
-                passing.append({
-                    "status": "OK",
-                    "section": section,
-                    "area_mm2": self.metroll_section_area_mm2(section),
-                    "depth_mm": depth_mm,
-                    "thickness_tenths_mm": thickness_tenths_mm,
-                    "span_row_mm": outward_row["span_mm"],
-                    "interpolated": outward_row.get("interpolated", False) or inward_row.get("interpolated", False),
-                    "tables": f"{table_ids[0]} / {table_ids[1]}",
-                    "outward_capacity_kn_m": outward_capacity,
-                    "inward_strength_capacity_kn_m": inward_strength_capacity,
-                    "inward_service_capacity_kn_m": inward_service_capacity,
-                    "outward_bridging": outward_bridging,
-                    "inward_bridging": inward_bridging,
-                    "bridging_rows": bridging_rows,
-                    "minimum_bridging_rows": minimum_bridging_rows,
-                    "max_bridging_spacing_mm": max_bridging_spacing_mm,
-                    "max_bridged_bay_mm": max_bridged_bay_mm,
-                    "capped_by_double_span": capped_by_double,
-                })
-        if passing:
-            lightest_area = min(item["area_mm2"] for item in passing)
-            near_lightest = [
-                item for item in passing
-                if item["area_mm2"] <= lightest_area * 1.05
-            ]
-            selected = dict(min(near_lightest, key=lambda item: (-item["depth_mm"], item["area_mm2"], item["section"])))
-            failed = [
-                item for item in candidates
-                if max(item["outward_ratio"], item["inward_strength_ratio"], item["inward_service_ratio"]) > 1.0
-            ]
-            failed.sort(key=lambda item: max(item["outward_ratio"], item["inward_strength_ratio"], item["inward_service_ratio"]))
-            selected["near_misses"] = failed[:3]
-            if include_candidates:
-                selected["passing_candidates"] = passing
-            return selected
-        return {"status": "NOT OK", "message": "No listed Metroll section satisfies the calculated line loads."}
+        return purlin_tables.match_section(self.metroll_tables, span_type, span_mm, outward_kn_m, inward_strength_kn_m,
+                                           inward_service_kn_m, include_candidates=include_candidates)
 
     def purlin_check_from_inputs(self, purlin_layout, bay_size_m, roof_loads, wind_inputs, span_type):
         if purlin_layout is None or purlin_layout.max_spacing_mm <= 0.0 or bay_size_m <= 0.0:
@@ -563,11 +354,20 @@ class SecondarySteelMixin:
         from portalcalc.frame.purlin_selection import select_roof_purlin_pair
         edge_rows_total = min(len(purlin_layout.points), 2 * edge_rows)
         general_rows = max(len(purlin_layout.points) - edge_rows_total, 0)
-        pair = select_roof_purlin_pair(match.pop("passing_candidates", []), local_match.pop("passing_candidates", []),
-                                      general_rows, edge_rows_total)
+        general_passing = match.pop("passing_candidates", [])
+        edge_passing = local_match.pop("passing_candidates", [])
+        pair = select_roof_purlin_pair(general_passing, edge_passing, general_rows, edge_rows_total)
         selection = {}
+        end_zone = None
         if pair is not None:
             match, local_match, selection = pair
+            # Corner infill purlins sit in the eave strip: the edge-row line loads.
+            uniform = {"spacing_mm": purlin_layout.max_spacing_mm, "outward_kn_m": local_outward_kn_m,
+                       "inward_strength_kn_m": local_inward_strength_kn_m,
+                       "inward_service_kn_m": local_inward_service_kn_m}
+            match, local_match, selection, end_zone = self.roof_purlin_end_zones(
+                purlin_layout, span_mm, span_type, edge_rows, wind_inputs, general_passing, edge_passing,
+                match, local_match, selection, uniform)
         elif match.get("status") == "OK" and local_match.get("status") == "OK":
             match = {"status": "NOT OK", "message": "No common Metroll profile satisfies both roof zones, even with different thicknesses."}
             local_match = dict(match)
@@ -603,7 +403,63 @@ class SecondarySteelMixin:
             "local_inward_wind_uls_kpa": local_inward_wind_uls_kpa,
             "local_match": local_match,
             "profile_selection": selection,
+            **({"end_zone": end_zone} if end_zone is not None else {}),
+            # Only when the user switched a Table 5.6 region off (stated in the report).
+            **({"local_pressure_regions_off": off} if (off := [
+                region for region in ROOF_LOCAL_PRESSURE_REGIONS
+                if not local_pressure_region_enabled(wind_inputs, region)]) else {}),
         }
+
+    def roof_purlin_end_zones(self, purlin_layout, span_mm, span_type, edge_rows, wind_inputs, general_passing,
+                              edge_passing, match, local_match, selection, uniform=None):
+        """Gable-end local pressure on every purlin row along the actual run (purlins/roof.py).
+
+        Tries the passing common profiles in order of weight and keeps the lightest
+        including its end-zone sections; if none passes, keeps the lightest profile
+        with its failing end zone reported. Returns (match, local_match, selection, end_zone).
+        """
+        from portalcalc.bracing.analysis import AnalysisError
+        from portalcalc.purlins.roof import end_zone_design
+        if not ROOF_END_ZONES_ACTIVE:
+            return match, local_match, selection, None
+        bays = [float(b) for b in (self.bay_lengths_mm() or []) if b > 0]
+        alternatives = selection.get("profile_alternatives") or []
+        if not bays or not purlin_layout.points or not self.metroll_tables or not alternatives:
+            return match, local_match, selection, None
+        length_m = sum(bays) / 1000.0
+        checked, best = [], None
+        for option in alternatives:
+            base_kg = option["weight_kg_per_m_building"] * length_m
+            if best is not None and base_kg >= best[0]["total_kg"] - 1e-9:
+                break   # heavier before any end zone: cannot beat the best passing profile
+            try:
+                design = end_zone_design(self.metroll_tables, wind_inputs, purlin_layout.points, bays, span_type,
+                                         edge_rows, option["general_section"], option["edge_section"], span_mm, uniform)
+            except AnalysisError as error:
+                design = {"status": "NOT CHECKED", "message": str(error), "extra_kg": 0.0, "zones": {}}
+            row = {"profile": option["profile"], "general_section": option["general_section"],
+                   "edge_section": option["edge_section"], "base_kg": base_kg, "end_zone_extra_kg": design["extra_kg"],
+                   "total_kg": base_kg + design["extra_kg"], "status": design["status"]}
+            checked.append(row)
+            if design["status"] == "OK" and (best is None or row["total_kg"] < best[0]["total_kg"]):
+                best = (row, option, design)
+        if best is None:
+            # Nothing passes: keep the table-selected profile and report its end zone.
+            design = end_zone_design(self.metroll_tables, wind_inputs, purlin_layout.points, bays, span_type,
+                                     edge_rows, match["section"], local_match["section"], span_mm, uniform) \
+                if checked and checked[0]["status"] != "NOT CHECKED" else {"status": "NOT CHECKED", "zones": {},
+                "message": checked[0].get("message", "") if checked else ""}
+            return match, local_match, {**selection, "end_zone_comparison": checked}, design
+        row, option, design = best
+        if option["profile"] != selection.get("common_profile"):
+            match = dict(next(c for c in general_passing if c["section"] == option["general_section"]))
+            local_match = dict(next(c for c in edge_passing if c["section"] == option["edge_section"]))
+            selection = {**selection, "common_profile": option["profile"],
+                         "weighted_area_mm2": option["weighted_area_mm2"]}
+        selection = {**selection, "end_zone_comparison": checked,
+                     "basis": selection.get("basis", "") + " Includes the gable-end local pressure end zones (thicker "
+                              "end-bay sections where needed) in the weight comparison."}
+        return match, local_match, selection, design
 
     def canopy_purlin_check(self, side, wind_inputs, bay_size_m, canopy_loads, span_type, main_spacing_mm):
         """Open canopy edge purlin (the 3D canopy-edge strut): Metroll bending check.

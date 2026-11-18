@@ -324,6 +324,23 @@ def canopy_depth_mm_from_preset(canopies, side, canopy_type, default_text):
         return str(legacy_depth)
 
 
+def truss_centreline_vertical_depth(outside_depth_mm, pitch_deg, top_chord_mm, bottom_chord_mm, parallel=True):
+    """Vertical gap between chord centreline nodes for an outside-to-outside truss depth.
+
+    Parallel chords (main truss, lean-to): the depth is measured square to the
+    chords, so the centreline depth D - t/2 - b/2 is divided by cos(pitch) to
+    give the vertical offset between nodes.
+
+    Sloping top chord over a flat bottom chord (canopy deep end): the depth is
+    measured vertically at the post, where the top chord's half-depth is t/2
+    over cos(pitch) and the bottom chord's is b/2.
+    """
+    cos_pitch = math.cos(math.radians(pitch_deg))
+    if parallel:
+        return (outside_depth_mm - 0.5 * top_chord_mm - 0.5 * bottom_chord_mm) / cos_pitch
+    return outside_depth_mm - 0.5 * top_chord_mm / cos_pitch - 0.5 * bottom_chord_mm
+
+
 def pitch_compensated_gable_top_stations(span_mm, depth_mm, pitch_deg, num_panels):
     if num_panels < 4 or num_panels % 4 != 0 or span_mm <= 0.0 or depth_mm <= 0.0:
         return [span_mm * index / max(num_panels, 1) for index in range(max(num_panels, 0) + 1)]

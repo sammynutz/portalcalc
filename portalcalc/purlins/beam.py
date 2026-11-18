@@ -54,10 +54,24 @@ def solve_run(spans_mm, roof_i_mm4, added_i_mm4, roof_count=1, added_bays=(),
     Coupling units kN/m per mm relative deflection = N/mm2. Its value applies
     to each added line against the equivalent existing run. Loads enter the
     original roof line, with transfer to the added member through the springs.
+
+    ``roof_i_mm4`` is one I for the run, or one per bay (e.g. a thicker end-bay
+    purlin of the same profile). In a lap the two plies are the adjoining bays'
+    sections; the reported moment and shear are for the bay's own ply, shared
+    in proportion to EI.
     """
     spans = tuple(float(s) for s in spans_mm)
     if not spans or any(not math.isfinite(s) or s <= 0 for s in spans):
         raise AnalysisError("Positive roof-run spans are required")
+    if isinstance(roof_i_mm4, (list, tuple)):
+        if len(roof_i_mm4) != len(spans):
+            raise AnalysisError("Per-bay roof I must give one value per bay")
+        bay_i = tuple(float(v) for v in roof_i_mm4)
+    else:
+        bay_i = (float(roof_i_mm4),)*len(spans)
+    if any(not math.isfinite(v) or v <= 0 for v in bay_i):
+        raise AnalysisError("Positive web-axis I is required for both beam lines")
+    roof_i_mm4 = min(bay_i)   # scalar uses below: validation and the coupling transfer length
     if len(spans) > 20 or not 4 <= divisions <= 48:
         raise AnalysisError("Roof beam model supports 20 bays and 4-48 elements per bay")
     if span_type not in {"single", "double", "continuous_lapped"}:
@@ -139,9 +153,14 @@ def solve_run(spans_mm, roof_i_mm4, added_i_mm4, roof_count=1, added_bays=(),
             factor = roof_count*(2 if lap else 1)
             ids = (*roof_node(a), *roof_node(b))
             extra = (*added_node(a), *added_node(b)) if bay in added else None
+            own = bay_i[bay]
+            other = (bay_i[bay-1] if midpoint < .5 else bay_i[bay+1]) if lap else own
+            # Equal plies keep the original arithmetic exactly; unequal plies share by EI.
+            roof_ei = 200000*own*factor if other == own else 200000*(own+other)*roof_count
+            divisor = factor if other == own else (own+other)*roof_count/own   # run action -> own ply
             elements.append({"bay": bay, "x": offset+a*length, "length": (b-a)*length,
-                             "roof": ids, "added": extra, "roof_plies": factor,
-                             "roof_ei": 200000*roof_i_mm4*factor, "added_ei": 200000*added_i_mm4})
+                             "roof": ids, "added": extra, "roof_plies": factor, "roof_divisor": divisor,
+                             "roof_ei": roof_ei, "added_ei": 200000*added_i_mm4})
         offset += length
     size = len(dofs)
     if size > 1600:
@@ -205,10 +224,11 @@ def solve_run(spans_mm, roof_i_mm4, added_i_mm4, roof_count=1, added_bays=(),
                     if q and 0 < -ends[0]/(q*length) < 1:
                         positions.add(float(-ends[0]/(q*length)))
                     factor = e['roof_plies'] if role=='roof' else 1
+                    divisor = e['roof_divisor'] if role=='roof' else 1
                     for t in sorted(positions):
                         bay[role].append({'x_mm':e['x']+t*length,
-                            'moment_knm':float(ends[1]-ends[0]*length*t-q*length**2*t*t/2)/factor/1e6,
-                            'shear_kn':float(-ends[0]-q*length*t)/factor/1000,
+                            'moment_knm':float(ends[1]-ends[0]*length*t-q*length**2*t*t/2)/divisor/1e6,
+                            'shear_kn':float(-ends[0]-q*length*t)/divisor/1000,
                             'deflection_mm':float(np.polynomial.polynomial.polyval(t,w)),'plies':factor})
                 continue
             length, shape = e["length"], _shape(e["length"])
@@ -237,9 +257,10 @@ def solve_run(spans_mm, roof_i_mm4, added_i_mm4, roof_count=1, added_bays=(),
                 w = sum((s*d for s, d in zip(shape, displacement[list(ids), j])), P([0.]))+particular
                 positions = sorted({0., .25, .5, .75, 1., *_roots(shear), *_roots(q), *_roots(w.deriv())})
                 factor = e["roof_plies"] if role == "roof" else 1
+                divisor = e["roof_divisor"] if role == "roof" else 1
                 for t in positions:
-                    bay[role].append({"x_mm": e["x"]+t*length, "moment_knm": float(moment(t))/factor/1e6,
-                                      "shear_kn": float(shear(t))/factor/1000, "deflection_mm": float(w(t)),
+                    bay[role].append({"x_mm": e["x"]+t*length, "moment_knm": float(moment(t))/divisor/1e6,
+                                      "shear_kn": float(shear(t))/divisor/1000, "deflection_mm": float(w(t)),
                                       "plies": factor})
         for bay in bays:
             for role in ("roof", "added"):

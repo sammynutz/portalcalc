@@ -38,6 +38,8 @@ class StateMixin:
         self.purlin_check = None
         self.canopy_purlin_checks = {}
         self.extra_purlin_rows = 0
+        # How many of extra_purlin_rows Optimise added (the rest are the user's minimum).
+        self.optimiser_purlin_rows = 0
         self.wall_girt_check = None
         self.end_wall_mullion_design = None
         self.end_wall_girt_check = None
@@ -68,6 +70,9 @@ class StateMixin:
         self._panel_count_override = None
         self._panel_topology_cache_signature = None
         self._panel_topology_cache_count = None
+        self._default_main_panel_count = None
+        self._held_main_panel_count = None
+        self._held_main_panel_key = None
         self._suppress_panel_topology_search = False
         self.panel_topology_search_report = ""
         self.active_eave_x_restraint = "None"

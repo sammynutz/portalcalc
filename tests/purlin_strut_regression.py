@@ -377,6 +377,30 @@ class SharedMechanicsTests(unittest.TestCase):
         same = next(c for c in base['cases'] if c['name'] == 'ULS outward')['bays'][1]['roof']
         self.assertLess(short['positive_moment_knm'], same['positive_moment_knm'])
 
+    def test_lapped_run_of_more_than_five_spans_uses_the_five_span_reference(self):
+        """A 7-bay lapped Z run: analysed over 7 spans, 5A/5B reference from 5 spans."""
+        def lapped(bays):
+            assemblies = fixture(active=())
+            template = assemblies[0]
+            data = template.location['purlin']
+            data['axial_rating'] = {'purlin_shape': 'Z', 'beam_lap_ratio': .15}
+            data['beam_inputs'] = {**data['beam_inputs'], 'span_type': 'Continuous lapped'}
+            return [template]*bays
+        with self.assertRaises(AnalysisError):
+            solve_shared(lapped(4), [8000.]*4, 0)
+        five = solve_shared(lapped(5), [8000.]*5, 0)
+        seven = solve_shared(lapped(7), [8000.]*7, 0)
+        for bay in map(str, range(7)):
+            reference = seven['references'][bay]
+            self.assertEqual((reference['reference_span_count'], reference['run_span_count']), (5, 7))
+            for key in ('moment_per_kn_m', 'shear_per_kn_m', 'deflection_per_kn_m'):
+                self.assertAlmostEqual(reference[key], five['references']['0'][key])
+            self.assertEqual(reference['capacity']['tables'], '5A / 5B')
+        c = next(c for c in seven['cases'] if c['name'] == 'ULS outward')
+        self.assertEqual(len(c['bays']), 7)
+        self.assertAlmostEqual(c['applied_load_n'], -7*8000.)
+        self.assertLess(abs(c['applied_load_n']+c['support_reaction_n']), 1e-6)
+
     def test_unsupported_restraint_and_reference_configurations_cannot_pass(self):
         a = fixture()
         a[0].components[-1]['data']['shared_cladding_fixed'] = False

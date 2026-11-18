@@ -809,7 +809,9 @@ def frame_element_property_matrices(element) -> tuple[np.ndarray, np.ndarray]:
     ``element`` is intentionally duck-typed so the numerical module remains
     independent from PortalCalc's UI-owned ``FrameElement2D`` class.
     """
-    length = float(element.length())
+    rigid_start = float(getattr(element, "rigid_start", 0.0) or 0.0)
+    rigid_end = float(getattr(element, "rigid_end", 0.0) or 0.0)
+    length = float(element.length()) - rigid_start - rigid_end  # flexible length
     if length <= _TINY:
         raise ValueError("frame element length must be positive")
     elastic_modulus = float(element.E)
@@ -832,6 +834,13 @@ def frame_element_property_matrices(element) -> tuple[np.ndarray, np.ndarray]:
         [-c1, -c2, c1, -c2],
         [c2, c4, -c2, c3],
     ])
+    if rigid_start or rigid_end:
+        # Rigid end zones (FrameElement2D.rigid_arm_matrix): still linear in A and I.
+        arms = np.eye(6)
+        arms[1, 2] = rigid_start
+        arms[4, 5] = -rigid_end
+        axial_local = arms.T @ axial_local @ arms
+        bending_local = arms.T @ bending_local @ arms
     transform = np.asarray(element.transformation_matrix(), dtype=float)
     return transform.T @ axial_local @ transform, transform.T @ bending_local @ transform
 

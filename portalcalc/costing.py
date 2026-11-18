@@ -242,17 +242,41 @@ def costing_from_structure(self, structure, building_length_m, bay_size_m):
     clad_long_wall_count = sum(bool(enclosure.get(side)) for side in ("left", "right"))
     wall_rows_total = clad_long_wall_count * wall_rows_each_side
 
+    # Gable-end end zones and corner infills (purlins/roof.py): each upgraded
+    # end-zone length is taken off its row's base item and costed at its own section.
+    roof_span_type = (self.purlin_check or {}).get("span_type", "")
+    end_zone = (self.purlin_check or {}).get("end_zone") or {}
+    end_items, upgraded_m = [], {"general": 0.0, "edge": 0.0}
+    if end_zone.get("status") == "OK":
+        for group in (end_zone.get("zones") or {}).values():
+            length_m = float(group.get("end_length_mm", 0.0) or 0.0) / 1000.0
+            for zone_name, rows in (group.get("rows_by_2d_zone") or {}).items():
+                base = (roof_edge if zone_name == "edge" else roof_general).get("section")
+                end = (group.get("end_sections") or {}).get(base, base)
+                if end and base and end != base and length_m > 0.0 and rows > 0:
+                    upgraded_m[zone_name] = upgraded_m.get(zone_name, 0.0) + rows * length_m
+                    end_items.append((f"Roof {'edge/local' if zone_name == 'edge' else 'general'} end zones",
+                                      {"section": end}, rows, length_m, roof_span_type))
+            infill = group.get("infill") or {}
+            if infill.get("status") == "OK" and infill.get("section"):
+                pieces = int(infill.get("count", 0)) * int(infill.get("bays", 0) or 0)
+                total_m = float(infill.get("total_length_mm", 0.0)) / 1000.0
+                if pieces > 0 and total_m > 0.0:
+                    end_items.append(("Roof corner infills", {"section": infill["section"]}, pieces,
+                                      total_m / pieces, "Single span"))
+
     purlin_items = []
-    for label, match, count, length_m, span_type in [
-        ("Roof general", roof_general, roof_general_rows, roof_length_m, (self.purlin_check or {}).get("span_type", "")),
-        ("Roof edge/local", roof_edge, roof_edge_rows_total, roof_length_m, (self.purlin_check or {}).get("span_type", "")),
-        ("Wall girts", wall_match, wall_rows_total, roof_length_m, (self.wall_girt_check or {}).get("span_type", "")),
+    for label, match, count, length_m, span_type, deduct_m in [
+        ("Roof general", roof_general, roof_general_rows, roof_length_m, roof_span_type, upgraded_m["general"]),
+        ("Roof edge/local", roof_edge, roof_edge_rows_total, roof_length_m, roof_span_type, upgraded_m["edge"]),
+        ("Wall girts", wall_match, wall_rows_total, roof_length_m, (self.wall_girt_check or {}).get("span_type", ""), 0.0),
+        *[(*item, 0.0) for item in end_items],
     ]:
         section = match.get("section")
         if not section or count <= 0 or length_m <= 0.0:
             continue
         kg_m = self.metroll_section_weight_kg_m(section)
-        total_m = count * length_m
+        total_m = count * length_m - deduct_m
         lap_factor = 1.15 if span_type == "Continuous lapped" else 1.0
         purlin_items.append({
             "label": label,

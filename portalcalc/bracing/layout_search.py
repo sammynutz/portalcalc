@@ -29,6 +29,25 @@ class LayoutSearchStopped(AnalysisError):
         self.evidence = evidence
 
 
+def _record_error(record, error):
+    record['analysis_error'] = str(error)
+    diagnostic = getattr(error, 'diagnostic', None) or {}
+    if diagnostic.get('constraint'):
+        record.update(stop_constraint=diagnostic['constraint'], stop_location=diagnostic.get('location'))
+
+
+def _common_stop(evidence):
+    """A clearer message when every trial stopped on an installed roof purlin
+    that no layout or strut choice can fix (sizing_diagnostics.stop_for_strut)."""
+    trials = evidence['trials']
+    if not trials or any(t.get('stop_constraint') != 'installed_purlin_bending' for t in trials):
+        return None
+    locations = '; '.join(dict.fromkeys(t['stop_location'] for t in trials if t.get('stop_location')))
+    return (f"Every bracing layout tried ({len(trials)}) stops on the installed roof purlins ({locations}), which are "
+            f"overstressed in roof bending on their own. No bracing layout or added strut can fix this; a heavier "
+            f"installed purlin is needed. Last stop - {trials[-1]['analysis_error']}. Layout and sections unchanged.")
+
+
 def layout_context(context, selected):
     """Keep actual and nominal grids aligned by panel ID, without mutating input."""
     original = context['layout']
@@ -202,7 +221,7 @@ def find_cost_layout(context, selections, candidates, criteria, rates, *, requir
         except LayoutSearchCancelled:
             raise
         except AnalysisError as error:
-            record['analysis_error'] = str(error)
+            _record_error(record, error)
             return None
 
     best, winning_trial, beam = None, None, []
@@ -254,7 +273,7 @@ def find_cost_layout(context, selections, candidates, criteria, rates, *, requir
         evidence['layout_trials'] = len(trials)
         if not trials and evidence['spacing_rejections']:
             raise LayoutSearchStopped(f"Blocked panels prevent a compliant braced bay within every {max_bay_spacing(context)} bays. Review the blocked locations or maximum braced-bay spacing.",evidence)
-        raise LayoutSearchStopped('No passing layout found within the search budget. Review blocked locations, sections and criteria; this is not proof that no feasible layout exists.', evidence)
+        raise LayoutSearchStopped(_common_stop(evidence) or 'No passing layout found within the search budget. Review blocked locations, sections and criteria; this is not proof that no feasible layout exists.', evidence)
 
     # Give two promising starts a bounded neighbourhood budget. Full bay moves
     # can cross a cost/feasibility barrier that single-panel deletions cannot.
@@ -935,11 +954,11 @@ def _find_practical_layout(context, selections, candidates, criteria, rates, req
         except LayoutSearchCancelled:
             raise
         except AnalysisError as error:
-            record['analysis_error'] = str(error)
+            _record_error(record, error)
     evidence.update(layout_trials=len(evidence['trials']), elapsed_seconds=perf_counter()-started)
     if not evidence['trials'] and evidence['spacing_rejections']:
         raise LayoutSearchStopped(f"Blocked panels prevent a compliant braced bay within every {max_bay_spacing(context)} bays. Review the blocked locations or maximum braced-bay spacing. Layout and sections unchanged.",evidence)
-    raise LayoutSearchStopped('No passing practical layout found within the short search. Review blocked paths/ratings or use Detailed cost search for a broader search. Layout and sections unchanged.', evidence)
+    raise LayoutSearchStopped(_common_stop(evidence) or 'No passing practical layout found within the short search. Review blocked paths/ratings or use Detailed cost search for a broader search. Layout and sections unchanged.', evidence)
 
 
 @deferred_transverse_sls(final_context=lambda context, layout: layout_context(context, layout.pinned))

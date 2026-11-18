@@ -7,7 +7,8 @@ AS/NZS 1170.2 design certificate.
 
 Scope in this first version
 ---------------------------
-- Regional ultimate and serviceability wind speed lookup from the spreadsheet.
+- Regional ultimate and serviceability wind speeds from AS/NZS 1170.2:2021
+  Table 3.1(A), with the climate change multiplier Mc from Table 3.3.
 - Direction multiplier lookup from the spreadsheet's direction table.
 - Terrain/height multiplier interpolation from the spreadsheet's Mz,cat table.
 - Basic dynamic pressure calculation: q = 0.5 * rho_air * V^2 / 1000.
@@ -65,21 +66,55 @@ SIDE_WALL_CPE_BANDS = [
 ]
 
 
-# Ultimate regional wind speed table from the spreadsheet.
+# AS/NZS 1170.2:2021 Table 3.1(A) regional wind speeds (Australia):
+# V_R = a - b * R^-0.1, with R the return period in years. Unrounded, as
+# SpaceGass reports them (Region B1, R = 500 gives 56.58 m/s; the table rounds to 57).
+REGIONAL_SPEED_COEFFICIENTS: Dict[str, Tuple[float, float]] = {
+    **{f"A{i}": (67.0, 41.0) for i in range(6)},
+    "B1": (106.0, 92.0),
+    "B2": (106.0, 92.0),
+    "C": (122.0, 104.0),
+    "D": (156.0, 142.0),
+}
+CYCLONIC_REGIONS = frozenset({"B2", "C", "D"})
+
+# AS/NZS 1170.0 Table F2, 50-year design working life: annual probability of
+# exceedance 1/R for wind. Importance level 1 is 1/200 in cyclonic regions.
+ULTIMATE_RETURN_PERIODS: Dict[int, int] = {1: 100, 2: 500, 3: 1000, 4: 2500}
+CYCLONIC_IL1_RETURN_PERIOD = 200
+SERVICEABILITY_RETURN_PERIOD = 25
+
+# AS/NZS 1170.2:2021 Table 3.3 climate change multiplier Mc (replaces the 2011
+# Fc/Fd factors). Applied to the site wind speed, not folded into V_R.
+CLIMATE_CHANGE_MULTIPLIERS: Dict[str, float] = {region: 1.05 for region in CYCLONIC_REGIONS}
+
+
+def regional_wind_speed(region: str, return_period_years: float) -> float:
+    """AS/NZS 1170.2:2021 Table 3.1(A) V_R for an Australian region."""
+    a, b = REGIONAL_SPEED_COEFFICIENTS[region]
+    return a - b * float(return_period_years) ** -0.1
+
+
+def ultimate_return_period(region: str, importance_level: int) -> int:
+    if importance_level == 1 and region in CYCLONIC_REGIONS:
+        return CYCLONIC_IL1_RETURN_PERIOD
+    return ULTIMATE_RETURN_PERIODS[importance_level]
+
+
+def climate_change_multiplier(region: str) -> float:
+    return CLIMATE_CHANGE_MULTIPLIERS.get(region.upper(), 1.0)
+
+
 # Rows are importance levels 1-4; columns are wind regions.
 REGIONAL_WIND_SPEEDS: Dict[int, Dict[str, float]] = {
-    1: {"A0": 41, "A1": 41, "A2": 41, "A3": 41, "A4": 41, "A5": 41, "B1": 48, "B2": 48, "C": 53, "D": 66},
-    2: {"A0": 45, "A1": 45, "A2": 45, "A3": 45, "A4": 45, "A5": 45, "B1": 60, "B2": 60, "C": 69, "D": 88},
-    3: {"A0": 45, "A1": 45, "A2": 45, "A3": 45, "A4": 45, "A5": 45, "B1": 64, "B2": 64, "C": 74, "D": 95},
-    4: {"A0": 48, "A1": 48, "A2": 48, "A3": 48, "A4": 48, "A5": 48, "B1": 69, "B2": 69, "C": 79, "D": 106},
+    level: {region: regional_wind_speed(region, ultimate_return_period(region, level))
+            for region in REGIONAL_SPEED_COEFFICIENTS}
+    for level in ULTIMATE_RETURN_PERIODS
 }
 
-# The spreadsheet uses 37 m/s serviceability wind speed for the A regions in the
-# sample. This table is intentionally conservative/simple for first integration.
-# Expand later if your workbook has separate SLS values for all regions.
 SERVICEABILITY_WIND_SPEEDS: Dict[str, float] = {
-    "A0": 37, "A1": 37, "A2": 37, "A3": 37, "A4": 37, "A5": 37,
-    "B1": 37, "B2": 37, "C": 37, "D": 37,
+    region: regional_wind_speed(region, SERVICEABILITY_RETURN_PERIOD)
+    for region in REGIONAL_SPEED_COEFFICIENTS
 }
 
 # Directional multipliers from the spreadsheet's table. Rows are directions;
@@ -249,6 +284,9 @@ CPI_BY_FRAME_TYPE: Dict[str, Tuple[float, float]] = {
 }
 
 
+ROOF_LOCAL_PRESSURE_REGIONS = ("RA1", "RA2", "RC1", "RC2")
+
+
 @dataclass
 class WindInputs:
     wind_region: str = "A5"
@@ -272,6 +310,9 @@ class WindInputs:
     reduction_factor: float = 1.0
     air_density: float = 1.2
     internal_pressure_mode: str = "Standard"
+    # Table 5.6 roof local pressure regions switched on (purlin checks only;
+    # frame and bracing wind loads never use Kl).
+    local_pressure_regions: Tuple[str, ...] = ("RA1", "RA2", "RC1", "RC2")
 
     def validate(self) -> None:
         region = self.wind_region.upper()
@@ -291,6 +332,9 @@ class WindInputs:
             raise ValueError(f"Unsupported Cpi case: {self.cpi_case}")
         if self.roof_shape not in {"Gable", "Skillion"}:
             raise ValueError("roof_shape must be Gable or Skillion")
+        unknown = set(self.local_pressure_regions) - set(ROOF_LOCAL_PRESSURE_REGIONS)
+        if unknown:
+            raise ValueError(f"Unknown local pressure regions: {sorted(unknown)}")
 
 
 @dataclass
@@ -311,6 +355,7 @@ class WindCalculationResult:
     inputs: WindInputs
     vr_ultimate_m_s: float
     vr_service_m_s: float
+    climate_change_multiplier: float
     direction_multiplier: float
     design_direction_multiplier: float
     h_m: float
@@ -488,7 +533,8 @@ class WindCalculationResult:
             f"B {'clad' if cladding['back'] else 'open'}"
         )
         lines.append(f"Canopies L/R      : {self.inputs.left_canopy_length_m:.3f} / {self.inputs.right_canopy_length_m:.3f} m")
-        lines.append(f"Vr ultimate       : {self.vr_ultimate_m_s:.2f} m/s")
+        lines.append(f"Vr ultimate/SLS   : {self.vr_ultimate_m_s:.2f} / {self.vr_service_m_s:.2f} m/s")
+        lines.append(f"Mc                : {self.climate_change_multiplier:.2f}")
         lines.append(f"Md selected/design: {self.direction_multiplier:.3f} / {self.design_direction_multiplier:.3f}")
         lines.append(f"Mz,cat            : {self.mz_cat:.3f}")
         lines.append(f"Vdes,b            : {self.vdes_b_m_s:.2f} m/s")
@@ -660,17 +706,27 @@ def local_pressure_dimension_a(result_or_inputs) -> float:
     return max(min(0.2 * inputs.building_width_m, 0.2 * inputs.building_length_m, h_m), 0.0)
 
 
+def local_pressure_region_enabled(result_or_inputs, region: str) -> bool:
+    """Whether a Table 5.6 roof local pressure region is switched on (all are by default)."""
+    inputs = getattr(result_or_inputs, "inputs", result_or_inputs)
+    return region in getattr(inputs, "local_pressure_regions", ROOF_LOCAL_PRESSURE_REGIONS)
+
+
 def roof_local_pressure_factor(result, tributary_area_m2: float, proximity_m: float, roof_location: str = "edge") -> float:
-    """Table 5.6 roof local pressure factor for cladding/support checks."""
+    """Table 5.6 roof local pressure factor for cladding/support checks.
+
+    A region switched off in ``WindInputs.local_pressure_regions`` is skipped;
+    the largest factor among the regions still on applies.
+    """
     a_m = local_pressure_dimension_a(result)
     if a_m <= 1e-9:
         return 1.0
     area = max(tributary_area_m2, 0.0)
     proximity = max(proximity_m, 0.0)
     factor = 1.0
-    if area <= a_m * a_m and proximity < a_m:
+    if area <= a_m * a_m and proximity < a_m and local_pressure_region_enabled(result, "RA1"):
         factor = max(factor, 1.5)
-    if area <= 0.25 * a_m * a_m and proximity < 0.5 * a_m:
+    if area <= 0.25 * a_m * a_m and proximity < 0.5 * a_m and local_pressure_region_enabled(result, "RA2"):
         factor = max(factor, 2.0)
     # Corner factors need a two-edge local region. The frame-wide purlin check
     # uses one-span line loads, so it deliberately does not smear RC1/RC2 over
@@ -909,6 +965,7 @@ def calculate_wind(inputs: WindInputs) -> WindCalculationResult:
 
     vr = REGIONAL_WIND_SPEEDS[inputs.importance_level][region]
     vr_sls = SERVICEABILITY_WIND_SPEEDS[region]
+    mc = climate_change_multiplier(region)
     if inputs.orientation == "Any":
         md = max(DIRECTION_MULTIPLIERS[direction][region] for direction in DIRECTION_ORDER)
     else:
@@ -924,9 +981,9 @@ def calculate_wind(inputs: WindInputs) -> WindCalculationResult:
         apex = inputs.eave_height_m + roof_rise * 0.5
     mz = terrain_multiplier(h, inputs.terrain_category)
 
-    vsit = vr * md * mz
-    vdes = vr * m_design * mz
-    vdes_sls = vr_sls * m_design * mz
+    vsit = vr * mc * md * mz
+    vdes = vr * mc * m_design * mz
+    vdes_sls = vr_sls * mc * m_design * mz
 
     wu = inputs.reduction_factor * 0.001 * 0.5 * inputs.air_density * vdes**2
     ws = inputs.reduction_factor * 0.001 * 0.5 * inputs.air_density * vdes_sls**2
@@ -997,6 +1054,7 @@ def calculate_wind(inputs: WindInputs) -> WindCalculationResult:
         inputs=inputs,
         vr_ultimate_m_s=vr,
         vr_service_m_s=vr_sls,
+        climate_change_multiplier=mc,
         direction_multiplier=md,
         design_direction_multiplier=m_design,
         h_m=h,
@@ -1079,7 +1137,7 @@ def apply_roof_cpi_to_top_nodes(structure, top_nodes: Sequence, result: WindCalc
         nx, ny = add_roof_panel_pressure(structure, n1, n2, total_n)
         mx = (n1.x + n2.x) / 2
         my = (n1.y + n2.y) / 2
-        arrows.append((mx, my + 800, total_n * nx, total_n * ny))
+        arrows.append((mx, my + 800, line_kn_m * 1000.0 * nx, line_kn_m * 1000.0 * ny))
     return arrows
 
 

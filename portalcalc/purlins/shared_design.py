@@ -153,8 +153,11 @@ def solve_shared(assemblies, spans, line):
     reference_bay = max(range(len(spans)), key=lambda i: spans[i])
     reference_span = spans[reference_bay]
     lap = float(rating.get('beam_lap_ratio', .15))
-    if kind == 'continuous_lapped' and (len(spans) != 5 or p['shape'] != 'Z' or abs(lap-.15) > 1e-8):
-        raise AnalysisError('The 5A/5B preliminary reference requires five Z spans with 15% laps')
+    # Project-adopted (2026-11-17): a lapped run of more than five spans uses
+    # the five-span 5A/5B reference. The run itself is analysed with its
+    # actual span count; only the reference actions come from five spans.
+    if kind == 'continuous_lapped' and (len(spans) < 5 or p['shape'] != 'Z' or abs(lap-.15) > 1e-8):
+        raise AnalysisError('The 5A/5B preliminary reference requires at least five Z spans with 15% laps')
     additions = {i: [c['data'] for c in a.components if c.get('shared_beam')]
                  for i, a in enumerate(assemblies) if a.arrangement in ARRANGEMENTS}
     for i, parts in additions.items():
@@ -227,7 +230,8 @@ def solve_shared(assemblies, spans, line):
         reference = {'moment_per_kn_m': max(max(b['roof']['positive_moment_knm'], b['roof']['negative_moment_knm']) for b in ref['cases'][0]['bays']),
                      'deflection_per_kn_m': max(b['roof']['deflection_mm'] for b in ref['cases'][0]['bays']),
                      'shear_per_kn_m': max(b['roof']['shear_kn'] for b in ref['cases'][0]['bays']), 'capacity': caps,
-                     'reference_span_mm': reference_span}
+                     'reference_span_mm': reference_span, 'reference_span_count': count,
+                     'run_span_count': len(spans)}
         references[str(i)] = reference
     return {**roof, 'cases': cases, 'line': line, 'added_bays': list(active),
             'existing_count': n,

@@ -123,20 +123,22 @@ def _patch_normal(structure, element, origin, bands, q_width, factor, internal, 
 
 
 def _wall_strip_targets(tops, eave_strips):
-    """Per side: the eave node and the height of wall cladding above it.
+    """Per side: the eave node, the wall cladding height above it and the roof beyond it.
 
-    The eave is the cladding pitching point, above the top chord node, so the
-    wall pressure on that height reaches the frame at the eave node. This is
-    the wall part of the 2D frame's eave strips (frame.solver.apply_eave_strip_loads).
-    The 2D frame applies roof wind as point loads, which its strips do not
-    extend, so there is no roof wind strip here either.
+    The eave is the cladding pitching point, above the top chord node, and the
+    roof runs past the column centreline to the wall cladding line. Wind on
+    both reaches the frame at the eave node, as on the 2D frame's eave strips
+    (frame.solver.apply_eave_strip_loads for the wall, and the 2D roof wind
+    strip at the eave node).
     """
     targets={}
-    nodes=[n for e in tops for n in (e.start,e.end)]
     for strip in eave_strips or ():
-        node=next((n for n in nodes if abs(n.x-strip['x'])<1e-6 and abs(n.y-strip['y'])<1e-6),None)
-        if node is not None and strip['wall_mm']>1e-9:
-            targets[strip['side'].lower()]={'node':node,'wall_mm':float(strip['wall_mm'])}
+        for e in tops:
+            node=next((n for n in (e.start,e.end) if abs(n.x-strip['x'])<1e-6 and abs(n.y-strip['y'])<1e-6),None)
+            if node is not None:
+                targets[strip['side'].lower()]={'node':node,'element':e,'wall_mm':max(float(strip['wall_mm']),0.),
+                                                'roof_mm':max(float(strip.get('roof_mm',0.)),0.)}
+                break
     return targets
 
 
@@ -230,13 +232,37 @@ def side_wind_cases(portal, geometry, inputs, gravity, widths, source=None, eave
                         for e in structure.elements:
                             if 'COLUMN' in e.group.upper() and abs((e.start.x+e.end.x)/2-origin-x)<1.:
                                 structure.add_uniform_global_line_load(e,(-1. if side=='left' else 1.)*outward,0.)
-                        if side in strip_targets:
+                        if side in strip_targets and strip_targets[side]['wall_mm']>1e-9:
                             # Wall cladding above the eave node, to the pitching point.
                             fx=(-1. if side=='left' else 1.)*outward*strip_targets[side]['wall_mm']
                             structure.add_load(strip_targets[side]['node'].ux,fx)
                             strips.append({'side':side,'wall_mm':strip_targets[side]['wall_mm'],'fx_n':fx})
                         walls.append({'face':side+'_wall','cpe':cp,'external_factor':factor,
                                       'net_inward_kpa':q*(cp*factor-cpi*kci)})
+                    for side,target in strip_targets.items():
+                        # Roof beyond the column centreline, to the cladding line, at the
+                        # eave node: the end roof band's pressure, normal to the end panel
+                        # (as 2D). A canopy roof starting at the eave carries its own.
+                        if target['roof_mm']<=1e-9 or any(p['side']==side for p in canopies):
+                            continue
+                        e=target['element'];node=target['node']
+                        xa,xb=e.start.x-origin,e.end.x-origin;dx=xb-xa;dz=e.end.y-e.start.y
+                        sign=1. if dx>=0 else -1.
+                        nx,nz=-sign*dz/e.length(),sign*dx/e.length()
+                        x=node.x-origin
+                        if free_roof:
+                            windward=((xa+xb)/2<=apex_x)!=right
+                            cpn=free_roof_cpn(g.pitch_deg,wind.h_over_d,'windward' if windward else 'leeward','empty',use_max)
+                            outward=-cpn*q*width/1000
+                        else:
+                            cp=next((c for a,b,c in roof_bands if (a<=x<b if side=='left' else a<x<=b)),None)
+                            if cp is None:
+                                continue
+                            outward=q*(-cp*roof_factor+cpi*kci)*width/1000
+                        force=outward*target['roof_mm']
+                        structure.add_load(node.ux,nx*force)
+                        structure.add_load(node.uy,nz*force)
+                        strips.append({'side':side,'roof_mm':target['roof_mm'],'fx_n':nx*force,'fz_n':nz*force})
                     normal.append(_snapshot(structure,equivalents))
                     frame_evidence.append({'index':index,'tributary_width_mm':float(width),
                                            'roof_external_factor':roof_factor,'walls':walls,

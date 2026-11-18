@@ -1,14 +1,38 @@
 """The structure optimiser: depth sweep, physics-screened search and building-load screening."""
 
+import copy
 import math
 import time
 
 from portalcalc.frame.common import MAIN_TRUSS_DEPTH_MIN_RATIO
 from portalcalc.frame.reduced_optimizer import build_screen_from_portalcalc
 
+# Extra purlin rows per slope Optimise tries on a chord-governed design, on top
+# of the user's own rows (auto_size_current_preset). Rows are spread evenly.
+OPTIMISER_PURLIN_ROW_TRIALS = (1, 2)
+CHORD_GROUPS = {"TOP", "BOTTOM"}
+PANEL_TOPOLOGY_STATE = ("_panel_count_override", "_panel_topology_cache_signature", "_panel_topology_cache_count")
+
 
 class OptimiserMixin:
     """Top-level auto-size / optimise entry points."""
+
+    def purlin_row_trial_wanted(self, specs):
+        """True when the main truss chords limit the solved design.
+
+        Either a chord governs the overall check, or a chord has member-strength
+        doublers (not web-joint doublers, which purlin spacing does not affect).
+        """
+        if self.frame_system_combo.currentText() != "Truss":
+            return False
+        _, group, _ = self.auto_size_overall_ratio(specs)
+        if group in CHORD_GROUPS:
+            return True
+        return any(
+            isinstance(zone, dict) and zone.get("group") in CHORD_GROUPS
+            and not zone.get("web_joint_trigger") and not zone.get("auto_web_joint_doubler")
+            for zone in (self.design_envelope_actions or {}).get("doubled_chord_zones", [])
+        )
 
     def optimisation_progress_update(self, step=None, label=None, exact_solves=None, busy=False):
         # A caller running the auto-size inside a larger job (the frame +
@@ -817,10 +841,95 @@ class OptimiserMixin:
 
         With building loads it sizes on the governing combinations and accepts
         only on a check of all of them (_auto_size_with_building_screening).
+
+        Purlin row trial: rows a previous Optimise added are taken off first,
+        so each run starts from the user's own rows (a minimum). If that design
+        is limited by the truss chords (purlin_row_trial_wanted), Optimise runs
+        again from the same starting design with one more purlin row per slope,
+        and with two only if one saved money. Rows are spread evenly along each
+        slope, as the manual rows are. The purlins set the top chord's
+        out-of-plane length (and the bottom chord's, at twice the spacing) and
+        the costing includes them, so the cheapest verified run is adopted.
+        A full run is needed: re-sizing only at the chosen depth missed the
+        saving (21 m factory shed, +1 row: $35,772 -> $33,930).
         """
+        added = int(getattr(self, "optimiser_purlin_rows", 0) or 0)
+        if added:
+            self.extra_purlin_rows = max(0, int(self.extra_purlin_rows) - added)
+            self.optimiser_purlin_rows = 0
+            self.update_extra_purlin_rows_label()
+        user_rows = int(getattr(self, "extra_purlin_rows", 0))
+        start = self._optimise_snapshot()
+        result = self._auto_size_at_current_purlin_rows()
+        best = (result, self._optimise_snapshot(), 0)
+        lines = []
+        if self._optimise_result_ok(result) and self.purlin_row_trial_wanted(self.active_auto_size_group_specs()):
+            lines.append(f"Rows as entered (+0): ${float(result['cost']):,.0f}")
+            for added in OPTIMISER_PURLIN_ROW_TRIALS:
+                self.optimisation_progress_update(
+                    1, f"Purlin rows +{added} per slope: optimising again...", result.get("exact_solves"))
+                self._optimise_restore(start)
+                self.extra_purlin_rows = user_rows + added
+                self.optimiser_purlin_rows = added
+                self.update_extra_purlin_rows_label()
+                trial = self._auto_size_at_current_purlin_rows()
+                if not self._optimise_result_ok(trial):
+                    lines.append(f"Rows +{added}: no verified design")
+                    break
+                lines.append(f"Rows +{added} (spacing {self.purlin_layout.max_spacing_mm:.0f} mm): "
+                             f"${float(trial['cost']):,.0f}")
+                if float(trial["cost"]) >= float(best[0]["cost"]) - 1e-6:
+                    break
+                best = (trial, self._optimise_snapshot(), added)
+            result, snapshot, adopted = best
+            if adopted != self.optimiser_purlin_rows:
+                self._optimise_restore(snapshot)
+            lines.append(f"Adopted: {adopted} purlin row(s) added per slope "
+                         f"(extra rows {user_rows + adopted}, user minimum {user_rows})")
+            self.auto_size_report_text = "\n".join(
+                [self.auto_size_report_text or "", "", "PURLIN ROW TRIAL", *[f"  {line}" for line in lines]]).strip()
+            result = {**result, "report": self.auto_size_report_text, "optimiser_purlin_rows": adopted}
+        if show_completion:
+            verified = bool(result.get("verified"))
+            if result.get("error"):
+                self.notify("critical", "Optimise failed", str(result["error"]))
+            else:
+                self.notify("information" if verified else "warning",
+                            "Optimise" if verified else "Optimisation did not find a passing design",
+                            self.auto_size_report_text)
+        return result
+
+    def _auto_size_at_current_purlin_rows(self):
         if not getattr(self, "building_load_mode", None) or getattr(self, "building_screening_disabled", False):
-            return self.run_physics_structure_optimisation(show_completion=show_completion)
-        return self._auto_size_with_building_screening(show_completion=show_completion)
+            return self.run_physics_structure_optimisation(show_completion=False)
+        return self._auto_size_with_building_screening(show_completion=False)
+
+    @staticmethod
+    def _optimise_result_ok(result):
+        return bool(result) and bool(result.get("verified")) and not result.get("error") \
+            and math.isfinite(float(result.get("cost") or float("inf")))
+
+    def _optimise_snapshot(self):
+        """Everything an Optimise run changes: sections, depths, purlin rows,
+        web assignments, the held panel count and the report."""
+        state = self.auto_size_capture_state(self.active_auto_size_group_specs(), ratio=0.0, cost=0.0)
+        state["panel_topology"] = {key: copy.deepcopy(getattr(self, key, None)) for key in PANEL_TOPOLOGY_STATE}
+        state["report"] = self.auto_size_report_text
+        return state
+
+    def _optimise_restore(self, state):
+        self.auto_size_restore_state(state)
+        for key, value in state["panel_topology"].items():
+            setattr(self, key, copy.deepcopy(value))
+        self.auto_size_report_text = state["report"]
+        previous = (getattr(self, "_preserve_web_assignments_on_solve", False),
+                    getattr(self, "_suppress_panel_topology_search", False))
+        self._preserve_web_assignments_on_solve = bool(state["web_assignments"])
+        self._suppress_panel_topology_search = True
+        try:
+            self.generate_and_solve()
+        finally:
+            self._preserve_web_assignments_on_solve, self._suppress_panel_topology_search = previous
 
     def _auto_size_with_building_screening(self, *, show_completion=True, max_rounds=3):
         """Phase 5: optimise against the governing building combinations, then check all of them.

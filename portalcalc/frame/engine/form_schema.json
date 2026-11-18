@@ -300,7 +300,7 @@
   },
   "extra_purlin_rows_label": {
    "kind": "text",
-   "text": "Manual extra roof purlin rows per slope: 0"
+   "text": "Extra roof purlin rows per slope: 0"
   },
   "factory_defaults_status_label": {
    "kind": "text",
@@ -570,6 +570,22 @@
    "index": 0,
    "items": "options_24",
    "kind": "choice"
+  },
+  "local_pressure_ra1_checkbox": {
+   "checked": true,
+   "kind": "check"
+  },
+  "local_pressure_ra2_checkbox": {
+   "checked": true,
+   "kind": "check"
+  },
+  "local_pressure_rc1_checkbox": {
+   "checked": true,
+   "kind": "check"
+  },
+  "local_pressure_rc2_checkbox": {
+   "checked": true,
+   "kind": "check"
   },
   "longitudinal_bracing_case_label": {
    "kind": "text",

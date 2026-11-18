@@ -2,8 +2,11 @@
 
 import math
 
+import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+
+from portalcalc.loads import arrow_unit
 
 
 # ==========================================================
@@ -12,10 +15,116 @@ from matplotlib.figure import Figure
 
 class PlotCanvas(FigureCanvasQTAgg):
 
+    HOVER_RADIUS_PX = 14
+
     def __init__(self):
         self.fig = Figure(figsize=(12, 8))
         self.ax = self.fig.add_subplot(111)
         super().__init__(self.fig)
+        self._hover_segments = []
+        self._hover_a = None
+        self._hover_b = None
+        self._hover_shown = None
+        self._hover_annot = None
+        self._hover_marker = None
+        self.mpl_connect("motion_notify_event", self._on_hover)
+        self.mpl_connect("axes_leave_event", lambda _event: self._hide_hover())
+        self.mpl_connect("figure_leave_event", lambda _event: self._hide_hover())
+
+    # ------------------------------------------------------------------
+    # Hover read-out. Plot routines register probes: single points (loads,
+    # nodes) or polylines carrying values at each vertex (members, force
+    # diagrams). The cursor snaps to the nearest probe within a few pixels,
+    # values are interpolated along the segment, and a popup shows them.
+    # ------------------------------------------------------------------
+
+    def _add_hover(self, x, y, text):
+        x, y = float(x), float(y)
+        self._hover_segments.append((x, y, x, y, (), (), lambda: text))
+
+    def _add_hover_line(self, points, values, fmt):
+        """points[i] carries the value tuple values[i]; fmt(*interpolated) -> popup text."""
+        for i in range(len(points) - 1):
+            (x1, y1), (x2, y2) = points[i], points[i + 1]
+            self._hover_segments.append(
+                (float(x1), float(y1), float(x2), float(y2), tuple(values[i]), tuple(values[i + 1]), fmt)
+            )
+
+    @staticmethod
+    def _member_label(element):
+        group = str(element.group or "").replace("_", " ").title()
+        return f"M{element.id} ({group})" if group else f"M{element.id}"
+
+    def _finish_hover_setup(self):
+        self._hover_shown = None
+        self._hover_a = self._hover_b = None
+        if self._hover_segments:
+            self._hover_a = np.array([s[0:2] for s in self._hover_segments], dtype=float)
+            self._hover_b = np.array([s[2:4] for s in self._hover_segments], dtype=float)
+        self._hover_annot = self.ax.annotate(
+            "",
+            xy=(0.0, 0.0),
+            xytext=(14, 14),
+            textcoords="offset points",
+            fontsize=8,
+            color="#1c2430",
+            bbox={"boxstyle": "round,pad=0.4", "fc": "#fffdf4", "ec": "#6b7280", "alpha": 0.96},
+            zorder=50,
+            annotation_clip=False,
+        )
+        self._hover_annot.set_visible(False)
+        (self._hover_marker,) = self.ax.plot(
+            [0.0], [0.0], marker="o", markersize=7, markerfacecolor="none",
+            markeredgecolor="#d62728", markeredgewidth=1.6, linestyle="none", zorder=49,
+        )
+        self._hover_marker.set_visible(False)
+
+    def _hide_hover(self):
+        if self._hover_annot is not None and self._hover_annot.get_visible():
+            self._hover_annot.set_visible(False)
+            self._hover_marker.set_visible(False)
+            self._hover_shown = None
+            self.draw_idle()
+
+    def _on_hover(self, event):
+        if event.inaxes is not self.ax or self._hover_a is None or self._hover_annot is None:
+            self._hide_hover()
+            return
+        # Nearest point on each segment, measured in screen pixels.
+        a = self.ax.transData.transform(self._hover_a)
+        b = self.ax.transData.transform(self._hover_b)
+        ab = b - a
+        p = np.array([event.x, event.y], dtype=float)
+        len2 = (ab * ab).sum(axis=1)
+        frac = np.where(len2 > 1e-12, ((p - a) * ab).sum(axis=1) / np.maximum(len2, 1e-12), 0.0)
+        frac = np.clip(frac, 0.0, 1.0)
+        nearest = a + ab * frac[:, None]
+        dist2 = ((nearest - p) ** 2).sum(axis=1)
+        index = int(dist2.argmin())
+        if dist2[index] > self.HOVER_RADIUS_PX ** 2:
+            self._hide_hover()
+            return
+        x1, y1, x2, y2, v1, v2, fmt = self._hover_segments[index]
+        f = float(frac[index])
+        x = x1 + f * (x2 - x1)
+        y = y1 + f * (y2 - y1)
+        text = fmt(*[u + f * (w - u) for u, w in zip(v1, v2)])
+        if self._hover_shown == (round(x, 1), round(y, 1), text):
+            return
+        self._hover_shown = (round(x, 1), round(y, 1), text)
+        # Keep the popup inside the axes: flip it to the left / below near the edges.
+        bbox = self.ax.bbox
+        right = event.x > bbox.x0 + 0.6 * bbox.width
+        top = event.y > bbox.y0 + 0.7 * bbox.height
+        self._hover_annot.xy = (x, y)
+        self._hover_annot.set_text(text)
+        self._hover_annot.set_position((-14 if right else 14, -14 if top else 14))
+        self._hover_annot.set_ha("right" if right else "left")
+        self._hover_annot.set_va("top" if top else "bottom")
+        self._hover_annot.set_visible(True)
+        self._hover_marker.set_data([x], [y])
+        self._hover_marker.set_visible(True)
+        self.draw_idle()
 
     def element_plot_style(self, group):
         group = str(group or "").upper()
@@ -34,6 +143,9 @@ class PlotCanvas(FigureCanvasQTAgg):
                        purlin_layout=None, wall_cladding_segments=None, doubled_chord_zones=None,
                        governing_deflection=None, analysis_structure=None, column_flybraces=None):
         self.ax.clear()
+        self._hover_segments = []
+        self._hover_annot = None
+        self._hover_marker = None
 
         for element in elements:
             x1 = element.start.x
@@ -44,6 +156,7 @@ class PlotCanvas(FigureCanvasQTAgg):
             self.ax.plot([x1, x2], [y1, y2], **style)
 
         if result_type == "Geometry":
+            self._add_geometry_hover(nodes, elements)
             self.plot_doubled_chord_zones(doubled_chord_zones or [])
             self.plot_governing_deflection(governing_deflection, nodes, elements, scale)
         elif result_type == "Load Diagram":
@@ -101,7 +214,28 @@ class PlotCanvas(FigureCanvasQTAgg):
             self.ax.text(0.01, 0.98, f"Diagram scale factor x{diagram_scale_factor:g}", transform=self.ax.transAxes,
                          va="top", ha="left", fontsize=8,
                          bbox={"boxstyle": "round,pad=0.25", "fc": "white", "alpha": 0.75})
+        self._finish_hover_setup()
         self.draw()
+
+    def _add_geometry_hover(self, nodes, elements):
+        # Nodes first so they win ties with the member ends that meet there.
+        seen = set()
+        for node in nodes:
+            key = (round(node.x, 6), round(node.y, 6))
+            if key in seen:
+                continue
+            seen.add(key)
+            self._add_hover(node.x, node.y, f"Node {node.id}\nX = {node.x:,.0f} mm\nY = {node.y:,.0f} mm")
+        for element in elements:
+            length = element.length()
+            if length <= 0:
+                continue
+            label = self._member_label(element)
+            self._add_hover_line(
+                [(element.start.x, element.start.y), (element.end.x, element.end.y)],
+                [(0.0,), (length,)],
+                lambda s, label=label, length=length: f"{label} @ {s:,.0f} mm\nLength {length:,.0f} mm",
+            )
 
     def plot_governing_deflection(self, item, nodes, elements, scale):
         if not item or not nodes or item.get("displacements") is None:
@@ -243,6 +377,8 @@ class PlotCanvas(FigureCanvasQTAgg):
                 style["color"] = color
             uniform_load = (element_load_state or {}).get(element.id, (0.0, 0.0))
             points = []
+            values = []
+            length = element.length()
             for index in range(21):
                 t = index / 20.0
                 ux, uy = element.global_displacement_at(displacements, t, uniform_load)
@@ -250,7 +386,14 @@ class PlotCanvas(FigureCanvasQTAgg):
                     element.start.x + t * (element.end.x - element.start.x) + ux * scale,
                     element.start.y + t * (element.end.y - element.start.y) + uy * scale,
                 ))
+                values.append((t * length, ux, uy))
             self.ax.plot([point[0] for point in points], [point[1] for point in points], **style)
+            label = self._member_label(element)
+            self._add_hover_line(
+                points,
+                values,
+                lambda s, ux, uy, label=label: f"{label} @ {s:,.0f} mm\ndx = {ux:+.2f} mm\ndy = {uy:+.2f} mm",
+            )
 
     def plot_force_diagram(
         self,
@@ -296,6 +439,8 @@ class PlotCanvas(FigureCanvasQTAgg):
             ny = dx / L
             diagram_points = []
             station_values = []
+            member_points = []
+            hover_values = []
             for index in range(21):
                 t = index / 20.0
                 axial_n, shear_n, moment_nmm = element.section_forces_at(
@@ -316,6 +461,16 @@ class PlotCanvas(FigureCanvasQTAgg):
                 py = y1 + t * dy
                 diagram_points.append((px + nx * value * diagram_scale, py + ny * value * diagram_scale))
                 station_values.append(value)
+                member_points.append((px, py))
+                hover_values.append((t * L, moment_nmm / 1_000_000.0, shear_n / 1000.0, axial_n / 1000.0))
+
+            label = self._member_label(element)
+            fmt = lambda s, m, v, n, label=label: (  # noqa: E731
+                f"{label} @ {s:,.0f} mm\nM = {m:+.2f} kNm\nV = {v:+.2f} kN\n"
+                f"N = {abs(n):.2f} kN {'C' if n < 0 else 'T'}"
+            )
+            self._add_hover_line(diagram_points, hover_values, fmt)
+            self._add_hover_line(member_points, hover_values, fmt)
 
             self.ax.plot(
                 [x1] + [point[0] for point in diagram_points] + [x2],
@@ -377,39 +532,54 @@ class PlotCanvas(FigureCanvasQTAgg):
 
         This avoids the old sawtooth effect when, for example, dead load and wind
         load were drawn as separate arrows at the same roof panel midpoint.
+
+        Line loads (N/m, shown as kN/m) and point loads (N, shown as kN) are
+        kept apart so only like is added to like. Returns (x, y, fx, fy, unit).
         """
         combined = {}
-        for x, y, fx, fy in load_arrows:
-            key = (round(x, 6), round(y, 6))
+        for arrow in load_arrows:
+            x, y, fx, fy = arrow
+            key = (round(x, 6), round(y, 6), arrow_unit(arrow))
             old_fx, old_fy = combined.get(key, (0.0, 0.0))
             combined[key] = (old_fx + fx, old_fy + fy)
-        return [(x, y, fx, fy) for (x, y), (fx, fy) in combined.items()]
+        return [(x, y, fx, fy, unit) for (x, y, unit), (fx, fy) in combined.items()]
 
     def plot_load_diagram_visual(self, load_arrows, diagram_scale_factor=1.0):
         """Draw a scaled resultant load diagram using combined loads."""
         combined = self.combined_load_arrows(load_arrows)
-        combined = [(x, y, fx, fy) for x, y, fx, fy in combined if math.sqrt(fx**2 + fy**2) > 1e-9]
+        combined = [arrow for arrow in combined if math.hypot(arrow[2], arrow[3]) > 1e-9]
         if not combined:
             return
 
-        max_mag = max([math.sqrt(fx**2 + fy**2) for _, _, fx, fy in combined] + [1e-9])
-        all_x = [x for x, _, _, _ in combined]
+        all_x = [arrow[0] for arrow in combined]
         structure_span = max(all_x) - min(all_x) if len(all_x) > 1 else 10000
-        diagram_scale = (max(structure_span * 0.04, 600) / max_mag) * diagram_scale_factor
+        # kN/m and kN are scaled separately so a large point load does not
+        # flatten the line-load diagram (and vice versa).
+        max_mag = {}
+        for _, _, fx, fy, unit in combined:
+            max_mag[unit] = max(max_mag.get(unit, 1e-9), math.hypot(fx, fy))
 
         vertical_points = []
         horizontal_points = []
 
-        for x, y, fx, fy in combined:
+        for x, y, fx, fy, unit in combined:
             mag = math.sqrt(fx**2 + fy**2)
             if mag == 0:
                 continue
 
+            diagram_scale = (max(structure_span * 0.04, 600) / max_mag[unit]) * diagram_scale_factor
             ox = fx * diagram_scale
             oy = fy * diagram_scale
 
             self.ax.plot([x, x + ox], [y, y + oy], linestyle="--", linewidth=1.1)
             self.ax.plot(x + ox, y + oy, marker=".", markersize=5)
+            kind = "Line load" if unit == "kN/m" else "Point load"
+            hover_text = (
+                f"{kind} at X = {x:,.0f}, Y = {y:,.0f} mm\n"
+                f"Fx = {fx / 1000:+.2f} {unit}\nFy = {fy / 1000:+.2f} {unit}\n|F| = {mag / 1000:.2f} {unit}"
+            )
+            self._add_hover(x + ox, y + oy, hover_text)
+            self._add_hover(x, y, hover_text)
 
             if abs(fy) >= abs(fx):
                 vertical_points.append((x, y, y + oy))
@@ -436,9 +606,12 @@ class PlotCanvas(FigureCanvasQTAgg):
                 self.ax.plot([p[0] for p in right], [p[1] for p in right], linestyle="--", linewidth=1.3)
 
     def plot_load_arrows(self, load_arrows, show_labels=False):
-        arrows = self.combined_load_arrows(load_arrows) if show_labels else load_arrows
+        if show_labels:
+            arrows = self.combined_load_arrows(load_arrows)
+        else:
+            arrows = [(*arrow, arrow_unit(arrow)) for arrow in load_arrows]
         label_arrows = show_labels and len(arrows) <= 30
-        for x, y, fx, fy in arrows:
+        for x, y, fx, fy, unit in arrows:
             mag = math.sqrt(fx**2 + fy**2)
             if mag == 0:
                 continue
@@ -448,5 +621,5 @@ class PlotCanvas(FigureCanvasQTAgg):
             self.ax.arrow(x - dx, y - dy, dx, dy, head_width=250, head_length=300,
                           length_includes_head=True)
             if label_arrows:
-                label = f"Fx={fx / 1000:+.1f} kN\nFy={fy / 1000:+.1f} kN"
+                label = f"Fx={fx / 1000:+.1f} {unit}\nFy={fy / 1000:+.1f} {unit}"
                 self.ax.text(x, y, label, fontsize=7)

@@ -126,12 +126,14 @@ class FlybraceRegression(unittest.TestCase):
         self.assertTrue(row['passes'])
         # The bottom chord node: the top chord node below the 6750 mm pitching
         # point (200 girt, 200 purlin, 410/460UB, 89 SHS chord, 7.5 deg) less
-        # the 1211 mm chord centreline depth.
-        roof_node = w.eave_node_basis_record['node_mm']-1211
-        self.assertAlmostEqual(roof_node, 5347.026, places=3)
+        # the 1211 mm chord centreline depth square to the chords, which is
+        # 1211 / cos(7.5 deg) vertically.
+        roof_node = w.eave_node_basis_record['node_mm']-1211/math.cos(math.radians(7.5))
+        self.assertAlmostEqual(roof_node, 5336.576, places=3)
         self.assertAlmostEqual(row['roof_node_mm'], roof_node, places=6)
         self.assertEqual(len(row['positions_mm']), 1)
-        self.assertAlmostEqual(row['positions_mm'][0], (roof_node+1511)/2, places=6)
+        # The middle of the two girt spaces above the 300 mm bottom girt.
+        self.assertAlmostEqual(row['positions_mm'][0], (w.eave_node_basis_record['node_mm']+300)/2, places=6)
         left = next(m for m in report['members'] if m['group']=='LEFT_COLUMN')
         self.assertLess(left['ratio'], 1)
         self.assertAlmostEqual(left['actions']['effective_length_z_mm'], roof_node, places=6)

@@ -7,7 +7,8 @@ import math
 from dataclasses import replace
 
 from portalcalc.wind import (calculate_wind, active_cpi_for_case, CPI_CASE_OPTIONS,
-                  direction_bearing_degrees, wind_pressure_scale, low_pitch_cpe_values)
+                  direction_bearing_degrees, wind_pressure_scale, low_pitch_cpe_values,
+                  local_pressure_region_enabled)
 
 SOURCE = 'AS/NZS 1170.2:2021 Amd 2, clauses 5.4.3/5.4.4, Table 5.6 and Figure 5.3'
 URL = 'https://webstore.ansi.org/preview-pages/sai/preview_00-2666920554-primary.pdf'
@@ -45,8 +46,14 @@ def end_roof_local_cases(inputs, geometry, purlin):
             continue
         regions = [('RA1',1.5,a,a*a,width), ('RA2',2.,.5*a,.25*a*a,width)]
         left,right = x-plan_width/2,x+plan_width/2
+        corner_extent = a
         if geometry.pitch_deg < 10:
-            overlap = max(0.,min(right,a)-max(left,0.))+max(0.,min(right,span)-max(left,span-a))
+            # RC1: an a/2 x a/2 square at each roof corner (CSB Purlin & Girt Loads
+            # V5.08 local pressure calculator, adopted 2026-11-18): only rows within
+            # a/2 of an eave, over a/2 along the purlin from the gable end.
+            corner_extent = .5*a
+            overlap = (max(0.,min(right,corner_extent)-max(left,0.))
+                       +max(0.,min(right,span)-max(left,span-corner_extent)))
             corner_width = min(plan_width,overlap)/cosine
             corner = 'RC1'
         elif geometry.roof_shape == 'Gable':
@@ -56,7 +63,7 @@ def end_roof_local_cases(inputs, geometry, purlin):
         else:
             corner_width,corner = 0.,'RC2'
         if corner_width > 1e-8:
-            regions.append((corner,3.,a,.25*a*a,corner_width))
+            regions.append((corner,3.,corner_extent,.25*a*a,corner_width))
         cpi = max(active_cpi_for_case(wind,c,'End +') for c in CPI_CASE_OPTIONS)
         kce,kci = (.9,.9) if abs(cpi) >= .4 else (1.,1.)
         # Retain the application's End roof coefficient branch. For >=10 deg
@@ -71,6 +78,8 @@ def end_roof_local_cases(inputs, geometry, purlin):
             zones = [(0.,length,cp)]
             cp_basis = 'Conservative external roof Cpe envelope for pitched-roof end patches'
         for region,kl,extent,area_limit,loaded_width in regions:
+            if not local_pressure_region_enabled(inputs, region):
+                continue   # switched off in the wind inputs (stated in the report)
             loaded_width = min(loaded_width,2*math.sqrt(area_limit))
             patch_length = min(extent,area_limit/loaded_width,length)
             # Expand a narrow patch transversely where necessary to satisfy

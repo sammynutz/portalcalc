@@ -383,6 +383,10 @@ class AutoSizeMixin:
             self.right_canopy_shallow_depth_input.setText(state["right_depth"])
         for combo, index in state["combos"]:
             combo.setCurrentIndex(index)
+        if "extra_purlin_rows" in state:
+            self.extra_purlin_rows = int(state["extra_purlin_rows"])
+            self.optimiser_purlin_rows = int(state.get("optimiser_purlin_rows", 0))
+            self.update_extra_purlin_rows_label()
         self.auto_web_profile_assignments = copy.deepcopy(state["web_assignments"])
         self.auto_web_assignment_basis = copy.deepcopy(state.get("web_assignment_basis", {}))
         self.auto_web_joint_doubler_sides = copy.deepcopy(state.get("web_joint_doubler_sides", {}))
@@ -405,6 +409,8 @@ class AutoSizeMixin:
             "left_depth": self.left_canopy_shallow_depth_input.text(),
             "right_depth": self.right_canopy_shallow_depth_input.text(),
             "combos": unique_combos,
+            "extra_purlin_rows": int(getattr(self, "extra_purlin_rows", 0)),
+            "optimiser_purlin_rows": int(getattr(self, "optimiser_purlin_rows", 0) or 0),
             "web_assignments": copy.deepcopy(self.auto_web_profile_assignments),
             "web_assignment_basis": copy.deepcopy(getattr(self, "auto_web_assignment_basis", {})),
             "web_joint_doubler_sides": copy.deepcopy(getattr(self, "auto_web_joint_doubler_sides", {})),

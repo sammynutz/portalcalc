@@ -66,9 +66,10 @@ def restore_state(window, state, exact=False):
 
     ``exact=True`` also restores the main truss panel count, so the window
     holds exactly the captured frame (with its web assignments, which are per
-    panel member). Otherwise apply_preset_data clears the panel count and the
-    solve uses the default count for the restored truss depth: a warm start
-    of sections for a new auto-size, which re-chooses the panel count.
+    panel member). Otherwise it is a warm start of sections for a new
+    auto-size: a panel count chosen for the design (saved in the preset, see
+    hold_main_panel_count) is kept, and otherwise the solve uses the default
+    count for the restored truss depth.
     """
     # apply_preset_data resets the topology suppression (it sets it only for a
     # future-canopy design); keep a caller's hold, e.g. the optimiser's.

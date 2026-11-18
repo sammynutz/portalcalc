@@ -303,7 +303,20 @@ class InputsMixin:
             right_canopy_length_m=(max(float(self.right_canopy_length_input.text()), 0.0) if self.side_addition_selected(self.right_canopy_type_combo) else 0.0),
             reduction_factor=float(self.wind_reduction_input.text()),
             internal_pressure_mode=self.internal_pressure_combo.currentText(),
+            local_pressure_regions=self.local_pressure_regions_from_ui(),
         )
+
+    LOCAL_PRESSURE_CHECKBOXES = (("RA1", "local_pressure_ra1_checkbox"), ("RA2", "local_pressure_ra2_checkbox"),
+                                 ("RC1", "local_pressure_rc1_checkbox"), ("RC2", "local_pressure_rc2_checkbox"))
+
+    def local_pressure_regions_from_ui(self):
+        """Table 5.6 roof regions switched on in the wind inputs (all, if the form has no switches)."""
+        return tuple(region for region, name in self.LOCAL_PRESSURE_CHECKBOXES
+                     if getattr(self, name, None) is None or getattr(self, name).isChecked())
+
+    def local_pressure_regions_off(self):
+        return [region for region, _ in self.LOCAL_PRESSURE_CHECKBOXES
+                if region not in self.local_pressure_regions_from_ui()]
 
     def wind_source_direction_for_case(self, north_up_direction, cpe_case):
         directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
